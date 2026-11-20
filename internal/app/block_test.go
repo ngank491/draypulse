@@ -11,12 +11,12 @@ import (
 )
 
 // blockHarness runs a hub with one pull router whose CLI is a simulated
-// DrayOS with a firewall.
-func blockHarness(t *testing.T, fw *simFirewall, bc BlockCfg) (*Hub, *Router, *Store) {
+// DrayOS with a Bind IP to MAC table.
+func blockHarness(t *testing.T, bm *simBindMAC) (*Hub, *Router, *Store) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	sim, err := startSimCLI(ctx, "Vigor", "admin", "pw", func(cmd string) string {
-		if out, ok := fw.handle(cmd); ok {
+		if out, ok := bm.handle(cmd); ok {
 			return out
 		}
 		return "% Unknown command"
@@ -30,7 +30,7 @@ func blockHarness(t *testing.T, fw *simFirewall, bc BlockCfg) (*Hub, *Router, *S
 	settings, _ := NewSettingsStore(st, box)
 	h := NewHub(st, box, settings, false)
 	r := &Router{Name: "R", Mode: "pull", Host: "127.0.0.1", Username: "admin", Interval: 300, WANTarget: "8.8.8.8",
-		Opts: DrayOpts{SNMPVersion: "off", CLI: "telnet", CLIPort: sim.Port(), Block: bc}}
+		Opts: DrayOpts{SNMPVersion: "off", CLI: "telnet", CLIPort: sim.Port(), Block: BlockCfg{Enabled: true}}}
 	r.secret = box.Seal("pw")
 	if err := st.SaveRouter(r); err != nil {
 		t.Fatal(err)
@@ -38,137 +38,138 @@ func blockHarness(t *testing.T, fw *simFirewall, bc BlockCfg) (*Hub, *Router, *S
 	if err := h.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
+	// the router's LAN, as the poller would have read it
+	rs := h.get(r.ID)
+	rs.mu.Lock()
+	rs.Sections["lan"] = []Row{{"name": "LAN1", "enabled": "true", "address": "192.168.1.1", "gateway": "192.168.1.1", "network": "192.168.1.0/24"}}
+	rs.mu.Unlock()
 	t.Cleanup(func() { cancel(); h.Wait(); st.Close() })
 	return h, r, st
 }
 
-var testBlockCfg = BlockCfg{Enabled: true, Set: 2, Rule: 7, Group: 32, ObjFrom: 181, ObjTo: 183}
+func TestParseBindMAC(t *testing.T) {
+	st := parseBindMAC("> ip bindmac show\nip bind mac function is turned OFF\nip bind mac function is STRICT OFF\nShow all IP Bind MAC entries.\nIP : 192.168.1.46 bind MAC : 00-50-7f-22-33-55 HOST ID :              \nComment : just\n")
+	if !st.Known || st.On || st.Strict || len(st.Entries) != 1 || st.Entries[0].IP != "192.168.1.46" || st.Entries[0].MAC != "00:50:7F:22:33:55" || st.Entries[0].Comment != "just" {
+		t.Fatalf("%+v", st)
+	}
+	if parseBindMAC("% Unknown command").Known {
+		t.Fatal("unknown output must not look like a state")
+	}
+}
 
 func TestBlockUnblockFlow(t *testing.T) {
-	fw := newSimFirewall()
-	fw.prepareDemoRule(2, 7, "DrayPulse")
-	fw.rule(2, 7).enabled = true // left on by mistake: the check must switch it off
-	fw.handle("object ip obj 182 -n DP-OLD123")
-	h, r, st := blockHarness(t, fw, testBlockCfg)
+	bm := &simBindMAC{}
+	h, r, st := blockHarness(t, bm)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	if _, err := h.BlockClient(ctx, r.ID, "F0:2F:74:55:00:21", "", "", "", "admin"); err == nil {
-		t.Fatal("blocking must require a passed readiness check")
+	for _, bad := range []string{"192.168.1.1", "8.8.8.8", "10.9.9.9", "x"} {
+		if _, err := h.BlockClient(ctx, r.ID, bad, "", "", "", "admin"); err == nil {
+			t.Fatalf("must refuse %s", bad)
+		}
 	}
-	chk, err := h.CheckBlocking(ctx, r.ID)
-	if err != nil || !chk.OK {
-		t.Fatalf("check: %v %+v", err, chk)
-	}
-	if fw.grps[32].name != "DrayPulse" || fw.rules[[2]int{2, 7}].enabled {
-		t.Fatalf("group not prepared or rule still on: %+v %+v", fw.grps[32], fw.rules[[2]int{2, 7}])
-	}
-	if r2, _ := st.GetRouter(r.ID); !r2.Opts.Block.Ready {
-		t.Fatal("ready flag not stored")
-	}
-
-	b1, err := h.BlockClient(ctx, r.ID, "f0-2f-74-55-00-21", "192.168.1.21", "LAPTOP-GD", "", "admin")
+	b, err := h.BlockClient(ctx, r.ID, "192.168.1.21", "f0-2f-74-55-00-21", "LAPTOP-GD", "", "admin")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if b1.Obj != 181 || fw.objs[181].mac != "F0:2F:74:55:00:21" || fw.objs[181].name != "DP-550021" {
-		t.Fatalf("object %+v %+v", b1, fw.objs[181])
+	if !bm.on || len(bm.entries) != 1 || bm.entries[0].MAC != blockMAC || bm.entries[0].Comment != "DrayPulse" || b.MAC != "F0:2F:74:55:00:21" {
+		t.Fatalf("router state %+v %+v", bm, b)
 	}
-	if !fw.rules[[2]int{2, 7}].enabled || !sameMembers(fw.grps[32].members, []int{181}) {
-		t.Fatal("rule must be on with one member")
+	if r2, _ := st.GetRouter(r.ID); !r2.Opts.Block.TurnedOn {
+		t.Fatal("TurnedOn must be remembered")
 	}
-	b2, err := h.BlockClient(ctx, r.ID, "62:1B:77:00:00:22", "", "", "", "admin")
-	if err != nil || b2.Obj != 182 { // DP-named leftover object is reusable
-		t.Fatalf("%v %+v", err, b2)
-	}
-	if _, err := h.BlockClient(ctx, r.ID, "62:1B:77:00:00:22", "", "", "", "admin"); err == nil {
+	if _, err := h.BlockClient(ctx, r.ID, "192.168.1.21", "", "", "", "admin"); err == nil {
 		t.Fatal("double block must fail")
 	}
-	st1, _ := h.BlockState(ctx, r.ID, true)
-	if st1.Drift != "" || len(st1.Blocks) != 2 || st1.RuleEnabled == nil || !*st1.RuleEnabled {
-		t.Fatalf("state %+v", st1)
-	}
-
-	if err := h.UnblockClient(ctx, r.ID, "F0:2F:74:55:00:21", "admin"); err != nil {
+	if _, err := h.BlockClient(ctx, r.ID, "192.168.1.22", "", "", "", "admin"); err != nil {
 		t.Fatal(err)
 	}
-	if !sameMembers(fw.grps[32].members, []int{182}) || !fw.rules[[2]int{2, 7}].enabled || fw.objs[181].mac != zeroMAC {
-		t.Fatalf("after first unblock: %+v rule=%v obj=%+v", fw.grps[32], fw.rules[[2]int{2, 7}].enabled, fw.objs[181])
+	live, _ := h.BlockState(ctx, r.ID, true)
+	if live.On == nil || !*live.On || len(live.Missing) != 0 || len(live.Extra) != 0 || len(live.Blocks) != 2 {
+		t.Fatalf("live %+v", live)
 	}
-	// last one: the rule must go off (an empty group is never live)
-	if err := h.UnblockClient(ctx, r.ID, "62:1B:77:00:00:22", "admin"); err != nil {
+	if err := h.UnblockClient(ctx, r.ID, "192.168.1.21", "admin"); err != nil {
 		t.Fatal(err)
 	}
-	if fw.rules[[2]int{2, 7}].enabled || fw.objs[182].mac != zeroMAC {
-		t.Fatal("rule must be off and object blanked after the last unblock")
+	if !bm.on || len(bm.entries) != 1 {
+		t.Fatal("function must stay on while another IP is blocked")
+	}
+	if err := h.UnblockClient(ctx, r.ID, "192.168.1.22", "admin"); err != nil {
+		t.Fatal(err)
+	}
+	if bm.on || len(bm.entries) != 0 {
+		t.Fatal("DrayPulse switched the function on, so it must switch it off again")
 	}
 	evs, _ := st.ListEvents(nil, 20)
 	all := ""
 	for _, e := range evs {
 		all += e.Msg + "\n"
 	}
-	if !strings.Contains(all, "Đã chặn client LAPTOP-GD (F0:2F:74:55:00:21)") || !strings.Contains(all, "Đã bỏ chặn client") {
+	if !strings.Contains(all, "Đã chặn LAPTOP-GD (192.168.1.21) khỏi mạng – bởi admin") || !strings.Contains(all, "Đã bỏ chặn") {
 		t.Fatalf("events:\n%s", all)
 	}
-	// nothing outside DrayPulse's own objects, group and rule was touched
-	for _, c := range fw.Log {
-		ok := strings.Contains(c, "obj 181 ") || strings.Contains(c, "obj 182 ") || strings.Contains(c, "grp 32 ") || strings.Contains(c, "rule 2 7 ")
-		if !ok {
-			t.Fatalf("touched something else: %q", c)
+	for _, c := range bm.Log {
+		if !strings.HasPrefix(c, "ip bindmac ") || strings.Contains(c, "all") || strings.Contains(c, "strict") {
+			t.Fatalf("unexpected command %q", c)
 		}
 	}
 }
 
-func TestBlockRollsBackWhenMACNotStored(t *testing.T) {
-	fw := newSimFirewall()
-	fw.prepareDemoRule(2, 7, "DrayPulse")
-	h, r, _ := blockHarness(t, fw, testBlockCfg)
+func TestBlockRespectsUserEntries(t *testing.T) {
+	bm := &simBindMAC{entries: []bindEntry{{IP: "192.168.1.50", MAC: "00:50:7F:22:33:55", Comment: "printer"}}}
+	h, r, _ := blockHarness(t, bm)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	if chk, err := h.CheckBlocking(ctx, r.ID); err != nil || !chk.OK {
-		t.Fatalf("%v %+v", err, chk)
+	// function off with the admin's own entry: switching on would enforce it, so refuse
+	if _, err := h.BlockClient(ctx, r.ID, "192.168.1.21", "", "", "", "admin"); err == nil || !strings.Contains(err.Error(), "192.168.1.50") {
+		t.Fatalf("want refusal naming the user entry, got %v", err)
 	}
-	fw.RejectMAC = true // firmware ignores MAC objects
-	if _, err := h.BlockClient(ctx, r.ID, "F0:2F:74:55:00:21", "", "", "", "admin"); err == nil || !strings.Contains(err.Error(), "không phải") {
-		t.Fatalf("want verify error, got %v", err)
+	if bm.on || len(bm.Log) != 0 {
+		t.Fatal("nothing may change")
 	}
-	if fw.rules[[2]int{2, 7}].enabled || len(fw.grps[32].members) != 0 {
-		t.Fatal("nothing may go live when the MAC was not stored")
+	// with the function already on, blocking works and leaves it on afterwards
+	bm.on = true
+	if _, err := h.BlockClient(ctx, r.ID, "192.168.1.21", "", "", "", "admin"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.BlockClient(ctx, r.ID, "192.168.1.50", "", "", "", "admin"); err == nil {
+		t.Fatal("an IP the admin bound must not be touched")
+	}
+	if err := h.UnblockClient(ctx, r.ID, "192.168.1.21", "admin"); err != nil {
+		t.Fatal(err)
+	}
+	if !bm.on || len(bm.entries) != 1 || bm.entries[0].IP != "192.168.1.50" {
+		t.Fatalf("the admin's entry and the ON state must remain: %+v", bm)
 	}
 }
 
-func TestBlockCheckRefusesUsedSlots(t *testing.T) {
-	fw := newSimFirewall()
-	fw.handle("object ip grp 32 -n Marketing")
-	fw.handle("object ip grp 32 -a 5")
-	fw.handle("object ip obj 181 -n Server")
-	h, r, _ := blockHarness(t, fw, testBlockCfg) // rule 2/7 still "Pass, source Any"
+func TestBlockUndoWhenRouterIgnoresAdd(t *testing.T) {
+	bm := &simBindMAC{IgnoreAdd: true}
+	h, r, st := blockHarness(t, bm)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	chk, err := h.CheckBlocking(ctx, r.ID)
-	if err != nil {
-		t.Fatal(err)
+	if _, err := h.BlockClient(ctx, r.ID, "192.168.1.21", "", "", "", "admin"); err == nil {
+		t.Fatal("want error when the entry is not stored")
 	}
-	all := strings.Join(chk.Problems, "\n")
-	if chk.OK || !strings.Contains(all, "IP group 32 đang được dùng") || !strings.Contains(all, "IP object 181 đang được dùng") || !strings.Contains(all, "Block Immediately") {
-		t.Fatalf("%+v", chk)
+	if bm.on {
+		t.Fatal("the function must be switched back off")
 	}
-	if fw.grps[32].name != "Marketing" || len(fw.Log) != 3 { // only the 3 setup commands above
-		t.Fatalf("check must not change a used group: %+v %v", fw.grps[32], fw.Log)
+	if l, _ := st.ListBlocks(r.ID); len(l) != 0 {
+		t.Fatal("nothing may be recorded")
 	}
 }
 
 func TestBlockWriteAllowlist(t *testing.T) {
-	for _, ok := range []string{"object ip obj 181 -a 4 f0:2f:74:55:00:21", "object ip grp 32 -a 181 182", "ipf rule 2 7 -e 1", "object ip obj 181 -n DP-550021", "ipf rule 2 7 -v"} {
+	for _, ok := range []string{"ip bindmac show", "ip bindmac on", "ip bindmac off", "ip bindmac add 192.168.1.21 02:dd:00:00:00:01 DrayPulse", "ip bindmac del 192.168.1.21"} {
 		if !cliWriteCommandAllowed(ok) {
 			t.Error("should allow", ok)
 		}
-		if cliCommandAllowed(ok) && !strings.HasSuffix(ok, "-v") {
+		if cliCommandAllowed(ok) {
 			t.Error("read-only list must not contain", ok)
 		}
 	}
-	for _, bad := range []string{"ipf rule 2 7 -F \"1 1\"", "ipf rule 2 7 -s \"g 1 32\"", "object ip obj 181 -a 2", "object ip obj 181 -n Server",
-		"object ip grp 32 -n Marketing", "object ip obj 181 -a 4 f0:2f:74:55:00:21; sys reboot", "ipf set -p 1 0", "sys reboot"} {
+	for _, bad := range []string{"ip bindmac del all", "ip bindmac strict_on", "ip bindmac add 192.168.1.21 aa:bb:cc:dd:ee:ff DrayPulse",
+		"ip bindmac add 192.168.1.21 02:dd:00:00:00:01 other", "ip bindmac subnet clear", "ip bindmac on; sys reboot", "sys reboot"} {
 		if cliWriteCommandAllowed(bad) {
 			t.Error("should block", bad)
 		}

@@ -233,3 +233,8 @@ details[open] > summary h2::before { content: '▾ '; }
 .usage .bar i { display: block; height: 100%; background: var(--up); }
 .usage .bar i.warn { background: var(--warn); }
 .usage .bar i.bad { background: var(--down); }
+tr.click { cursor: pointer; }
+tr.click:hover td { background: var(--accent-weak); }
+tr.sel td { background: var(--accent-weak); }
+tr.sel td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
+select.inline { width: auto; min-width: 140px; }

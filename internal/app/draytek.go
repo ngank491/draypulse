@@ -49,19 +49,7 @@ type DrayOpts struct {
 	CLIPort     int      `json:"cliPort"`
 	PingFrom    string   `json:"pingFrom"` // "local" (DrayPulse host, default) | "router"
 	Block       BlockCfg `json:"block"`
-}
-
-// BlockCfg reserves router resources for MAC blocking: a firewall rule the
-// admin built once in the web UI (source = IP group, action = Block), the IP
-// group, and a range of IP object indexes DrayPulse may use.
-type BlockCfg struct {
-	Enabled bool `json:"enabled"`
-	Set     int  `json:"set"`     // filter set 1-12
-	Rule    int  `json:"rule"`    // rule 1-7
-	Group   int  `json:"group"`   // IP group 1-32
-	ObjFrom int  `json:"objFrom"` // IP object range, 1-192
-	ObjTo   int  `json:"objTo"`
-	Ready   bool `json:"ready"` // set by the readiness check, cleared when the slots change
+	SyslogFrom  []string `json:"syslogFrom,omitempty"` // extra sender IPs whose syslog belongs to this router
 }
 
 // SNMPSecrets are stored encrypted, separately from the options.
@@ -649,11 +637,8 @@ func validDrayOpts(o *DrayOpts) error {
 	if o.SNMPVersion == "off" && o.CLI == "" {
 		return errors.New("cần bật ít nhất SNMP hoặc Telnet/SSH")
 	}
-	if err := validBlockCfg(&o.Block); err != nil {
-		return err
-	}
 	if o.Block.Enabled && o.CLI == "" {
-		return errors.New("chặn client theo MAC cần bật Telnet/SSH")
+		return errors.New("chặn client cần bật Telnet/SSH")
 	}
 	if o.SNMPPort < 0 || o.SNMPPort > 65535 || o.CLIPort < 0 || o.CLIPort > 65535 {
 		return errors.New("cổng không hợp lệ")

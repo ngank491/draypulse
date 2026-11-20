@@ -60,7 +60,7 @@ func parseConfig(args []string) (*Config, error) {
 	fs.BoolVar(&c.TrustProxy, "trust-proxy", envBool("DRAYPULSE_TRUST_PROXY"), "tin header X-Forwarded-* từ reverse proxy")
 	fs.BoolVar(&c.CookieSecure, "cookie-secure", envBool("DRAYPULSE_COOKIE_SECURE"), "luôn đặt cookie Secure")
 	fs.BoolVar(&c.Demo, "demo", envBool("DRAYPULSE_DEMO"), "tạo router mô phỏng để dùng thử")
-	fs.StringVar(&c.Syslog, "syslog", env("DRAYPULSE_SYSLOG", ":5514"), `nhận syslog từ router (UDP), "off" để tắt`)
+	fs.StringVar(&c.Syslog, "syslog", env("DRAYPULSE_SYSLOG", ":514,:5514"), `cổng UDP nhận syslog từ router, cách nhau dấu phẩy (514 cần quyền root/CAP_NET_BIND_SERVICE), "off" để tắt`)
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
@@ -245,7 +245,7 @@ func Run(ctx context.Context, cfg *Config) error {
 	}
 	if cfg.Syslog != "" && cfg.Syslog != "off" {
 		if err := hub.StartSyslog(runCtx, cfg.Syslog); err != nil {
-			log.Printf("không mở được cổng syslog %s: %v (bỏ qua)", cfg.Syslog, err)
+			log.Printf("syslog: %v (bỏ qua)", err)
 		}
 	}
 	auditor.ctx = runCtx

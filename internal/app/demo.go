@@ -19,7 +19,7 @@ import (
 type demoRouter struct {
 	snmp *simSNMP
 	cli  *simCLI
-	fw   *simFirewall
+	bind *simBindMAC
 
 	mu      sync.Mutex
 	started time.Time
@@ -71,9 +71,7 @@ func startDemoRouter(ctx context.Context, seed int64) (*demoRouter, error) {
 		d.bytes[it.idx] = [2]float64{4.29e9 - it.rx*5, 4.29e9 - it.tx*7}
 	}
 	var err error
-	d.fw = newSimFirewall()
-	d.fw.prepareDemoRule(2, 7, "DrayPulse")
-	d.fw.handle("object ip obj 1 -n Server")
+	d.bind = &simBindMAC{}
 	if d.snmp, err = startSimSNMP(ctx, "public", d.snmpData); err != nil {
 		return nil, err
 	}
@@ -170,7 +168,7 @@ func atoiDef(s string, def int) int {
 func wan2Down() bool { return time.Now().Minute()%15 < 2 }
 
 func (d *demoRouter) cliReply(cmd string) string {
-	if out, ok := d.fw.handle(cmd); ok {
+	if out, ok := d.bind.handle(cmd); ok {
 		return out
 	}
 	up := time.Since(d.started)
@@ -303,7 +301,7 @@ func seedDemo(st *Store) error {
 	r := &Router{Name: "Văn phòng Hà Nội (demo)", Mode: "demo", Host: "127.0.0.1", Interval: 10, Enabled: true, WANTarget: "8.8.8.8",
 		WANs: []WAN{{Iface: "WAN1", Label: "VNPT"}, {Iface: "WAN2", Label: "Viettel"}},
 		Opts: DrayOpts{SNMPVersion: "2c", CLI: "telnet", PingFrom: "local",
-			Block: BlockCfg{Enabled: true, Set: 2, Rule: 7, Group: 32, ObjFrom: 181, ObjTo: 192}}}
+			Block: BlockCfg{Enabled: true}}}
 	if err := st.SaveRouter(r); err != nil {
 		return err
 	}

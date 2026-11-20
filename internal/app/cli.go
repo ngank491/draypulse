@@ -44,19 +44,14 @@ func cliCommandAllowed(cmd string) bool {
 }
 
 // cliWriteAllowed are the only configuration changes DrayPulse can make, used
-// by MAC blocking: its own IP objects ("DP-…"), its own IP group ("DrayPulse")
-// and switching one pre-built firewall rule on/off. Read-backs (-v) included.
+// by client blocking: adding/removing its own Bind IP to MAC entries (always
+// the fixed blocking MAC and the comment "DrayPulse") and switching the
+// function on/off. "del all" and strict mode are not possible.
 var cliWriteAllowed = []*regexp.Regexp{
-	regexp.MustCompile(`^object ip obj \d{1,3} -v$`),
-	regexp.MustCompile(`^object ip obj \d{1,3} -n DP-[0-9A-Za-z]{1,11}$`),
-	regexp.MustCompile(`^object ip obj \d{1,3} -i 1$`),
-	regexp.MustCompile(`^object ip obj \d{1,3} -a 4 [0-9a-f]{2}(:[0-9a-f]{2}){5}$`),
-	regexp.MustCompile(`^object ip grp \d{1,2} -v$`),
-	regexp.MustCompile(`^object ip grp \d{1,2} -n DrayPulse$`),
-	regexp.MustCompile(`^object ip grp \d{1,2} -i 1$`),
-	regexp.MustCompile(`^object ip grp \d{1,2} -a( \d{1,3}){1,12}$`),
-	regexp.MustCompile(`^ipf rule \d{1,2} \d{1,2} -v$`),
-	regexp.MustCompile(`^ipf rule \d{1,2} \d{1,2} -e [01]$`),
+	regexp.MustCompile(`^ip bindmac show$`),
+	regexp.MustCompile(`^ip bindmac (on|off)$`),
+	regexp.MustCompile(`^ip bindmac add \d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3} 02:dd:00:00:00:01 DrayPulse$`),
+	regexp.MustCompile(`^ip bindmac del \d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$`),
 }
 
 func cliWriteCommandAllowed(cmd string) bool {

@@ -4,7 +4,7 @@ Tài liệu này hướng dẫn từng bước:
 
 1. [Đăng nhập lần đầu](#1-đăng-nhập-lần-đầu)
 2. [Thêm router DrayTek](#2-thêm-router-draytek) – SNMP, Telnet/SSH và Syslog
-3. [Theo dõi thiết bị và đặt tên client](#3-theo-dõi-thiết-bị-và-đặt-tên-client) – kèm [theo dõi VLAN](#theo-dõi-vlan) và [chặn client theo MAC](#chặn-client-theo-mac-thử-nghiệm)
+3. [Theo dõi thiết bị và đặt tên client](#3-theo-dõi-thiết-bị-và-đặt-tên-client) – kèm [theo dõi VLAN](#theo-dõi-vlan) và [chặn client](#chặn-client)
 4. [Nhận cảnh báo qua Telegram](#4-nhận-cảnh-báo-qua-telegram)
 5. [Nhận cảnh báo qua Zalo](#5-nhận-cảnh-báo-qua-zalo)
 6. [DrayPulse cảnh báo những gì](#6-draypulse-cảnh-báo-những-gì)
@@ -84,19 +84,19 @@ mngt snmp -e 1 -c 1 -o draypulse -p 2 -q <MatKhauXacThuc> -r 6 -u <MatKhauMaHoa>
 
 ### Bước D3. (Tuỳ chọn) Gửi syslog về DrayPulse
 
-DrayPulse nhận syslog ở **UDP 5514** (đổi bằng `-syslog :cổng`, tắt bằng `-syslog off`).
+DrayPulse nhận syslog ở **UDP 514** (cổng mặc định của DrayTek) và **5514**. Bộ cài `install.sh` cấp quyền để dùng cổng 514; nếu chạy tay bằng user thường, cổng 514 không mở được, hãy đặt router gửi tới 5514. Đổi bằng `-syslog :514,:5514`, tắt bằng `-syslog off`.
 
-**Web UI:** *System Maintenance → SysLog / Mail Alert → Syslog Access Setup*: bật **Syslog Save to Syslog Server**, *Server IP* = `192.168.1.4`, *Destination Port* = `5514`; chọn **VPN Log**, **WAN Log**, **Router/DSL information**. Không cần Firewall Log (rất nhiều dòng).
+**Web UI:** *System Maintenance → SysLog / Mail Alert → Syslog Access Setup*: bật **Syslog Save to Syslog Server**, *Server IP* = `192.168.1.4`, *Destination Port* = `514`; chọn **VPN Log**, **WAN Log**, **Router/DSL information**. Không cần Firewall Log (rất nhiều dòng).
 
 ```
-sys syslog -a 1 -s 1 -i 192.168.1.4 -d 5514 -f 0 -v 1 -w 1 -r 1 -e 0
+sys syslog -a 1 -s 1 -i 192.168.1.4 -d 514 -f 0 -v 1 -w 1 -r 1 -e 0
 ```
 
-Gói syslog được nhận theo **IP nguồn** = địa chỉ router đã khai báo trong DrayPulse. Xem các dòng mới nhất ở tab **Syslog** của router.
+DrayPulse gán gói syslog cho router khi **IP gửi** trùng địa chỉ router đã khai báo, hoặc tên router trong dòng syslog trùng tên router. Router ở chi nhánh/qua VPN thường gửi từ IP khác: mở tab **Syslog** của router – khung chẩn đoán liệt kê các địa chỉ đang gửi syslog mà chưa gán cho router nào, bấm **Gán** là xong. Tab cũng cho biết DrayPulse đang nghe cổng nào, đã nhận bao nhiêu dòng, và có bộ lọc theo loại log (VPN, WAN, Firewall…).
 
 > Nếu server có tường lửa, mở cổng cho mạng LAN:
 > ```bash
-> sudo ufw allow from 192.168.1.0/24 to any port 5514 proto udp comment 'DrayPulse syslog'
+> sudo ufw allow from 192.168.1.0/24 to any port 514,5514 proto udp comment 'DrayPulse syslog'
 > ```
 
 ### Bước D4. Thêm router trong DrayPulse
@@ -149,30 +149,22 @@ Tab **VLAN** (cần Telnet/SSH) đọc mỗi phút lệnh `vlan status` và `sho
 
 DrayOS không có bộ đếm lưu lượng riêng cho từng VLAN qua SNMP; xem lưu lượng theo cổng LAN ở tab **Cổng**.
 
-### Chặn client theo MAC (thử nghiệm)
+### Chặn client
 
-DrayOS không có lệnh "chặn MAC" trực tiếp, nên DrayPulse dùng cơ chế Firewall chuẩn của router: **IP Object loại MAC → IP Group → Filter rule Block**. Đây là tính năng duy nhất của DrayPulse **ghi cấu hình** router, nên được giới hạn chặt:
+Chặn một IP khỏi mạng ngay từ DrayPulse, **không cần chuẩn bị gì trên router**:
 
-- Tắt mặc định, chỉ quản trị viên dùng được.
-- Chỉ đụng tới các ô bạn dành riêng: một khoảng IP Object (tối đa 12), một IP Group, và **bật/tắt** đúng một rule. DrayPulse **không tự tạo hay sửa nội dung Firewall rule**.
-- Mỗi lệnh ghi đều được đọc lại (`-v`) để xác minh; nếu router không nhận (ví dụ firmware không hỗ trợ object loại MAC qua Telnet), DrayPulse hoàn tác và báo lỗi.
-- Rule chỉ được bật khi có ít nhất một client bị chặn và tự tắt khi bỏ chặn người cuối cùng, để group rỗng không bao giờ được áp dụng.
+1. **Router → Sửa** → tick **Cho phép DrayPulse chặn IP client** (cần Telnet/SSH) → Lưu.
+2. Tab **Client** → nút **Chặn** ở dòng thiết bị, hoặc **+ Chặn IP** trong bảng "Client bị chặn" để nhập IP bất kỳ.
 
-**Chuẩn bị một lần:**
+**Cách hoạt động:** DrayPulse dùng chức năng **LAN → Bind IP to MAC** của router. IP bị chặn được gắn với một MAC không tồn tại (`02:dd:00:00:00:01`, ghi chú `DrayPulse`), nên router từ chối mọi gói tin từ IP đó: thiết bị không ra được Internet và không sang được mạng/VLAN khác. Các lệnh dùng: `ip bindmac show / on / off / add / del` – không lệnh nào khác.
 
-1. Web UI router → **Objects Setting → IP Group**: chọn một group trống (ví dụ số 32). Kiểm tra một khoảng IP Object trống (ví dụ 181–192).
-2. **Firewall → Filter Setup** → filter set đang chạy (thường Set 2) → một rule trống (ví dụ Rule 7):
-   - Comments: `DrayPulse block`
-   - Direction: **LAN/DMZ/RT/VPN → WAN**
-   - Source IP: **IP Group** số đã chọn; Destination: Any
-   - Filter: **Block Immediately**
-   - **Bỏ tick Enable** (DrayPulse tự bật).
-   Rule phải đứng trước các rule "Pass Immediately" áp dụng cho cùng máy.
-3. DrayPulse → **Router → Sửa** → mục **Chặn client theo MAC**: tick bật, nhập filter set, rule, IP group, khoảng IP object → **Lưu** → mở lại → **Kiểm tra cấu hình chặn**. Bước này kiểm tra group/object còn trống, rule đúng là Block với nguồn là group, rồi đặt tên group là "DrayPulse".
+- Chức năng được bật ở **chế độ thường** (không strict): các IP không có trong bảng vẫn dùng bình thường. Khi bỏ chặn IP cuối cùng, nếu chính DrayPulse đã bật chức năng thì sẽ tắt lại.
+- DrayPulse **không sửa hay xoá mục do bạn tạo**. Nếu chức năng đang tắt mà bảng đã có mục của bạn, DrayPulse từ chối bật (để không áp dụng nhầm các mục cũ đó) và báo rõ IP nào.
+- Không chặn được: IP của router, gateway, máy chạy DrayPulse, IP ngoài mạng LAN.
+- Mỗi thay đổi được đọc lại (`ip bindmac show`); nếu router không lưu, DrayPulse hoàn tác. Nút **Đối chiếu với router** so danh sách của DrayPulse với bảng trên router.
+- Mọi lần chặn/bỏ chặn được ghi vào **Sự kiện** kèm người thực hiện.
 
-**Sử dụng:** tab **Client** → nút **Chặn** ở dòng thiết bị. Danh sách **Client bị chặn** nằm ngay dưới, có nút **Bỏ chặn** và **Đối chiếu với router** (kiểm tra rule và group trên router có khớp danh sách của DrayPulse). Mỗi lần chặn/bỏ chặn được ghi vào **Sự kiện** kèm tên người thực hiện.
-
-Lưu ý: rule hướng LAN → WAN chặn **truy cập Internet**, thiết bị vẫn liên lạc được trong LAN. Phiên đang mở có thể còn chạy tới khi hết hạn. Thiết bị đổi MAC ("địa chỉ Wi-Fi riêng tư") có thể lách được.
+Giới hạn: máy cùng subnet vẫn nói chuyện trực tiếp với nhau qua switch (không đi qua router). Thiết bị tự đặt IP tĩnh khác có thể lách; máy nhận IP qua DHCP thường được cấp lại đúng IP cũ.
 
 ---
 
@@ -253,7 +245,7 @@ Có thể bật **cả Telegram và Zalo** cùng lúc: mỗi cảnh báo đượ
 | Firmware DrayOS đổi phiên bản | ✔ | ✔ |
 | VLAN bật/tắt hoặc đổi VID/cổng/subnet | ✔ | ✔ |
 | DHCP một subnet dùng ≥ 90% địa chỉ | ✔ | ✔ |
-| Chặn / bỏ chặn client (kèm người thực hiện) | ✔ | – |
+| Chặn / bỏ chặn IP client (kèm người thực hiện) | ✔ | – |
 | VPN kết nối / ngắt, WAN lên/xuống, đăng nhập quản trị (từ syslog) | ✔ | – |
 | Thiết bị lạ lần đầu vào mạng | ✔ | tuỳ chọn trong Cài đặt |
 | Cổng LAN / WAN mất hoặc có link | ✔ | – |
@@ -347,10 +339,9 @@ Nếu tài khoản bị lỗi (hết credit, key sai, quá tải) và bạn bậ
 | Tab Client / DHCP trống | Chưa bật Telnet/SSH | Bật CLI ở bước D2 rồi sửa router trong DrayPulse |
 | WAN Internet báo “Lỗi kiểm tra” | Router không chạy được `ip ping` qua WAN đó | Kiểm tra tên WAN (WAN1…), WAN đang bật |
 | Tab VLAN trống | Chưa bật Telnet/SSH, hoặc firmware không có lệnh `vlan status` | Bật CLI; DrayOS 5 chưa được hỗ trợ |
-| Kiểm tra cấu hình chặn báo "đang được dùng" | IP Group/Object đã có cấu hình khác | Chọn group/khoảng object trống khác |
-| Kiểm tra báo rule "chưa đặt hành động Block Immediately" hoặc nguồn chưa phải group | Rule chưa tạo đúng | Làm lại bước 2 phần Chặn client |
-| Chặn báo "IP object … có MAC …, không phải …" | Firmware không nhận object loại MAC qua Telnet; DrayPulse đã hoàn tác | Chặn bằng Web UI, hoặc cập nhật firmware |
-| Không thấy dòng nào ở tab Syslog | Router chưa gửi, sai cổng, tường lửa server chặn UDP, hoặc router gửi từ IP khác IP đã khai báo | Bước D3; trang **Router** hiện số gói bị bỏ qua và IP gửi gần nhất |
+| Chặn báo "Bind IP to MAC đang TẮT nhưng bảng có … mục do bạn tạo" | Bảng có mục cũ của bạn, bật lên sẽ áp dụng chúng | Kiểm tra/xoá các mục đó ở LAN → Bind IP to MAC rồi chặn lại |
+| Chặn báo "router không lưu mục chặn" | Router từ chối lệnh `ip bindmac add` (firmware khác cú pháp); DrayPulse đã hoàn tác | Báo lại kèm model/firmware |
+| Không thấy dòng nào ở tab Syslog | Router chưa gửi, sai cổng, tường lửa server chặn UDP, hoặc router gửi từ IP khác IP đã khai báo | Xem khung chẩn đoán đầu tab Syslog: cổng đang nghe, các IP gửi chưa gán (bấm **Gán**) |
 | WAN báo "Không thấy" | Tên WAN không đúng (phải là WAN1, WAN2…) | Router → Sửa → bấm **Kiểm tra kết nối** và chọn theo gợi ý |
 | Telegram/Zalo không nhận tin | Chưa lưu token, sai Chat ID, hoặc chưa nhắn bot trước | Xem lỗi đỏ cạnh tiêu đề kênh trong Cài đặt; nhắn bot rồi **Gửi tin thử** |
 | `Bot Token sai hoặc đã bị thu hồi` | Token bị đặt lại | Lấy token mới, dán lại |

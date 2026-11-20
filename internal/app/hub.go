@@ -393,6 +393,9 @@ func (h *Hub) load(r *Router, onStart bool) error {
 
 // Reload re-reads a router (and its monitors) from the database.
 func (h *Hub) Reload(id int64) error {
+	if h.syslog != nil {
+		h.syslog.Invalidate() // router addresses may have changed
+	}
 	h.ctl.Lock()
 	defer h.ctl.Unlock()
 	r, err := h.st.GetRouter(id)
@@ -1200,8 +1203,8 @@ func (h *Hub) view(rs *RState, detail bool) RouterView {
 	if detail {
 		v.Clients = rs.clientList()
 		v.VLANs, v.LANs = rs.vlanViews()
-		if bc := c.Opts.Block; bc.Enabled {
-			v.Blocking = &BlockInfo{Ready: bc.Ready, Set: bc.Set, Rule: bc.Rule, Group: bc.Group, Blocks: blocks}
+		if c.Opts.Block.Enabled {
+			v.Blocking = &BlockInfo{Blocks: blocks}
 		}
 		v.Ifaces = append([]Iface{}, rs.Ifaces...)
 		v.Sections, v.SectionAt = map[string][]Row{}, map[string]int64{}

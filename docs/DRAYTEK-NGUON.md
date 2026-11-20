@@ -39,17 +39,16 @@ Không có trên các walk đã xem (2920/2927/2962): `ifXTable` (bộ đếm 64
 | `vlan status`, `show lan` | VLAN (VID, cổng thành viên, subnet) và subnet LAN + DHCP pool |
 | `mngt rmtcfg status`, `sys iface`, `ip dhcpc status` | chỉ cho phần kiểm tra bảo mật |
 
-**Lệnh ghi (chỉ dùng cho chặn client theo MAC, danh sách riêng `cliWriteAllowed`):**
+**Lệnh ghi (chỉ dùng cho chặn client, danh sách riêng `cliWriteAllowed`):**
 
 | Lệnh | Ý nghĩa |
 |---|---|
-| `object ip obj N -n DP-xxxxxx` / `-i 1` / `-a 4 <mac>` / `-v` | ghi/đọc IP object loại MAC (TYPE=4) – cú pháp MAC chưa có ví dụ chính thức, nên luôn đọc lại `MAC Address:[…]` |
-| `object ip grp G -n DrayPulse` / `-i 1` / `-a <n1 n2…>` / `-v` | đặt tên và danh sách thành viên IP group (tối đa 12) |
-| `ipf rule S R -e 0/1` / `-v` | bật/tắt và đọc lại đúng một filter rule do quản trị viên tạo sẵn |
+| `ip bindmac show` | đọc trạng thái (ON/OFF, STRICT) và bảng IP–MAC |
+| `ip bindmac on` / `off` | bật/tắt Bind IP to MAC ở chế độ thường (không strict) |
+| `ip bindmac add <IP> 02:dd:00:00:00:01 DrayPulse` | chặn IP: gắn với MAC không tồn tại |
+| `ip bindmac del <IP>` | bỏ chặn (chỉ xoá mục có MAC và ghi chú của DrayPulse) |
 
-DrayPulse không gửi `ipf rule … -s/-F/-D`: tài liệu không rõ `-s "g 1 32"` nghĩa là "group 32" hay "group 1 và 32", nên nội dung rule do người quản trị tạo trong Web UI.
-
-Lệnh cấu hình gợi ý cho người dùng (không bao giờ do DrayPulse gửi): `mngt snmp -e 1 -b 1 -g <community> -m <IP>`, `sys syslog -a 1 -s 1 -i <IP> -d <cổng> …`, `mngt rmtcfg disable`.
+Không có `del all`, `strict_on`, `subnet`. Mẫu output `ip bindmac show` theo User Guide Vigor 2927/3912.
 
 ## Syslog
 

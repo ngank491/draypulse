@@ -2,11 +2,11 @@
 # Cài DrayPulse thành dịch vụ systemd trên Linux (Debian/Ubuntu/Raspberry Pi OS…).
 # Chạy lại script để nâng cấp: dữ liệu trong /var/lib/draypulse được giữ nguyên.
 #
-#   sudo ./install.sh [--port 8080] [--syslog 5514] [--uninstall]
+#   sudo ./install.sh [--port 8080] [--syslog 514,5514] [--uninstall]
 set -eu
 
 PORT=8080
-SYSLOG=5514
+SYSLOG=514,5514
 UNINSTALL=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -53,7 +53,8 @@ mkdir -p "$DATA"
 chown draypulse:draypulse "$DATA"
 chmod 0700 "$DATA"
 
-echo "→ Tạo dịch vụ $UNIT (web :$PORT, syslog UDP :$SYSLOG)"
+SYSLOG_ADDRS=$(echo "$SYSLOG" | sed 's/^/:/; s/,/,:/g')
+echo "→ Tạo dịch vụ $UNIT (web :$PORT, syslog UDP $SYSLOG_ADDRS)"
 cat > "$UNIT" <<EOF
 [Unit]
 Description=DrayPulse – giám sát router DrayTek
@@ -64,7 +65,7 @@ Wants=network-online.target
 User=draypulse
 Group=draypulse
 Environment=TZ=Asia/Ho_Chi_Minh
-ExecStart=/usr/local/bin/draypulse -data $DATA -listen :$PORT -syslog :$SYSLOG
+ExecStart=/usr/local/bin/draypulse -data $DATA -listen :$PORT -syslog $SYSLOG_ADDRS
 Restart=always
 RestartSec=5
 # ping thiết bị (ICMP) và cổng syslog < 1024 nếu cần

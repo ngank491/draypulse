@@ -343,6 +343,36 @@ func TestSyslogParseAndEvents(t *testing.T) {
 	if evs, _ := st.ListEvents(nil, 10); len(evs) != 1 {
 		t.Fatalf("repeated syslog lines must give one event: %+v", evs)
 	}
+
+	// a sender that is not the router's configured address shows up as unknown…
+	r2 := &Router{Name: "HCM", Mode: "pull", Host: "10.99.0.1", Enabled: false, Interval: 60, WANTarget: "8.8.8.8", Opts: DrayOpts{SNMPVersion: "2c"}}
+	st.SaveRouter(r2)
+	h.Reload(r2.ID)
+	c2, _ := net.Dial("udp", h.syslog.Addr()) // comes from 127.0.0.1 = router 1, so use the host name path instead
+	c2.Write([]byte("<166>Jan 01 09:00:00 HCM-Vigor: WAN 1 is down"))
+	c2.Close()
+	waitFor(t, "unknown sender listed", func() bool {
+		st1 := h.syslog.Status(r.ID, nil)
+		return st1.Received == 4
+	})
+	// …and is matched by host name once the router's identity is known
+	rs2 := h.get(r2.ID)
+	rs2.mu.Lock()
+	rs2.Identity = "HCM-Vigor"
+	rs2.mu.Unlock()
+	h.syslog.Invalidate()
+	if id, ok := h.syslog.routerFor("10.1.1.1", "hcm-vigor"); !ok || id != r2.ID {
+		t.Fatalf("host-name match failed: %v %v", id, ok)
+	}
+	if _, ok := h.syslog.routerFor("10.1.1.1", "unknown"); ok {
+		t.Fatal("unknown host must not match")
+	}
+	r2.Opts.SyslogFrom = []string{"10.1.1.1"}
+	st.SaveRouter(r2)
+	h.Reload(r2.ID)
+	if id, ok := h.syslog.routerFor("10.1.1.1", ""); !ok || id != r2.ID {
+		t.Fatal("extra sender IP must match")
+	}
 }
 
 func TestParseVlanAndLan(t *testing.T) {
@@ -365,20 +395,5 @@ func TestParseVlanAndLan(t *testing.T) {
 	}
 	if l[2]["dhcp"] != "false" || l[3]["enabled"] != "false" || l[4]["name"] != "Route" {
 		t.Fatalf("%+v %+v", l[2], l[3])
-	}
-}
-
-func TestParseFirewallReadbacks(t *testing.T) {
-	o := parseIPObject(fixture(t, "ipobj_mac.txt"))
-	if o["name"] != "DP-0A1B2C" || o["type"] != "mac" || o["mac"] != "F0:2F:74:0A:1B:2C" {
-		t.Fatalf("%+v", o)
-	}
-	n, mem := parseIPGroup(fixture(t, "ipgrp.txt"))
-	if n != "DrayPulse" || len(mem) != 2 || mem[0] != 181 || mem[1] != 183 {
-		t.Fatal(n, mem)
-	}
-	r := parseFilterRule(fixture(t, "ipf_rule.txt"))
-	if r["status"] != "enable" || r["action"] != "Block Immediately" || r["source"] != "Group DrayPulse" || r["comment"] != "<null>" || !strings.Contains(r["direction"], "-> WAN") {
-		t.Fatalf("%+v", r)
 	}
 }

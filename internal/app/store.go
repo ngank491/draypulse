@@ -152,6 +152,20 @@ CREATE TABLE blocks(
   PRIMARY KEY(router_id, mac)) WITHOUT ROWID;
 `
 
+// schemaV6: blocking moved to Bind IP to MAC, keyed by IP.
+const schemaV6 = `
+DROP TABLE blocks;
+CREATE TABLE ip_blocks(
+  router_id INTEGER NOT NULL REFERENCES routers(id) ON DELETE CASCADE,
+  ip TEXT NOT NULL,
+  mac TEXT NOT NULL DEFAULT '',
+  name TEXT NOT NULL DEFAULT '',
+  note TEXT NOT NULL DEFAULT '',
+  by_user TEXT NOT NULL DEFAULT '',
+  at INTEGER NOT NULL,
+  PRIMARY KEY(router_id, ip)) WITHOUT ROWID;
+`
+
 type Store struct{ db *sql.DB }
 
 func OpenStore(path string) (*Store, error) {
@@ -182,7 +196,7 @@ func (s *Store) migrate() error {
 	if err := s.db.QueryRow("PRAGMA user_version").Scan(&v); err != nil {
 		return err
 	}
-	migrations := []string{schemaV1, schemaV2, schemaV3, schemaV4, schemaV5}
+	migrations := []string{schemaV1, schemaV2, schemaV3, schemaV4, schemaV5, schemaV6}
 	if v > len(migrations) {
 		return fmt.Errorf("database được tạo bởi phiên bản mới hơn (schema %d)", v)
 	}
@@ -1050,12 +1064,11 @@ func (s *Store) FailStaleAudits() error {
 	return nil
 }
 
-// ---------- MAC blocks ----------
+// ---------- blocked client IPs ----------
 
 type Block struct {
-	MAC    string `json:"mac"`
-	Obj    int    `json:"obj"` // router IP object index holding the MAC
 	IP     string `json:"ip"`
+	MAC    string `json:"mac"` // the client's real MAC when known (display only)
 	Name   string `json:"name"`
 	Note   string `json:"note"`
 	ByUser string `json:"byUser"`
@@ -1063,7 +1076,7 @@ type Block struct {
 }
 
 func (s *Store) ListBlocks(routerID int64) ([]Block, error) {
-	rows, err := s.db.Query("SELECT mac,obj,ip,name,note,by_user,at FROM blocks WHERE router_id=? ORDER BY at", routerID)
+	rows, err := s.db.Query("SELECT ip,mac,name,note,by_user,at FROM ip_blocks WHERE router_id=? ORDER BY at", routerID)
 	if err != nil {
 		return nil, err
 	}
@@ -1071,7 +1084,7 @@ func (s *Store) ListBlocks(routerID int64) ([]Block, error) {
 	out := []Block{}
 	for rows.Next() {
 		var b Block
-		if err := rows.Scan(&b.MAC, &b.Obj, &b.IP, &b.Name, &b.Note, &b.ByUser, &b.At); err != nil {
+		if err := rows.Scan(&b.IP, &b.MAC, &b.Name, &b.Note, &b.ByUser, &b.At); err != nil {
 			return nil, err
 		}
 		out = append(out, b)
@@ -1080,12 +1093,12 @@ func (s *Store) ListBlocks(routerID int64) ([]Block, error) {
 }
 
 func (s *Store) AddBlock(routerID int64, b Block) error {
-	_, err := s.db.Exec("INSERT INTO blocks(router_id,mac,obj,ip,name,note,by_user,at) VALUES(?,?,?,?,?,?,?,?)",
-		routerID, b.MAC, b.Obj, b.IP, b.Name, b.Note, b.ByUser, b.At)
+	_, err := s.db.Exec("INSERT INTO ip_blocks(router_id,ip,mac,name,note,by_user,at) VALUES(?,?,?,?,?,?,?)",
+		routerID, b.IP, b.MAC, b.Name, b.Note, b.ByUser, b.At)
 	return err
 }
 
-func (s *Store) DeleteBlock(routerID int64, mac string) error {
-	_, err := s.db.Exec("DELETE FROM blocks WHERE router_id=? AND mac=?", routerID, mac)
+func (s *Store) DeleteBlock(routerID int64, ip string) error {
+	_, err := s.db.Exec("DELETE FROM ip_blocks WHERE router_id=? AND ip=?", routerID, ip)
 	return err
 }

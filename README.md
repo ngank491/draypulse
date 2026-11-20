@@ -11,12 +11,12 @@ Telegram/Zalo và trợ lý AI, nhưng lớp đọc router được viết lại
 - **Ba cách đọc router, bổ sung cho nhau**
   - **SNMP v1/v2c/v3**: CPU, RAM, uptime, model, firmware, lưu lượng từng cổng LAN/WAN, danh sách VPN đang kết nối (DRAYTEK-MIB).
   - **Telnet / SSH** (tuỳ chọn): trạng thái WAN chi tiết, IP public, bảng ARP và DHCP lease (client, tên máy, cổng LAN), VLAN, kiểm tra Internet riêng từng WAN bằng `ip ping … WANx`. Chỉ gửi lệnh xem trong danh sách cố định (riêng tính năng chặn client có danh sách lệnh ghi riêng, tắt mặc định).
-  - **Syslog** (tuỳ chọn): router tự đẩy sự kiện VPN kết nối/ngắt, WAN lên/xuống, đăng nhập quản trị.
+  - **Syslog** (tuỳ chọn, UDP 514/5514): router tự đẩy log; sự kiện VPN kết nối/ngắt, WAN lên/xuống, đăng nhập quản trị. Tab Syslog có khung chẩn đoán và gán địa chỉ gửi bằng một nút.
 - **Tổng quan nhiều router**: CPU, RAM, uptime, firmware, trạng thái WAN và số thiết bị lỗi trên một màn hình.
 - **WAN đa đường**: link + Internet từng WAN, IP public, đổi IP, tự gợi ý WAN đang bật trên router.
 - **VPN**: bảng LAN-to-LAN / Remote Dial-in đang kết nối, cảnh báo VPN PPTP.
-- **VLAN**: từng VLAN với VID, cổng thành viên (kèm trạng thái link), subnet, client và mức dùng DHCP; cảnh báo khi VLAN bị đổi cấu hình hoặc DHCP sắp hết địa chỉ.
-- **Chặn client theo MAC** (thử nghiệm, tắt mặc định): một nút trong tab Client, chặn ra Internet qua Firewall của router (IP Object MAC → IP Group → rule Block). Chỉ đụng tới các ô bạn dành riêng, đọc lại sau mỗi lệnh ghi và tự hoàn tác nếu router không nhận.
+- **VLAN**: bấm vào từng VLAN/subnet để xem client của nó; VID, cổng thành viên (kèm trạng thái link), subnet, client và mức dùng DHCP; cảnh báo khi VLAN bị đổi cấu hình hoặc DHCP sắp hết địa chỉ.
+- **Chặn client**: một nút trong tab Client chặn IP khỏi mạng qua bảng Bind IP to MAC của router – không cần chuẩn bị trên router, không đụng tới mục do bạn tạo, đọc lại sau mỗi lệnh ghi và tự hoàn tác nếu router không nhận.
 - **Theo dõi thiết bị**: ping camera, switch, AP, NAS… mỗi 30 giây (từ máy DrayPulse hoặc từ router). Độ trễ và tỷ lệ sẵn sàng 24 giờ.
 - **Client**: gộp DHCP lease và ARP; tên máy (HOST ID, NetBIOS, mDNS), hãng theo MAC, cổng LAN (P1…).
 - **Sơ đồ mạng kéo thả**, **biểu đồ lịch sử** lưu lượng/CPU/RAM từ 1 giờ đến 30 ngày (bộ đếm 32-bit của DrayOS được tự nối dài thành 64-bit, không bị nhảy số khi tràn).
@@ -94,7 +94,7 @@ Image Docker/Home Assistant chỉ được CI build khi đẩy tag phiên bản 
 | `-tls-cert`, `-tls-key` | Dùng chứng chỉ riêng của bạn |
 | `DRAYPULSE_ADMIN_PASSWORD` | Tạo admin ngay ở lần chạy đầu, không cần mã khởi tạo |
 | `-trust-proxy` | Tin header `X-Forwarded-*` (chỉ bật khi đứng sau reverse proxy) |
-| `-syslog` / `DRAYPULSE_SYSLOG` | Cổng UDP nhận syslog từ router (mặc định `:5514`, `off` để tắt) |
+| `-syslog` / `DRAYPULSE_SYSLOG` | Cổng UDP nhận syslog từ router (mặc định `:514,:5514`; 514 cần root/CAP_NET_BIND_SERVICE; `off` để tắt) |
 | `-demo` | Tạo một router Vigor2927 mô phỏng (SNMP + Telnet giả lập chạy bên trong) để dùng thử |
 
 ## Kết nối router (tóm tắt)
@@ -108,7 +108,7 @@ Trên router (Web UI hoặc Telnet/SSH từ LAN), với `192.168.1.4` là máy c
 2. **SSH/Telnet** (nên có) – *System Maintenance → Management*: bật SSH Server cho LAN. Không bật "Allow management from the Internet".
 3. **Syslog** (tuỳ chọn) – *System Maintenance → SysLog / Mail Alert*:
    ```
-   sys syslog -a 1 -s 1 -i 192.168.1.4 -d 5514 -f 0 -v 1 -w 1 -r 1 -e 0
+   sys syslog -a 1 -s 1 -i 192.168.1.4 -d 514 -f 0 -v 1 -w 1 -r 1 -e 0
    ```
 4. Trong DrayPulse: **Router → Thêm router**, nhập IP, community, tài khoản SSH → **Kiểm tra kết nối** → chọn WAN1/WAN2 → Lưu.
 

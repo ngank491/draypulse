@@ -80,9 +80,11 @@ func (s *Server) Handler() http.Handler {
 	admin("PUT /api/admin/routers/{id}", s.saveRouter)
 	admin("DELETE /api/admin/routers/{id}", s.deleteRouter)
 	user("GET /api/routers/{id}/blocks", s.listBlocks)
-	admin("POST /api/admin/routers/{id}/blocks/check", s.checkBlocks)
 	admin("POST /api/admin/routers/{id}/blocks", s.blockClient)
-	admin("DELETE /api/admin/routers/{id}/blocks/{mac}", s.unblockClient)
+	admin("DELETE /api/admin/routers/{id}/blocks/{ip}", s.unblockClient)
+	user("GET /api/routers/{id}/syslog", s.syslogStatus)
+	admin("POST /api/admin/routers/{id}/syslog-source", s.addSyslogSource)
+	admin("DELETE /api/admin/routers/{id}/syslog-source/{ip}", s.removeSyslogSource)
 	admin("POST /api/admin/routers/test", s.testRouter)
 	admin("POST /api/admin/routers/{id}/monitors", s.saveMonitor)
 	admin("PUT /api/admin/monitors/{mid}", s.saveMonitor)
@@ -695,8 +697,10 @@ func (s *Server) applyRouter(r *Router, in routerInput) error {
 	r.Interval, r.WANs, r.WANTarget, r.ChatID, r.Enabled = in.Interval, in.WANs, in.WANTarget, in.ChatID, in.Enabled
 	r.ZaloChat = in.ZaloChat
 	if in.Mode == "pull" {
-		// readiness of MAC blocking survives a save only if its slots are unchanged
-		in.Opts.Block.Ready = r.Opts.Block.Ready && sameBlockSlots(r.Opts.Block, in.Opts.Block)
+		// whether DrayPulse switched Bind IP to MAC on is router state, not a setting;
+		// extra syslog senders are managed from the Syslog tab
+		in.Opts.Block.TurnedOn = r.Opts.Block.TurnedOn
+		in.Opts.SyslogFrom = r.Opts.SyslogFrom
 		r.Opts = in.Opts
 	}
 	if r.WANs == nil {
@@ -720,9 +724,7 @@ func (s *Server) adminRouters(w http.ResponseWriter, r *http.Request, u *User) {
 	}
 	out := map[string]any{"routers": rs}
 	if sl := s.hub.syslog; sl != nil {
-		sl.mu.Lock()
-		out["syslog"] = map[string]any{"addr": sl.Addr(), "unknown": sl.Unknown, "lastFrom": sl.LastFrom}
-		sl.mu.Unlock()
+		out["syslog"] = map[string]any{"listening": sl.Addrs, "failed": sl.Fails}
 	}
 	writeJSON(w, 200, out)
 }
@@ -1319,17 +1321,6 @@ func (s *Server) listBlocks(w http.ResponseWriter, r *http.Request, u *User) {
 	writeJSON(w, 200, st)
 }
 
-func (s *Server) checkBlocks(w http.ResponseWriter, r *http.Request, u *User) {
-	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
-	defer cancel()
-	res, err := s.hub.CheckBlocking(ctx, pathID(r, "id"))
-	if err != nil {
-		errJSON(w, 502, err.Error())
-		return
-	}
-	writeJSON(w, 200, res)
-}
-
 func (s *Server) blockClient(w http.ResponseWriter, r *http.Request, u *User) {
 	var in struct {
 		MAC  string `json:"mac"`
@@ -1341,13 +1332,14 @@ func (s *Server) blockClient(w http.ResponseWriter, r *http.Request, u *User) {
 		return
 	}
 	in.Name, in.Note = truncateUTF8(strings.TrimSpace(in.Name), 64), truncateUTF8(strings.TrimSpace(in.Note), 200)
-	if in.IP != "" && net.ParseIP(in.IP) == nil {
+	in.IP = strings.TrimSpace(in.IP)
+	if net.ParseIP(in.IP) == nil {
 		errJSON(w, 400, "IP không hợp lệ")
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
 	defer cancel()
-	b, err := s.hub.BlockClient(ctx, pathID(r, "id"), in.MAC, in.IP, in.Name, in.Note, u.Username)
+	b, err := s.hub.BlockClient(ctx, pathID(r, "id"), in.IP, in.MAC, in.Name, in.Note, u.Username)
 	if err != nil {
 		errJSON(w, 502, err.Error())
 		return
@@ -1358,9 +1350,108 @@ func (s *Server) blockClient(w http.ResponseWriter, r *http.Request, u *User) {
 func (s *Server) unblockClient(w http.ResponseWriter, r *http.Request, u *User) {
 	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
 	defer cancel()
-	if err := s.hub.UnblockClient(ctx, pathID(r, "id"), r.PathValue("mac"), u.Username); err != nil {
+	if err := s.hub.UnblockClient(ctx, pathID(r, "id"), r.PathValue("ip"), u.Username); err != nil {
 		errJSON(w, 502, err.Error())
 		return
 	}
 	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+
+// ---------- syslog diagnostics ----------
+
+func (s *Server) syslogStatus(w http.ResponseWriter, r *http.Request, u *User) {
+	id := pathID(r, "id")
+	if !u.CanSee(id) {
+		errJSON(w, 404, "không tìm thấy")
+		return
+	}
+	rt, err := s.st.GetRouter(id)
+	if err != nil {
+		serverErr(w, err)
+		return
+	}
+	sl := s.hub.syslog
+	if sl == nil {
+		writeJSON(w, 200, map[string]any{"enabled": false})
+		return
+	}
+	st := sl.Status(id, rt.Opts.SyslogFrom)
+	if u.Role != "admin" {
+		st.Unknown = []srcStat{} // other routers' senders are not this viewer's business
+	}
+	writeJSON(w, 200, map[string]any{"enabled": true, "status": st, "host": rt.Host})
+}
+
+func (s *Server) setSyslogSources(w http.ResponseWriter, r *http.Request, change func([]string) []string) {
+	id := pathID(r, "id")
+	rt, err := s.st.GetRouter(id)
+	if err != nil {
+		serverErr(w, err)
+		return
+	}
+	rt.Opts.SyslogFrom = change(rt.Opts.SyslogFrom)
+	if len(rt.Opts.SyslogFrom) > 8 {
+		errJSON(w, 400, "tối đa 8 địa chỉ gửi syslog cho một router")
+		return
+	}
+	if err := s.st.SaveRouter(rt); err != nil {
+		serverErr(w, err)
+		return
+	}
+	if err := s.hub.Reload(id); err != nil {
+		serverErr(w, err)
+		return
+	}
+	if s.hub.syslog != nil {
+		s.hub.syslog.Invalidate()
+	}
+	writeJSON(w, 200, map[string]any{"syslogFrom": rt.Opts.SyslogFrom})
+}
+
+func (s *Server) addSyslogSource(w http.ResponseWriter, r *http.Request, u *User) {
+	var in struct {
+		IP string `json:"ip"`
+	}
+	if !readJSON(w, r, &in) {
+		return
+	}
+	ip := net.ParseIP(strings.TrimSpace(in.IP))
+	if ip == nil {
+		errJSON(w, 400, "IP không hợp lệ")
+		return
+	}
+	// one sender belongs to one router
+	routers, _ := s.st.ListRouters()
+	for _, o := range routers {
+		if o.ID == pathID(r, "id") {
+			continue
+		}
+		for _, x := range o.Opts.SyslogFrom {
+			if x == ip.String() {
+				errJSON(w, 400, "IP này đang được gán cho router "+o.Name)
+				return
+			}
+		}
+	}
+	s.setSyslogSources(w, r, func(l []string) []string {
+		for _, x := range l {
+			if x == ip.String() {
+				return l
+			}
+		}
+		return append(l, ip.String())
+	})
+}
+
+func (s *Server) removeSyslogSource(w http.ResponseWriter, r *http.Request, u *User) {
+	ip := r.PathValue("ip")
+	s.setSyslogSources(w, r, func(l []string) []string {
+		out := []string{}
+		for _, x := range l {
+			if x != ip {
+				out = append(out, x)
+			}
+		}
+		return out
+	})
 }
