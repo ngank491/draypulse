@@ -1,0 +1,5 @@
+[ARP Table]
+Index IP Address     MAC Address      HOST ID    Interface  VLAN   Port
+   1   192.168.100.100AA-BB-CC-DD-EE-FF          WAN1        ---    --
+   2   192.168.1.10   08-00-27-5D-1A-09           LAN1       VLAN0   P9
+   3   192.168.1.23   3C-52-82-11-22-33  HP-Printer  LAN1       VLAN0   P2

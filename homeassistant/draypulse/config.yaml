@@ -1,0 +1,31 @@
+name: DrayPulse
+version: "0.1.0"
+slug: draypulse
+description: Giám sát router DrayTek Vigor gọn nhẹ – SNMP/Telnet/SSH/Syslog, WAN, VPN, thiết bị, cảnh báo Telegram/Zalo, kiểm tra bảo mật bằng AI
+url: https://github.com/ngank491/draypulse
+arch:
+  - amd64
+  - aarch64
+  - armv7
+startup: application
+boot: auto
+init: false
+# Image được CI build (khi đẩy tag v*) với RUN_USER=0
+# vì /data của add-on thuộc root.
+image: ghcr.io/ngank491/draypulse-ha
+ports:
+  8080/tcp: 8080
+  5514/udp: 5514
+ports_description:
+  8080/tcp: Giao diện web
+  5514/udp: Nhận syslog từ router DrayTek
+webui: "[PROTO:https]://[HOST]:[PORT:8080]"
+watchdog: "[PROTO:https]://[HOST]:[PORT:8080]/healthz"
+options:
+  admin_password: ""
+  https: false
+  trust_proxy: false
+schema:
+  admin_password: password?
+  https: bool
+  trust_proxy: bool

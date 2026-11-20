@@ -1,0 +1,21 @@
+services:
+  draypulse:
+    image: ghcr.io/ngank491/draypulse:latest   # hoặc: build: .
+    container_name: draypulse
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+      - "5514:5514/udp"   # syslog từ router DrayTek (tuỳ chọn)
+    environment:
+      TZ: Asia/Ho_Chi_Minh
+      # Bỏ trống để dùng mã khởi tạo hiện trong log (docker logs draypulse)
+      # DRAYPULSE_ADMIN_PASSWORD: "doi-mat-khau-nay"
+      # DRAYPULSE_TLS: auto            # HTTPS tự ký
+      # DRAYPULSE_TRUST_PROXY: "true"  # nếu đứng sau reverse proxy
+    volumes:
+      - draypulse-data:/data
+    logging:
+      driver: json-file
+      options: { max-size: "5m", max-file: "3" }
+volumes:
+  draypulse-data:

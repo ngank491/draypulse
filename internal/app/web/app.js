@@ -1,0 +1,1623 @@
+'use strict';
+/* DrayPulse web UI – plain JS, no build step. DOM is built with h()/s(),
+   never innerHTML, so router-supplied names can't inject markup. */
+
+// ---------- DOM helpers ----------
+function h(tag, attrs, ...kids) {
+  const el = document.createElement(tag);
+  setAttrs(el, attrs);
+  append(el, kids);
+  return el;
+}
+const SVGNS = 'http://www.w3.org/2000/svg';
+function s(tag, attrs, ...kids) {
+  const el = document.createElementNS(SVGNS, tag);
+  setAttrs(el, attrs);
+  append(el, kids);
+  return el;
+}
+function setAttrs(el, attrs) {
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v == null || v === false) continue;
+    if (k === 'class') el.setAttribute('class', v);
+    else if (k.startsWith('on') && typeof v === 'function') el.addEventListener(k.slice(2), v);
+    else if (k === 'value') el.value = v;
+    else if (k === 'checked') el.checked = !!v;
+    else if (k === 'selected') el.selected = !!v;
+    else el.setAttribute(k, v === true ? '' : v);
+  }
+}
+function append(el, kids) {
+  for (const c of kids.flat(Infinity)) {
+    if (c == null || c === false) continue;
+    el.append(c instanceof Node ? c : String(c));
+  }
+}
+const $ = (sel, el = document) => el.querySelector(sel);
+const clear = el => { while (el.firstChild) el.removeChild(el.firstChild); return el; };
+const fill = (el, ...kids) => { clear(el); append(el, kids); return el; };
+
+// ---------- API ----------
+async function api(method, path, body) {
+  const opt = { method, headers: { 'X-Requested-With': 'draypulse' }, credentials: 'same-origin' };
+  if (body !== undefined) { opt.headers['Content-Type'] = 'application/json'; opt.body = JSON.stringify(body); }
+  let r;
+  try { r = await fetch(path, opt); } catch { throw new Error('Không kết nối được máy chủ DrayPulse'); }
+  const ct = r.headers.get('content-type') || '';
+  const data = ct.includes('json') ? await r.json().catch(() => ({})) : await r.blob();
+  if (!r.ok) {
+    const e = new Error((data && data.error) || ('Lỗi ' + r.status));
+    e.status = r.status;
+    if (r.status === 401 && me && !path.startsWith('/api/me/password')) { me = null; showAuth(); }
+    throw e;
+  }
+  return data;
+}
+
+function toast(msg, kind = '') {
+  const t = h('div', { class: 'toast ' + kind }, msg);
+  $('#toasts').append(t);
+  setTimeout(() => t.remove(), kind === 'bad' ? 7000 : 3500);
+}
+
+// ---------- formatting ----------
+const fmtBps = v => v == null ? '–' : v >= 1e9 ? (v / 1e9).toFixed(2) + ' Gbps' : v >= 1e6 ? (v / 1e6).toFixed(1) + ' Mbps' : v >= 1e3 ? (v / 1e3).toFixed(0) + ' kbps' : Math.round(v) + ' bps';
+function fmtBytes(v) {
+  v = Number(v); if (!isFinite(v)) return '–';
+  const u = ['B', 'KB', 'MB', 'GB', 'TB', 'PB']; let i = 0;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return (i ? v.toFixed(1) : v) + ' ' + u[i];
+}
+function rosSec(s) {
+  if (!s) return null; if (/^\d+(\.\d+)?$/.test(String(s))) return +s; let t = 0; const c = /(\d+):(\d+):(\d+)/.exec(s);
+  if (c) { t += +c[1] * 3600 + +c[2] * 60 + +c[3]; s = s.replace(c[0], ''); }
+  for (const m of s.matchAll(/(\d+)(ms|us|w|d|h|m|s)/g)) t += +m[1] * ({ w: 604800, d: 86400, h: 3600, m: 60, s: 1, ms: .001, us: 0 })[m[2]];
+  return t;
+}
+function fmtDur(sec) {
+  if (sec == null || !isFinite(sec)) return '–';
+  sec = Math.max(0, Math.floor(sec));
+  const d = Math.floor(sec / 86400), hr = Math.floor(sec % 86400 / 3600), m = Math.floor(sec % 3600 / 60);
+  if (d) return `${d} ngày ${hr} giờ`;
+  if (hr) return `${hr} giờ ${m} phút`;
+  if (m) return `${m} phút`;
+  return `${sec} giây`;
+}
+const since = ms => ms ? fmtDur((Date.now() - ms) / 1000) : '–';
+function ago(ms) { if (!ms) return 'chưa có'; const s = (Date.now() - ms) / 1000; return s < 5 ? 'vừa xong' : fmtDur(s) + ' trước'; }
+function fmtTime(ms) {
+  if (!ms) return '–';
+  const d = new Date(ms), today = new Date();
+  const t = d.toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  return d.toDateString() === today.toDateString() ? t : t + ' ' + d.toLocaleDateString('vi-VN', { day: '2-digit', month: '2-digit' });
+}
+const pct = v => v == null ? '–' : Math.round(v) + '%';
+function ipKey(ip) { const p = String(ip).split('.'); return p.length === 4 ? p.reduce((a, x) => a * 256 + (+x || 0), 0) : Number.MAX_SAFE_INTEGER; }
+const truthy = v => v === 'true' || v === 'yes';
+
+const ST_TEXT = { up: 'Hoạt động', down: 'Mất kết nối', waiting: 'Chờ dữ liệu', disabled: 'Đã tắt', unknown: 'Chưa rõ', error: 'Lỗi kiểm tra' };
+const badge = (st, text) => h('span', { class: 'st ' + (st || 'unknown') }, text || ST_TEXT[st] || st || '–');
+const KIND = { device: ['PC', 'Máy tính / thiết bị'], switch: ['SW', 'Switch'], ap: ['AP', 'Wi-Fi AP'], camera: ['CAM', 'Camera'], server: ['SRV', 'Máy chủ / NAS'], printer: ['PRN', 'Máy in'], phone: ['TEL', 'Điện thoại IP'], virtual: ['—', 'Nút ảo (không ping)'] };
+
+function meterRow(label, v) {
+  const val = v == null ? 0 : Math.min(100, Math.max(0, v));
+  const cls = val >= 90 ? 'crit' : val >= 75 ? 'hi' : '';
+  const bar = h('i', { class: cls }); bar.style.width = val + '%';
+  return h('div', { class: 'meter' }, h('span', { class: 'muted' }, label), h('div', { class: 'bar' }, bar), h('span', { class: 'right' }, pct(v)));
+}
+
+// ---------- sortable / filterable table ----------
+// cols: [{t:'Title', v: row => sortValue, r: row => cell content, num:bool}]
+function table(cols, rows, opts = {}) {
+  const st = opts.state || {};
+  let list = rows;
+  if (st.q) {
+    const q = st.q.toLowerCase();
+    list = list.filter(r => cols.some(c => String(c.v ? c.v(r) ?? '' : '').toLowerCase().includes(q)));
+  }
+  if (st.sort != null && cols[st.sort] && cols[st.sort].v) {
+    const c = cols[st.sort], dir = st.desc ? -1 : 1;
+    list = [...list].sort((a, b) => {
+      const x = c.v(a), y = c.v(b);
+      if (typeof x === 'number' || typeof y === 'number') return ((x ?? -Infinity) - (y ?? -Infinity)) * dir;
+      return String(x ?? '').localeCompare(String(y ?? ''), 'vi', { numeric: true }) * dir;
+    });
+  }
+  const head = h('tr', null, cols.map((c, i) => h('th', {
+    class: (c.num ? 'num ' : '') + (c.v ? 'sort' : ''),
+    onclick: c.v ? () => { if (st.sort === i) st.desc = !st.desc; else { st.sort = i; st.desc = !!c.num; } opts.rerender && opts.rerender(); } : null,
+  }, c.t, st.sort === i ? (st.desc ? ' ▾' : ' ▴') : '')));
+  const body = list.length ? list.map(r => h('tr', { class: opts.rowClass ? opts.rowClass(r) : null },
+    cols.map(c => h('td', { class: c.num ? 'num' : null }, c.r ? c.r(r) : (c.v(r) ?? '–'))))) :
+    h('tr', null, h('td', { colspan: cols.length, class: 'empty' }, opts.empty || 'Không có dữ liệu'));
+  return h('div', { class: 'tw' }, h('table', null, h('thead', null, head), h('tbody', null, body)));
+}
+
+// A panel with title, optional search box and a body re-rendered on refresh.
+function tablePanel(title, key, extra) {
+  const state = ui.tables[key] || (ui.tables[key] = { q: '' });
+  const body = h('div');
+  const count = h('span', { class: 'muted small' });
+  const search = h('input', { class: 'search', type: 'search', placeholder: 'Tìm…', value: state.q, oninput: e => { state.q = e.target.value; panel.redraw(); } });
+  const el = h('div', { class: 'panel' }, h('div', { class: 'panel-h' }, h('h2', null, title), count, h('div', { class: 'grow' }), extra || null, search), body);
+  const panel = {
+    el, state,
+    last: null,
+    draw(cols, rows, opts = {}) { this.last = [cols, rows, opts]; fill(body, table(cols, rows, { ...opts, state, rerender: () => this.redraw() })); count.textContent = rows.length ? `(${rows.length})` : ''; },
+    redraw() { if (this.last) this.draw(...this.last); },
+  };
+  return panel;
+}
+
+// ---------- modal ----------
+function modal(title, content, actions) {
+  const bg = h('div', { class: 'modal-bg' });
+  const close = () => { bg.remove(); ui.modal = false; };
+  const foot = h('div', { class: 'modal-foot' });
+  for (const a of actions || []) foot.append(h('button', { class: a.cls || '', type: a.submit ? 'submit' : 'button', onclick: a.submit ? null : () => a.fn(close) }, a.t));
+  const form = h('form', { class: 'panel modal', onsubmit: e => { e.preventDefault(); const a = (actions || []).find(x => x.submit); if (a) a.fn(close); } },
+    h('div', { class: 'panel-h' }, h('h2', { class: 'grow' }, title), h('button', { type: 'button', class: 'link', onclick: close, 'aria-label': 'Đóng' }, '✕')),
+    h('div', { class: 'panel-b' }, content), foot);
+  bg.addEventListener('mousedown', e => { if (e.target === bg) close(); });
+  bg.append(form);
+  document.body.append(bg);
+  ui.modal = true;
+  const first = form.querySelector('input:not([type=checkbox]),select');
+  if (first) first.focus();
+  return close;
+}
+const field = (label, input, cls) => h('label', { class: 'f ' + (cls || '') }, label, input);
+const check = (label, input) => h('label', { class: 'cb' }, input, label);
+
+async function busy(btn, fn) {
+  btn.disabled = true;
+  try { return await fn(); } catch (e) { toast(e.message, 'bad'); } finally { btn.disabled = false; }
+}
+
+// ---------- state & routing ----------
+let me = null;
+const ui = { tables: {}, modal: false, drag: false, hist: { hours: 6, iface: '' } };
+let page = null, timer = null;
+
+async function boot() {
+  try { me = await api('GET', '/api/me'); } catch { return showAuth(); }
+  if (!boot.bound) {
+    boot.bound = true;
+    window.addEventListener('hashchange', route);
+    document.addEventListener('visibilitychange', () => { if (!document.hidden && me) refresh(); });
+  }
+  route();
+}
+
+function shell() {
+  const navItems = [['#/', 'Tổng quan'], ['#/events', 'Sự kiện']];
+  const helpItem = ['#/help', 'Hướng dẫn'];
+  if (me.role === 'admin') navItems.push(['#/admin/routers', 'Router'], ['#/admin/users', 'Người dùng'], ['#/admin/settings', 'Cài đặt']);
+  navItems.push(helpItem);
+  const hash = location.hash || '#/';
+  const nav = h('nav', { class: 'nav' }, navItems.map(([href, t]) => h('a', {
+    href, class: (href === '#/' ? hash === '#/' || hash.startsWith('#/r/') : hash.startsWith(href)) ? 'on' : null,
+  }, t)));
+  const top = h('header', { class: 'top' }, h('div', { class: 'top-in' },
+    h('a', { class: 'logo', href: '#/' }, h('img', { src: 'favicon.svg', alt: '' }), 'DrayPulse'), nav,
+    h('div', { class: 'user' },
+      h('a', { href: '#/account', class: 'name', title: 'Tài khoản' }, me.username + (me.role === 'admin' ? ' (admin)' : '')),
+      h('button', { class: 'sm', onclick: async () => { await api('POST', '/api/logout').catch(() => { }); me = null; showAuth(); } }, 'Đăng xuất'))));
+  const main = h('main');
+  fill($('#app'), top, main);
+  return main;
+}
+
+function route() {
+  if (!me) return;
+  clearInterval(timer);
+  const parts = (location.hash || '#/').slice(2).split('?')[0].split('/');
+  const main = shell();
+  let p;
+  if (parts[0] === 'r' && parts[1]) p = routerPage(+parts[1], parts[2] || 'overview');
+  else if (parts[0] === 'events') p = eventsPage();
+  else if (parts[0] === 'account') p = accountPage();
+  else if (parts[0] === 'help') p = helpPage(parts[1] ? decodeURIComponent(parts[1]) : '');
+  else if (parts[0] === 'admin' && me.role === 'admin') p = ({ routers: adminRoutersPage, users: usersPage, settings: settingsPage })[parts[1]]?.();
+  p = p || overviewPage();
+  page = p;
+  p.mount(main);
+  refresh();
+  if (p.every) timer = setInterval(() => { if (!document.hidden && !ui.modal && !ui.drag) refresh(); }, p.every);
+}
+
+async function refresh() {
+  const p = page;
+  if (!p || !p.load || p.loading) return;
+  p.loading = true;
+  try { const d = await p.load(); if (page === p) p.update(d); }
+  catch (e) { if (e.status !== 401 && page === p) toast(e.message, 'bad'); }
+  finally { p.loading = false; }
+}
+
+// ---------- auth screens ----------
+async function showAuth() {
+  clearInterval(timer);
+  let needed = false;
+  try { needed = (await api('GET', '/api/setup')).needed; } catch { }
+  needed ? showSetup() : showLogin();
+}
+
+function authForm(title, sub, fields, btnText, submit) {
+  const err = h('div', { class: 'err-line' });
+  const btn = h('button', { class: 'primary', type: 'submit' }, btnText);
+  const form = h('form', { class: 'panel stack', onsubmit: async e => {
+    e.preventDefault(); err.textContent = ''; btn.disabled = true;
+    try { await submit(); } catch (x) { err.textContent = x.message; } finally { btn.disabled = false; }
+  } }, h('h1', null, h('img', { src: 'favicon.svg', alt: '' }), title), h('p', { class: 'muted' }, sub), fields, err, btn);
+  fill($('#app'), h('div', { class: 'auth' }, form));
+  form.querySelector('input').focus();
+}
+
+function showLogin() {
+  const u = h('input', { autocomplete: 'username', required: true, maxlength: 64 });
+  const p = h('input', { type: 'password', autocomplete: 'current-password', required: true, maxlength: 256 });
+  authForm('DrayPulse', 'Giám sát router DrayTek', [field('Tên đăng nhập', u), field('Mật khẩu', p)], 'Đăng nhập', async () => {
+    me = await api('POST', '/api/login', { username: u.value, password: p.value });
+    boot();
+  });
+}
+
+function showSetup() {
+  const c = h('input', { required: true, placeholder: 'XXXX-XXXX', autocomplete: 'off' });
+  const u = h('input', { value: 'admin', required: true, autocomplete: 'username' });
+  const p = h('input', { type: 'password', required: true, minlength: 10, autocomplete: 'new-password' });
+  const p2 = h('input', { type: 'password', required: true, autocomplete: 'new-password' });
+  authForm('Khởi tạo DrayPulse', 'Nhập mã khởi tạo hiển thị trong cửa sổ/log của DrayPulse, rồi tạo tài khoản quản trị.',
+    [field('Mã khởi tạo', c), field('Tên quản trị', u), field('Mật khẩu (≥ 10 ký tự)', p), field('Nhập lại mật khẩu', p2)], 'Tạo tài khoản', async () => {
+      if (p.value !== p2.value) throw new Error('Hai mật khẩu không khớp');
+      me = await api('POST', '/api/setup', { code: c.value, username: u.value, password: p.value });
+      location.hash = me.role === 'admin' ? '#/admin/routers' : '#/';
+      boot();
+    });
+}
+
+// ---------- overview ----------
+function overviewPage() {
+  let grid, evBox;
+  return {
+    every: 5000,
+    mount(main) {
+      grid = h('div', { class: 'grid cards' });
+      evBox = h('div');
+      main.append(h('div', { class: 'stack' }, grid, h('div', { class: 'panel' }, h('div', { class: 'panel-h' }, h('h2', null, 'Sự kiện gần đây'), h('div', { class: 'grow' }), h('a', { href: '#/events' }, 'Xem tất cả')), evBox)));
+    },
+    load: () => api('GET', '/api/overview'),
+    update(d) {
+      clear(grid);
+      if (!d.routers.length) {
+        grid.append(h('div', { class: 'panel panel-b' }, me.role === 'admin' ? ['Chưa có router nào. ', h('a', { href: '#/admin/routers' }, 'Thêm router đầu tiên →')] : 'Bạn chưa được cấp quyền xem router nào.'));
+      }
+      for (const r of d.routers) grid.append(routerCard(r));
+      fill(evBox, eventList(d.events, Object.fromEntries(d.routers.map(r => [r.id, r.name]))));
+    },
+  };
+}
+
+function routerCard(r) {
+  const res = r.resource || {};
+  r.wans = r.wans || []; r.downList = r.downList || [];
+  const chips = r.wans.filter(w => w.configured || r.wans.every(x => !x.configured)).map(w => {
+    const st = !w.configured ? (w.running ? 'up' : w.running === false ? 'down' : '') : (w.link.status === 'down' || w.inet.status === 'down') ? 'down' : w.inet.status === 'up' || (w.link.status === 'up' && w.inet.status === 'unknown') ? 'up' : '';
+    return h('span', { class: 'chip ' + st, title: w.iface }, (st === 'down' ? '✕ ' : st === 'up' ? '✓ ' : '') + (w.label || w.iface));
+  });
+  return h('a', { class: 'panel rcard ' + (r.status === 'down' ? 'down' : ''), href: `#/r/${r.id}/overview` },
+    h('div', { class: 'rc-head' }, h('span', { class: 'dot ' + r.status }), h('b', { class: 'grow' }, r.name), badge(r.status)),
+    h('div', { class: 'rc-sub' }, [r.identity, res['board-name'], res.version && 'DrayOS ' + res.version.split(' ')[0]].filter(Boolean).join(' · ') || (r.mode === 'demo' ? 'Router mô phỏng' : '')),
+    r.status === 'down' || r.status === 'waiting' ? h('div', { class: 'err-line' }, r.lastErr || (r.status === 'waiting' ? 'Đang chờ dữ liệu đầu tiên…' : 'Không nhận được dữ liệu')) : null,
+    meterRow('CPU', r.cpu), meterRow('RAM', r.mem),
+    chips.length ? h('div', { class: 'chips' }, chips) : null,
+    r.downList.length ? h('ul', { class: 'downlist' }, r.downList.slice(0, 4).map(x => h('li', null, '● ' + x))) : null,
+    h('div', { class: 'rc-foot' },
+      h('span', null, (r.monitorsTotal ? `Thiết bị: ${r.monitorsTotal - r.monitorsDown}/${r.monitorsTotal}` : 'Chưa theo dõi thiết bị') + (r.clientsTotal ? ` · Client: ${r.clientsOnline}/${r.clientsTotal}` : '')),
+      h('span', null, res.uptime ? 'Uptime ' + fmtDur(rosSec(res.uptime)) : ago(r.lastSeen))));
+}
+
+function eventList(events, names) {
+  if (!events.length) return h('div', { class: 'empty' }, EV_EMPTY);
+  return h('div', { class: 'tw' }, h('table', null, h('tbody', null, events.map(e => h('tr', null,
+    h('td', { class: 'nowrap muted small' }, fmtTime(e.at)),
+    names ? h('td', { class: 'nowrap' }, h('a', { href: `#/r/${e.routerId}/events` }, names[e.routerId] || '#' + e.routerId)) : null,
+    h('td', null, h('span', { class: 'dot ' + (e.level === 'warning' ? 'down' : 'up') }), ' ', e.msg))))));
+}
+
+// ---------- events page ----------
+const EV_EMPTY = 'Chưa có sự kiện. Sự kiện được ghi khi router mất/có kết nối, WAN hoặc cổng đổi trạng thái, thiết bị theo dõi lỗi, router khởi động lại, IP WAN đổi hoặc có thiết bị mới vào mạng.';
+function eventsPanel(title, key, withRouter) {
+  const levelSel = h('select', { class: 'search' }, h('option', { value: '' }, 'Mọi mức'), h('option', { value: 'warning' }, 'Cảnh báo'), h('option', { value: 'info' }, 'Thông tin'));
+  const p = tablePanel(title, key, levelSel);
+  let last = null;
+  levelSel.addEventListener('change', () => last && p.draw(...last));
+  const draw = (events, names) => {
+    const rows = levelSel.value ? events.filter(e => e.level === levelSel.value) : events;
+    const cols = [
+      { t: 'Thời gian', v: e => e.at, r: e => h('span', { class: 'nowrap small' }, fmtTime(e.at)) },
+      withRouter ? { t: 'Router', v: e => names[e.routerId] || '', r: e => h('a', { href: `#/r/${e.routerId}/events` }, names[e.routerId] || '#' + e.routerId) } : null,
+      { t: 'Mức', v: e => e.level, r: e => badge(e.level === 'warning' ? 'down' : 'up', e.level === 'warning' ? 'Cảnh báo' : 'Thông tin') },
+      { t: 'Nội dung', v: e => e.msg },
+    ].filter(Boolean);
+    last = [cols, rows, { empty: EV_EMPTY }];
+    if (p.state.sort == null) { p.state.sort = 0; p.state.desc = true; }
+    p.draw(...last);
+  };
+  return { el: p.el, draw };
+}
+
+function eventsPage() {
+  let panel, names = {};
+  return {
+    every: 10000,
+    mount(main) { panel = eventsPanel('Nhật ký sự kiện', 'events-all', true); main.append(panel.el); },
+    async load() {
+      const [ov, ev] = await Promise.all([api('GET', '/api/overview'), api('GET', '/api/events?limit=1000')]);
+      names = Object.fromEntries(ov.routers.map(r => [r.id, r.name]));
+      return ev;
+    },
+    update(ev) { panel.draw(ev, names); },
+  };
+}
+
+// ---------- router page ----------
+const TABS = [['overview', 'Tổng quan'], ['wan', 'WAN'], ['devices', 'Thiết bị'], ['map', 'Sơ đồ'], ['ports', 'Cổng'], ['clients', 'Client'], ['ppp', 'VPN'], ['ip', 'IP & định tuyến'], ['syslog', 'Syslog'], ['audit', 'Kiểm tra AI'], ['events', 'Sự kiện']];
+
+function routerPage(id, tab) {
+  if (!TABS.some(t => t[0] === tab)) tab = 'overview';
+  let head, tabsEl, body, view;
+  const t = ({ overview: tabOverview, wan: tabWan, devices: tabDevices, map: tabMap, ports: tabPorts, clients: tabClients, ppp: tabPpp, ip: tabIp, syslog: tabSyslog, audit: tabAudit, events: tabEvents })[tab](id);
+  return {
+    every: 5000,
+    mount(main) {
+      head = h('div'); tabsEl = h('nav', { class: 'tabs' }); body = h('div');
+      main.append(head, tabsEl, body);
+      t.mount(body);
+    },
+    load: () => api('GET', `/api/routers/${id}`),
+    update(d) {
+      view = d.router;
+      // tolerate missing collections (new router, no devices yet, no data yet)
+      view.ifaces = view.ifaces || []; view.monitors = view.monitors || []; view.sections = view.sections || {};
+      view.wans = view.wans || []; view.detectedWans = view.detectedWans || []; view.downList = view.downList || []; view.clients = view.clients || [];
+      const res = view.resource || {};
+      fill(head, h('div', { class: 'rhead' },
+        h('span', { class: 'dot ' + view.status }), h('h1', null, view.name), badge(view.status),
+        h('span', { class: 'muted small' }, [view.identity, res['board-name'], res.version && 'DrayOS ' + res.version, view.conn].filter(Boolean).join(' · ')),
+        h('div', { class: 'grow' }),
+        h('span', { class: 'muted small' }, 'Cập nhật ' + ago(view.lastSeen)),
+        me.role === 'admin' ? h('a', { class: 'btn', href: `#/admin/routers?edit=${id}` }, 'Cấu hình') : null),
+        view.lastErr && view.status !== 'up' ? h('div', { class: 'err-line' }, view.lastErr) : null);
+      const down = view.monitorsDown, wanDown = view.wans.filter(w => w.configured && (w.inet.status === 'down' || w.link.status === 'down')).length;
+      const counts = { devices: [view.monitorsTotal, down], wan: [view.wans.length, wanDown], clients: [view.clientsTotal, 0], ppp: [(view.sections.ppp_active || []).length, 0] };
+      fill(tabsEl, TABS.map(([k, label]) => h('a', { href: `#/r/${id}/${k}`, class: k === tab ? 'on' : null }, label,
+        k === 'clients' && view.clientsTotal ? h('span', { class: 'n', title: 'đang hoạt động / tổng' }, view.clientsOnline + '/' + view.clientsTotal) :
+        counts[k] && counts[k][0] ? h('span', { class: 'n ' + (counts[k][1] ? 'bad' : '') }, counts[k][1] ? counts[k][1] + '/' + counts[k][0] : counts[k][0]) : null)));
+      t.update(view);
+    },
+  };
+}
+
+// --- overview tab with history charts
+function tabOverview(id) {
+  let tiles, trafficBox, cpuBox, ifSel, lastHist = 0, view;
+  const loadHist = async () => {
+    lastHist = Date.now();
+    const iface = ui.hist.iface;
+    const d = await api('GET', `/api/routers/${id}/history?hours=${ui.hist.hours}&iface=${encodeURIComponent(iface)}`).catch(e => { toast(e.message, 'bad'); return null; });
+    if (!d) return;
+    const pts = d.points;
+    fill(trafficBox, pts.length && iface ? lineChart([
+      { cls: 'rx', name: 'Tải xuống (rx)', pts: pts.map(p => [p.t, p.rx]), area: true },
+      { cls: 'tx', name: 'Tải lên (tx)', pts: pts.map(p => [p.t, p.tx]), area: true }], { fmt: fmtBps, gap: d.bucket * 3 }) :
+      h('div', { class: 'empty' }, iface ? 'Chưa có lịch sử (dữ liệu được ghi mỗi phút).' : 'Chọn một interface.'));
+    fill(cpuBox, pts.length ? lineChart([
+      { cls: 'cpu', name: 'CPU', pts: pts.map(p => [p.t, p.cpu]) },
+      { cls: 'mem', name: 'RAM', pts: pts.map(p => [p.t, p.mem]) }], { fmt: v => Math.round(v) + '%', max: 100, gap: d.bucket * 3, height: 160 }) :
+      h('div', { class: 'empty' }, 'Chưa có lịch sử.'));
+  };
+  const rangeBtns = [[1, '1 giờ'], [6, '6 giờ'], [24, '24 giờ'], [168, '7 ngày'], [720, '30 ngày']];
+  return {
+    mount(el) {
+      tiles = h('div', { class: 'grid tiles' });
+      trafficBox = h('div', { class: 'panel-b' }); cpuBox = h('div', { class: 'panel-b' });
+      ifSel = h('select', { class: 'search', onchange: e => { ui.hist.iface = e.target.value; loadHist(); } });
+      const seg = h('div', { class: 'seg' }, rangeBtns.map(([v, t]) => h('button', { type: 'button', class: ui.hist.hours === v ? 'on' : null, onclick: e => {
+        ui.hist.hours = v; [...seg.children].forEach(b => b.classList.remove('on')); e.target.classList.add('on'); loadHist();
+      } }, t)));
+      el.append(h('div', { class: 'stack' }, tiles,
+        h('div', { class: 'panel' }, h('div', { class: 'panel-h' }, h('h2', null, 'Lưu lượng'), ifSel, h('div', { class: 'legend' }, h('span', null, h('i', { class: 'rx' }), 'rx (vào)'), h('span', null, h('i', { class: 'tx' }), 'tx (ra)')), h('div', { class: 'grow' }), seg), trafficBox),
+        h('div', { class: 'panel' }, h('div', { class: 'panel-h' }, h('h2', null, 'CPU & RAM'), h('div', { class: 'legend' }, h('span', null, h('i', { class: 'cpu' }), 'CPU'), h('span', null, h('i', { class: 'mem' }), 'RAM'))), cpuBox)));
+    },
+    update(v) {
+      view = v;
+      const r = v.resource || {};
+      const tile = (k, val, sm) => h('div', { class: 'tile' }, h('div', { class: 'k' }, k), h('div', { class: 'v' + (sm ? ' sm' : '') }, val));
+      const health = (v.sections.health || []).filter(x => /temperature|voltage/.test(x.name)).slice(0, 3);
+      const vpn = (v.sections.ppp_active || []).length;
+      fill(tiles, 
+        tile('CPU', pct(v.cpu)),
+        tile('RAM', pct(v.mem)),
+        tile('Thời gian chạy', fmtDur(rosSec(r.uptime)), true),
+        tile('Firmware DrayOS', r.version || '–', true),
+        tile('Model', r['board-name'] || '–', true),
+        tile('Ngày build firmware', r.build || '–', true),
+        tile('VPN đang kết nối', v.sections.ppp_active ? String(vpn) : '–', true),
+        health.map(x => tile(x.name, x.value + (x.type === 'C' ? ' °C' : x.type === 'V' ? ' V' : ''), true)),
+        tile('Thiết bị theo dõi', v.monitorsTotal ? `${v.monitorsTotal - v.monitorsDown}/${v.monitorsTotal} hoạt động` : 'chưa có', true));
+      const names = v.ifaces.filter(i => !i.disabled).map(i => i.name);
+      if (!ui.hist.iface || !names.includes(ui.hist.iface)) {
+        const wan = v.wans.find(w => names.includes(w.iface));
+        ui.hist.iface = wan ? wan.iface : names[0] || '';
+      }
+      const cur = [...ifSel.options].map(o => o.value).join('|');
+      if (cur !== names.join('|')) {
+        fill(ifSel, names.map(n => h('option', { value: n, selected: n === ui.hist.iface }, n)));
+      }
+      ifSel.value = ui.hist.iface;
+      if (Date.now() - lastHist > 60000) loadHist();
+    },
+  };
+}
+
+// --- WAN tab
+function tabWan(id) {
+  let p, note, ws;
+  return {
+    mount(el) {
+      p = tablePanel('Đường truyền WAN', 'wan');
+      ws = tablePanel('Trạng thái WAN trên router (wan status)', 'wanst');
+      note = h('div', { class: 'hint' });
+      el.append(h('div', { class: 'stack' }, p.el, note, ws.el));
+    },
+    update(v) {
+      const st = w => w.configured ? (w.link.status === 'down' ? 'down' : w.inet.status) : (w.running ? 'up' : w.running === false ? 'down' : 'unknown');
+      p.draw([
+        { t: 'WAN', v: w => w.label || w.iface, r: w => h('div', null, h('b', null, w.label || w.iface), w.label ? h('div', { class: 'muted small' }, w.iface) : null) },
+        { t: 'Link', v: w => w.running ? 1 : 0, r: w => w.running == null ? badge('error', 'Không thấy') : badge(w.running ? 'up' : 'down', w.running ? 'Có link' : 'Mất link') },
+        { t: 'Internet', v: w => st(w), r: w => w.configured ? badge(w.inet.status, w.inet.status === 'up' ? 'Thông' : w.inet.status === 'down' ? 'Mất Internet' : null) : h('span', { class: 'muted small' }, 'chưa theo dõi') },
+        { t: 'Ping', num: true, v: w => w.inet.rtt, r: w => w.inet.rtt > 0 ? w.inet.rtt.toFixed(1) + ' ms' : '–' },
+        { t: 'Vào', num: true, v: w => w.rxBps, r: w => fmtBps(w.rxBps) },
+        { t: 'Ra', num: true, v: w => w.txBps, r: w => fmtBps(w.txBps) },
+        { t: 'IP public', v: w => w.publicIp, r: w => h('span', { class: 'mono small' }, w.publicIp || '–') },
+        { t: 'Từ lúc', v: w => w.inet.since, r: w => w.configured && w.inet.since ? since(w.inet.since) : '–' },
+      ], v.wans, { empty: 'Không phát hiện WAN nào', rowClass: w => w.configured ? null : 'off' });
+      fill(note, v.wans.some(w => !w.configured) ?
+        ['WAN mờ là gợi ý tự phát hiện, chưa được kiểm tra Internet. ', me.role === 'admin' ? h('a', { href: `#/admin/routers?edit=${id}` }, 'Chọn WAN cần theo dõi →') : 'Liên hệ quản trị để bật theo dõi.'] :
+        `Internet được kiểm tra bằng ping ${v.wanTarget} qua từng WAN mỗi 30 giây (lệnh “ip ping” trên router khi có Telnet/SSH; nếu không, ping từ máy DrayPulse); báo mất sau 2 lần liên tiếp thất bại.`);
+      ws.draw([
+        { t: 'WAN', v: x => x.name, r: x => h('div', null, h('b', null, x.name), x.label && x.label !== x.name ? h('div', { class: 'muted small' }, x.label) : null) },
+        { t: 'Trạng thái', v: x => x.status, r: x => x.enabled === 'false' ? badge('disabled', 'Tắt') : badge(x.status === 'up' ? 'up' : 'down', x.state || x.status) },
+        { t: 'Kiểu', v: x => x.mode, r: x => x.mode || '–' },
+        { t: 'IP', v: x => ipKey(x.address || ''), r: x => h('span', { class: 'mono' }, x.address || '–') },
+        { t: 'Gateway', v: x => x.gateway, r: x => h('span', { class: 'mono' }, x.gateway || '–') },
+        { t: 'DNS', v: x => x.dns, r: x => h('span', { class: 'mono small' }, x.dns || '') },
+        { t: 'Đã kết nối', num: true, v: x => +x.uptime || 0, r: x => +x.uptime ? fmtDur(+x.uptime) : '–' },
+      ], v.sections.wan_status || [], { empty: 'Cần bật Telnet/SSH để đọc trạng thái WAN chi tiết.', rowClass: x => x.enabled === 'false' ? 'off' : null });
+    },
+  };
+}
+
+// --- devices tab
+function tabDevices(id) {
+  let p, view;
+  return {
+    mount(el) {
+      const extra = me.role === 'admin' ? h('div', { class: 'row' },
+        h('button', { class: 'primary', onclick: () => monitorForm(id, view, {}) }, '+ Thêm thiết bị'),
+        h('button', { onclick: () => suggestForm(id, view) }, 'Thêm từ DHCP/ARP')) : null;
+      p = tablePanel('Thiết bị theo dõi (ping định kỳ)', 'dev-' + id, extra);
+      el.append(p.el);
+    },
+    update(v) {
+      view = v;
+      const parentName = m => m.parentId ? (v.monitors.find(x => x.id === m.parentId) || {}).name || '?' : v.name;
+      const cols = [
+        { t: 'Trạng thái', v: m => m.kind === 'virtual' ? 'z' : m.state?.status || 'unknown', r: m => m.kind === 'virtual' ? h('span', { class: 'muted small' }, 'nút ảo') : !m.enabled ? badge('disabled', 'Tạm dừng') : badge(m.state?.status || 'unknown') },
+        { t: 'Tên', v: m => m.name, r: m => h('div', null, h('b', null, m.name), h('div', { class: 'muted small' }, KIND[m.kind]?.[1] || m.kind)) },
+        { t: 'IP', v: m => ipKey(m.ip), r: m => h('span', { class: 'mono' }, m.ip || '–') },
+        { t: 'Ping', num: true, v: m => m.state?.rtt, r: m => m.state?.rtt > 0 ? m.state.rtt.toFixed(1) + ' ms' : '–' },
+        { t: 'Sẵn sàng 24h', num: true, v: m => m.avail24, r: m => m.avail24 == null ? '–' : m.avail24.toFixed(m.avail24 === 100 ? 0 : 2) + '%' },
+        { t: 'Từ lúc', v: m => m.state?.since, r: m => m.state?.since ? since(m.state.since) : '–' },
+        { t: 'Nối với', v: parentName },
+        { t: 'Cảnh báo', v: m => m.notify ? 1 : 0, r: m => m.kind === 'virtual' ? '–' : m.notify ? (m.repeatMin ? `Có, nhắc ${m.repeatMin}′` : 'Có') : 'Không' },
+      ];
+      if (me.role === 'admin') cols.push({ t: '', r: m => h('div', { class: 'row' }, h('button', { class: 'sm', onclick: () => monitorForm(id, view, m) }, 'Sửa')) });
+      p.draw(cols, v.monitors, { empty: me.role === 'admin' ? 'Chưa có thiết bị. Bấm “Thêm thiết bị” hoặc chọn từ danh sách DHCP.' : 'Chưa có thiết bị', rowClass: m => m.enabled ? null : 'off' });
+    },
+  };
+}
+
+function descendants(monitors, id) {
+  const out = new Set([id]); let grew = true;
+  while (grew) { grew = false; for (const m of monitors) if (m.parentId && out.has(m.parentId) && !out.has(m.id)) { out.add(m.id); grew = true; } }
+  return out;
+}
+
+function monitorForm(routerId, view, m) {
+  const isNew = !m.id;
+  const name = h('input', { value: m.name || '', required: true, maxlength: 64 });
+  const ip = h('input', { value: m.ip || '', placeholder: '192.168.88.10', class: 'mono' });
+  const kind = h('select', null, Object.entries(KIND).map(([k, [, t]]) => h('option', { value: k, selected: (m.kind || 'device') === k }, t)));
+  const blocked = isNew ? new Set() : descendants(view.monitors, m.id);
+  const parent = h('select', null, h('option', { value: '' }, view.name + ' (router)'),
+    view.monitors.filter(x => !blocked.has(x.id)).map(x => h('option', { value: x.id, selected: m.parentId === x.id }, x.name + (x.ip ? ` (${x.ip})` : ''))));
+  const enabled = h('input', { type: 'checkbox', checked: isNew ? true : m.enabled });
+  const notify = h('input', { type: 'checkbox', checked: isNew ? true : m.notify });
+  const repeat = h('select', null, [[0, 'Chỉ báo một lần'], [15, 'Nhắc lại mỗi 15 phút'], [30, 'Nhắc lại mỗi 30 phút'], [60, 'Nhắc lại mỗi giờ'], [120, 'Nhắc lại mỗi 2 giờ']].map(([v, t]) => h('option', { value: v, selected: (m.repeatMin || 0) === v }, t)));
+  const syncKind = () => { const virt = kind.value === 'virtual'; ip.disabled = virt; ip.required = !virt; };
+  kind.addEventListener('change', syncKind); syncKind();
+  const actions = [{ t: 'Huỷ', fn: c => c() }, { t: isNew ? 'Thêm' : 'Lưu', cls: 'primary', submit: true, fn: async close => {
+    const body = { name: name.value, ip: ip.value, kind: kind.value, parentId: parent.value ? +parent.value : null, enabled: enabled.checked, notify: notify.checked, repeatMin: +repeat.value };
+    try {
+      await api(isNew ? 'POST' : 'PUT', isNew ? `/api/admin/routers/${routerId}/monitors` : `/api/admin/monitors/${m.id}`, body);
+      close(); toast('Đã lưu thiết bị', 'ok'); refresh();
+    } catch (e) { toast(e.message, 'bad'); }
+  } }];
+  if (!isNew) actions.unshift({ t: 'Xoá', cls: 'danger', fn: async close => {
+    if (!confirm(`Xoá “${m.name}”? Các thiết bị nối với nó sẽ chuyển lên nút cha.`)) return;
+    try { await api('DELETE', `/api/admin/monitors/${m.id}`); close(); refresh(); } catch (e) { toast(e.message, 'bad'); }
+  } });
+  modal(isNew ? 'Thêm thiết bị' : 'Sửa thiết bị', h('div', { class: 'form' },
+    field('Tên hiển thị', name), field('Địa chỉ IP', ip), field('Loại', kind), field('Nối với (trên sơ đồ)', parent),
+    h('div', { class: 'full row' }, check('Ping định kỳ', enabled), check('Báo khi mất kết nối (Telegram/Zalo)', notify)), field('Khi vẫn chưa khắc phục', repeat),
+    h('p', { class: 'hint full' }, 'Router ping 2 gói mỗi 30 giây. Thiết bị chỉ bị báo mất kết nối sau 2 lần liên tiếp không phản hồi; lỗi chạy lệnh ping không được tính.')), actions);
+}
+
+function suggestForm(routerId, view) {
+  const have = new Set(view.monitors.map(m => m.ip));
+  const items = [];
+  for (const c of view.clients) if (c.ip && !have.has(c.ip) && !items.some(i => i.ip === c.ip)) items.push({ name: c.name || (c.vendor ? c.vendor + ' ' + c.ip : c.ip), ip: c.ip, kind: 'device', src: (c.online ? 'đang hoạt động · ' : '') + (c.vendor || NAME_SRC[c.nameSrc] || '') });
+  const boxes = items.map(i => ({ i, cb: h('input', { type: 'checkbox' }) }));
+  modal('Thêm thiết bị từ dữ liệu router', boxes.length ? h('div', { class: 'tw' }, h('table', null, h('tbody', null, boxes.map(({ i, cb }) => h('tr', null,
+    h('td', null, cb), h('td', null, i.name), h('td', { class: 'mono' }, i.ip), h('td', { class: 'muted small' }, i.src)))))) :
+    h('div', { class: 'empty' }, 'Không còn địa chỉ nào chưa theo dõi.'), [{ t: 'Đóng', fn: c => c() }, { t: 'Thêm mục đã chọn', cls: 'primary', submit: true, fn: async close => {
+      const chosen = boxes.filter(b => b.cb.checked);
+      for (const { i } of chosen) {
+        try { await api('POST', `/api/admin/routers/${routerId}/monitors`, { name: i.name, ip: i.ip, kind: i.kind, enabled: true, notify: true, repeatMin: 0, parentId: null }); }
+        catch (e) { toast(i.ip + ': ' + e.message, 'bad'); }
+      }
+      close(); if (chosen.length) toast(`Đã thêm ${chosen.length} thiết bị`, 'ok'); refresh();
+    } }]);
+}
+
+// --- topology tab
+function tabMap(id) {
+  let wrap, svg, saveBtn, view, pos = {}, dirty = false;
+  const NW = 170, NH = 50;
+  const key = n => n.id === 0 ? 'r' : 'm' + n.id;
+
+  function autoLayout(nodes) {
+    // simple top-down tree: router on top, children spread by subtree width
+    const kids = {};
+    for (const n of nodes) if (n.id !== 0) { const p = n.parentId && nodes.some(x => x.id === n.parentId) ? n.parentId : 0; (kids[p] = kids[p] || []).push(n); }
+    const out = {}; let cursor = 0;
+    const place = (n, depth) => {
+      const ch = kids[n.id] || [];
+      if (!ch.length) { out[key(n)] = { x: cursor * (NW + 30), y: depth * 110 }; cursor++; return; }
+      const start = cursor;
+      ch.forEach(c => place(c, depth + 1));
+      out[key(n)] = { x: (start + cursor - 1) / 2 * (NW + 30), y: depth * 110 };
+    };
+    place(nodes[0], 0);
+    return out;
+  }
+
+  function draw() {
+    const nodes = [{ id: 0, name: view.name, ip: view.identity || '', kind: 'router', status: view.status, x: view.mapX, y: view.mapY },
+      ...view.monitors.map(m => ({ ...m, status: m.kind === 'virtual' ? 'virtual' : !m.enabled ? 'unknown' : m.state?.status || 'unknown' }))];
+    const auto = autoLayout(nodes);
+    for (const n of nodes) if (!pos[key(n)]) pos[key(n)] = n.x != null && n.y != null ? { x: n.x, y: n.y } : auto[key(n)];
+    const xs = nodes.map(n => pos[key(n)].x), ys = nodes.map(n => pos[key(n)].y);
+    const minX = Math.min(...xs) - 30, minY = Math.min(...ys) - 30, maxX = Math.max(...xs) + NW + 30, maxY = Math.max(...ys) + NH + 30;
+    svg = s('svg', { class: 'map', viewBox: `${minX} ${minY} ${maxX - minX} ${maxY - minY}` });
+    svg.style.maxWidth = Math.max(640, (maxX - minX) * 1.1) + 'px';
+    const edges = s('g'), layer = s('g');
+    svg.append(edges, layer);
+    const edgeEls = [];
+    for (const n of nodes) {
+      if (n.id === 0) continue;
+      const p = n.parentId && nodes.some(x => x.id === n.parentId) ? nodes.find(x => x.id === n.parentId) : nodes[0];
+      const line = s('path', { class: 'edge' + (n.status === 'down' ? ' down' : '') });
+      edgeEls.push({ line, a: key(p), b: key(n) });
+      edges.append(line);
+    }
+    const layoutEdges = () => {
+      for (const e of edgeEls) {
+        const a = pos[e.a], b = pos[e.b];
+        const x1 = a.x + NW / 2, y1 = a.y + NH, x2 = b.x + NW / 2, y2 = b.y, my = (y1 + y2) / 2;
+        e.line.setAttribute('d', `M${x1},${y1} C${x1},${my} ${x2},${my} ${x2},${y2}`);
+      }
+    };
+    for (const n of nodes) {
+      const k = key(n), [abbr] = n.id === 0 ? ['RT'] : KIND[n.kind] || ['?'];
+      const g = s('g', { class: `node ${n.status} ${n.kind === 'virtual' ? 'virtual' : ''} ${n.id === 0 ? 'router' : ''} ${me.role === 'admin' ? 'drag' : ''}`, transform: `translate(${pos[k].x},${pos[k].y})` },
+        s('title', null, `${n.name}${n.ip ? ' – ' + n.ip : ''}\n${ST_TEXT[n.status] || ''}`),
+        s('rect', { class: 'bg', width: NW, height: NH, rx: 9 }),
+        s('rect', { class: 'kind', x: 8, y: 12, width: 30, height: 26, rx: 6 }),
+        s('text', { class: 'kind', x: 23, y: 29, 'text-anchor': 'middle' }, abbr),
+        s('text', { x: 46, y: 22 }, n.name.length > 17 ? n.name.slice(0, 16) + '…' : n.name),
+        s('text', { class: 'ip', x: 46, y: 38 }, n.ip || (n.kind === 'virtual' ? 'không ping' : '')));
+      if (me.role === 'admin') {
+        g.addEventListener('pointerdown', e => {
+          e.preventDefault(); g.setPointerCapture(e.pointerId); ui.drag = true;
+          const m = svg.getScreenCTM().inverse();
+          const pt = (ev) => { const p = new DOMPoint(ev.clientX, ev.clientY).matrixTransform(m); return p; };
+          const start = pt(e), origin = { ...pos[k] };
+          const move = ev => {
+            const p = pt(ev);
+            pos[k] = { x: Math.round((origin.x + p.x - start.x) / 10) * 10, y: Math.round((origin.y + p.y - start.y) / 10) * 10 };
+            g.setAttribute('transform', `translate(${pos[k].x},${pos[k].y})`); layoutEdges();
+            if (!dirty) { dirty = true; saveBtn.classList.remove('hidden'); }
+          };
+          const up = () => { g.removeEventListener('pointermove', move); g.removeEventListener('pointerup', up); g.removeEventListener('pointercancel', up); ui.drag = false; };
+          g.addEventListener('pointermove', move); g.addEventListener('pointerup', up); g.addEventListener('pointercancel', up);
+        });
+      }
+      layer.append(g);
+    }
+    layoutEdges();
+    fill(wrap, svg);
+  }
+
+  return {
+    mount(el) {
+      wrap = h('div', { class: 'map-wrap' });
+      saveBtn = h('button', { class: 'primary hidden', onclick: e => busy(e.target, async () => {
+        const nodes = Object.entries(pos).map(([k, p]) => ({ id: k === 'r' ? 0 : +k.slice(1), x: p.x, y: p.y }));
+        await api('PUT', `/api/admin/routers/${id}/layout`, { nodes });
+        dirty = false; saveBtn.classList.add('hidden'); toast('Đã lưu sơ đồ', 'ok');
+      }) }, 'Lưu bố cục');
+      const tools = me.role === 'admin' ? h('div', { class: 'row' }, saveBtn,
+        h('button', { onclick: () => { if (!view) return; pos = autoLayout([{ id: 0 }, ...view.monitors].map(n => n)); dirty = true; saveBtn.classList.remove('hidden'); draw(); } }, 'Tự sắp xếp'),
+        h('button', { onclick: () => view && monitorForm(id, view, {}) }, '+ Thêm nút')) : null;
+      el.append(h('div', { class: 'panel' }, h('div', { class: 'panel-h' }, h('h2', null, 'Sơ đồ mạng'), h('span', { class: 'muted small' }, me.role === 'admin' ? 'Kéo thả để sắp xếp. Đường nối theo mục “Nối với” của thiết bị.' : ''), h('div', { class: 'grow' }), tools), wrap));
+    },
+    update(v) {
+      view = v;
+      if (dirty || ui.drag) return; // don't move nodes under the user's hands
+      pos = {};
+      draw();
+    },
+  };
+}
+
+// --- ports tab
+function tabPorts(id) {
+  let p;
+  return {
+    mount(el) { p = tablePanel('Interface', 'ports'); el.append(p.el); },
+    update(v) {
+      const wans = new Set(v.wans.filter(w => w.configured).map(w => w.iface));
+      p.draw([
+        { t: '', v: i => i.running ? 1 : 0, r: i => h('span', { class: 'dot ' + (i.disabled ? '' : i.running ? 'up' : 'down') }) },
+        { t: 'Tên', v: i => i.name, r: i => h('div', null, h('b', null, i.name), wans.has(i.name) ? h('span', { class: 'chip', title: 'WAN' }, ' WAN') : null, i.comment ? h('div', { class: 'muted small' }, i.comment) : null) },
+        { t: 'Loại', v: i => i.type },
+        { t: 'Trạng thái', v: i => i.disabled ? 'tắt' : i.running ? 'chạy' : 'không link', r: i => i.disabled ? badge('disabled', 'Tắt') : badge(i.running ? 'up' : 'down', i.running ? 'Có link' : 'Không link') },
+        { t: 'Vào', num: true, v: i => i.rxBps, r: i => fmtBps(i.rxBps) },
+        { t: 'Ra', num: true, v: i => i.txBps, r: i => fmtBps(i.txBps) },
+        { t: 'Tổng vào', num: true, v: i => i.rxBytes, r: i => fmtBytes(i.rxBytes) },
+        { t: 'Tổng ra', num: true, v: i => i.txBytes, r: i => fmtBytes(i.txBytes) },
+        { t: 'MAC', v: i => i.mac, r: i => h('span', { class: 'mono small' }, i.mac || '') },
+      ], v.ifaces, { rowClass: i => i.disabled ? 'off' : null });
+    },
+  };
+}
+
+// --- clients tab
+const NAME_SRC = { alias: 'tự đặt', device: 'thiết bị theo dõi', dhcp: 'DHCP', comment: 'ghi chú router', dns: 'DNS tĩnh', neighbor: 'neighbor', netbios: 'NetBIOS', mdns: 'mDNS', rdns: 'DNS ngược' };
+
+function clientName(c) {
+  if (c.name) return h('div', null, h('b', null, c.name), h('div', { class: 'muted small' }, [NAME_SRC[c.nameSrc] || c.nameSrc, c.vendor].filter(Boolean).join(' · ')));
+  return h('div', null, h('span', { class: 'muted' }, c.vendor ? 'Thiết bị ' + c.vendor : c.randomMac ? 'MAC ngẫu nhiên' : 'Không rõ tên'),
+    h('div', { class: 'muted small' }, c.randomMac ? 'điện thoại/laptop dùng địa chỉ riêng tư' : 'chưa dò được tên'));
+}
+
+function clientTime(c) {
+  if (c.online) return h('div', null, h('b', null, fmtDur((Date.now() - c.since) / 1000)), h('div', { class: 'muted small' }, 'từ ' + fmtTime(c.since)));
+  if (!c.since) return h('span', { class: 'muted small' }, 'chưa thấy hoạt động');
+  return h('div', null, 'dừng ' + fmtTime(c.since), h('div', { class: 'muted small' }, fmtDur((Date.now() - c.since) / 1000) + ' trước' + (c.lastSession > 0 ? ' · phiên trước ' + fmtDur(c.lastSession / 1000) : '')));
+}
+
+function clientNameForm(routerId, c) {
+  const name = h('input', { value: c.nameSrc === 'alias' ? c.name : '', placeholder: c.name || 'ví dụ: Camera cổng, PC kế toán', maxlength: 64 });
+  modal('Đặt tên cho ' + c.mac, h('div', { class: 'stack' }, field('Tên hiển thị (để trống = dùng tên tự dò)', name),
+    h('p', { class: 'hint' }, `IP ${c.ip}${c.vendor ? ' · ' + c.vendor : ''}. Tên gắn với địa chỉ MAC nên vẫn đúng khi IP thay đổi.`)),
+    [{ t: 'Huỷ', fn: x => x() }, { t: 'Lưu', cls: 'primary', submit: true, fn: async close => {
+      try { await api('PUT', `/api/admin/routers/${routerId}/clients/${encodeURIComponent(c.mac)}/name`, { name: name.value }); close(); toast('Đã lưu tên', 'ok'); refresh(); }
+      catch (e) { toast(e.message, 'bad'); }
+    } }]);
+}
+
+function tabClients(id) {
+  let p, view, filter = ui.clientFilter || 'all';
+  const seg = h('div', { class: 'seg' });
+  const filters = [['all', 'Tất cả'], ['online', 'Đang hoạt động'], ['offline', 'Ngừng'], ['noname', 'Chưa có tên']];
+  const drawSeg = () => fill(seg, filters.map(([k, t]) => h('button', { type: 'button', class: filter === k ? 'on' : null, onclick: () => { filter = ui.clientFilter = k; drawSeg(); render(); } }, t)));
+  const render = () => {
+    if (!view) return;
+    const watched = new Set(view.monitors.map(m => m.ip));
+    const rows = view.clients.filter(c => filter === 'online' ? c.online : filter === 'offline' ? !c.online : filter === 'noname' ? !c.name : true);
+    const cols = [
+      { t: 'Trạng thái', v: c => c.online ? 1 : 0, r: c => c.online ? badge('up', 'Hoạt động') : badge(c.since ? 'down' : 'unknown', c.since ? 'Ngừng' : 'Chưa rõ') },
+      { t: 'Tên máy', v: c => (c.name || '~' + (c.vendor || '')) + ' ' + c.mac + ' ' + (c.host || ''), r: clientName },
+      { t: 'IP', v: c => ipKey(c.ip), r: c => h('span', { class: 'mono' }, c.ip) },
+      { t: 'MAC', v: c => c.mac, r: c => h('div', null, h('span', { class: 'mono small' }, c.mac), c.randomMac ? h('div', { class: 'muted small' }, 'ngẫu nhiên') : null) },
+      { t: 'Thời gian hoạt động / dừng', v: c => (c.online ? 1e15 : 0) + (c.online ? -c.since : c.since), r: clientTime },
+      { t: 'Cổng', v: c => c.port || c.iface, r: c => c.port ? h('span', null, c.port, c.iface && c.iface !== c.port ? h('div', { class: 'muted small' }, c.iface) : null) : c.iface || '–' },
+      { t: 'DHCP', v: c => c.dhcp, r: c => c.dhcp ? badge(c.dhcp === 'bound' ? 'up' : 'unknown', c.dhcp) : h('span', { class: 'muted small' }, 'IP tĩnh') },
+      { t: 'Lần đầu thấy', v: c => c.firstSeen, r: c => h('span', { class: 'small' }, fmtTime(c.firstSeen)) },
+    ];
+    if (me.role === 'admin') cols.push({ t: '', r: c => h('div', { class: 'row' },
+      h('button', { class: 'sm', title: 'Đặt tên', onclick: () => clientNameForm(id, c) }, 'Đặt tên'),
+      watched.has(c.ip) ? null : h('button', { class: 'sm', title: 'Ping định kỳ và báo khi mất kết nối', onclick: () => monitorForm(id, view, { name: c.name || c.ip, ip: c.ip }) }, '+ Theo dõi')) });
+    p.draw(cols, rows, { empty: 'Chưa có dữ liệu client (cập nhật mỗi phút).', rowClass: c => c.online ? null : 'off' });
+  };
+  return {
+    mount(el) {
+      drawSeg();
+      p = tablePanel('Client', 'clients-' + id, seg);
+      if (p.state.sort == null) { p.state.sort = 0; p.state.desc = true; }
+      el.append(h('div', { class: 'stack' }, p.el, h('p', { class: 'hint' },
+        'Hoạt động = thiết bị có trong bảng ARP của router (đọc mỗi phút qua Telnet/SSH). Cổng = cổng LAN (P1…) router ghi nhận. Tên máy lấy theo thứ tự: tên tự đặt → thiết bị theo dõi → DHCP (HOST ID) → NetBIOS/mDNS/DNS ngược (DrayPulse hỏi trực tiếp thiết bị). Nếu vẫn không có, hiện hãng sản xuất theo MAC.')));
+    },
+    update(v) { view = v; render(); },
+  };
+}
+
+// --- VPN tab (DRAYTEK-MIB: connected VPN sessions)
+function tabPpp(id) {
+  let a;
+  return {
+    mount(el) { a = tablePanel('VPN đang kết nối', 'vpn'); el.append(h('div', { class: 'stack' }, a.el, h('p', { class: 'hint' }, 'Đọc qua SNMP (DRAYTEK-MIB) mỗi phút: LAN-to-LAN và Remote Dial-in (SSL, IPsec, WireGuard, OpenVPN, PPTP, L2TP…). Sự kiện VPN kết nối/ngắt được ghi khi router gửi syslog về DrayPulse.'))); },
+    update(v) {
+      a.draw([
+        { t: 'Profile / tài khoản', v: x => x.name, r: x => h('b', null, x.name) },
+        { t: 'Kiểu', v: x => x.service, r: x => /PPTP/i.test(x.service || '') ? badge('waiting', x.service) : x.service || '–' },
+        { t: 'IP phía kia', v: x => ipKey(x['caller-id'] || ''), r: x => h('span', { class: 'mono' }, x['caller-id'] || '–') },
+        { t: 'Mạng phía kia', v: x => x.address, r: x => h('span', { class: 'mono small' }, x.address || '–') },
+        { t: 'Qua WAN', v: x => x.interface },
+        { t: 'Tốc độ ra/vào', num: true, v: x => +x['tx-rate'] + +x['rx-rate'], r: x => x['tx-rate'] ? fmtBps(+x['tx-rate'] * 8) + ' / ' + fmtBps(+x['rx-rate'] * 8) : '–' },
+        { t: 'Thời gian', num: true, v: x => rosSec(x.uptime), r: x => x.uptime ? fmtDur(rosSec(x.uptime)) : '–' },
+      ], v.sections.ppp_active || [], { empty: v.sections.ppp_active ? 'Không có VPN nào đang kết nối.' : 'Chưa đọc được bảng VPN (cần SNMP).' });
+    },
+  };
+}
+
+// --- Syslog tab: lines the router pushed to DrayPulse
+function tabSyslog(id) {
+  let a, note;
+  const FAC = { vpn: 'VPN', wan: 'WAN', user: 'Truy cập', call: 'Kết nối', system: 'Hệ thống', firewall: 'Firewall', other: 'Khác' };
+  return {
+    mount(el) { a = tablePanel('Syslog gần đây', 'syslog-' + id); note = h('div', { class: 'hint' }); el.append(h('div', { class: 'stack' }, a.el, note)); },
+    update(v) {
+      const rows = (v.sections.syslog || []).slice().reverse();
+      a.draw([
+        { t: 'Thời gian', v: x => +x.time, r: x => h('span', { class: 'small' }, fmtTime(+x.time)) },
+        { t: 'Loại', v: x => x.facility, r: x => FAC[x.facility] || x.facility },
+        { t: 'Nội dung', v: x => x.message, r: x => h('span', { class: 'mono small' }, x.message) },
+      ], rows, { empty: 'Chưa nhận syslog từ router này.', rowClass: x => +x.severity <= 3 ? 'bad' : null });
+      fill(note, 'Bật trên router: System Maintenance → SysLog / Mail Alert → Syslog Access Setup: Server IP = máy DrayPulse, Destination Port = cổng syslog của DrayPulse (mặc định 5514), chọn VPN Log, WAN Log, Router/DSL Information. Xem lệnh mẫu ở trang Router → Sửa → “Tạo lệnh cấu hình router”.');
+    },
+  };
+}
+
+// --- IP tab
+function tabIp(id) {
+  let a, r, d, n;
+  return {
+    mount(el) {
+      a = tablePanel('Địa chỉ IP', 'addr'); r = tablePanel('Route mặc định', 'routes'); d = tablePanel('DHCP lease (srv dhcp status)', 'leases');
+      el.append(h('div', { class: 'stack' }, a.el, r.el, d.el));
+    },
+    update(v) {
+      const sec = v.sections;
+      a.draw([
+        { t: 'Địa chỉ', v: x => ipKey(x.address), r: x => h('span', { class: 'mono' }, x.address) },
+        { t: 'Interface', v: x => x.interface },
+        { t: 'Loại', v: x => truthy(x.dynamic) ? 'động' : 'tĩnh' },
+        { t: 'Ghi chú', v: x => x.comment },
+      ], sec.address || [], { rowClass: x => truthy(x.disabled) || truthy(x.invalid) ? 'off' : null });
+      r.draw([
+        { t: 'Gateway', v: x => x.gateway, r: x => h('span', { class: 'mono' }, x['immediate-gw'] || x.gateway) },
+        { t: 'Trạng thái', v: x => x.active, r: x => truthy(x.disabled) ? badge('disabled', 'Tắt') : truthy(x.active) ? badge('up', 'Đang dùng') : badge('unknown', 'Dự phòng') },
+        { t: 'Kiểu WAN', v: x => x.comment },
+      ], sec.route || []);
+      d.draw([
+        { t: 'IP', v: x => ipKey(x.address), r: x => h('span', { class: 'mono' }, x.address) },
+        { t: 'MAC', v: x => x['mac-address'], r: x => h('span', { class: 'mono small' }, x['mac-address']) },
+        { t: 'Tên máy (HOST ID)', v: x => x['host-name'] },
+        { t: 'LAN', v: x => x.server },
+        { t: 'Thời gian thuê còn lại', v: x => x['expires-after'] },
+      ], sec.lease || [], { empty: 'Cần bật Telnet/SSH để đọc DHCP lease.' });
+    },
+  };
+}
+
+// --- audit tab (security & performance, optional AI agent)
+const SEV = { critical: ['down', 'Nghiêm trọng'], high: ['down', 'Cao'], medium: ['waiting', 'Trung bình'], low: ['unknown', 'Thấp'], info: ['unknown', 'Thông tin'] };
+const AREA = { security: 'Bảo mật', performance: 'Hiệu suất', reliability: 'Độ ổn định' };
+
+// slugify makes GitHub-style heading anchors (Vietnamese letters kept).
+const slugify = t => t.toLowerCase().replace(/\[([^\]]+)\]\([^)]+\)/g, '$1').replace(/[^\p{L}\p{N}\s-]/gu, '').trim().replace(/\s/g, '-');
+
+// md renders a safe subset of Markdown into DOM nodes (never innerHTML):
+// headings with anchors, paragraphs, nested lists, fenced code (copyable),
+// tables, blockquotes, links, **bold**, `code`, horizontal rules.
+function md(text, opts = {}) {
+  const root = h('div', { class: 'md' });
+  const inline = str => {
+    const out = [];
+    const re = /(`[^`]+`|\*\*[^*]+\*\*|\[[^\]]+\]\([^)\s]+\))/g;
+    let last = 0, m;
+    while ((m = re.exec(str))) {
+      if (m.index > last) out.push(str.slice(last, m.index));
+      const t = m[0];
+      if (t[0] === '`') out.push(h('code', null, t.slice(1, -1)));
+      else if (t[0] === '*') out.push(h('b', null, t.slice(2, -2)));
+      else {
+        const [, label, href] = /^\[([^\]]+)\]\(([^)\s]+)\)$/.exec(t);
+        if (href.startsWith('#')) out.push(h('a', { href: '#', onclick: e => { e.preventDefault(); opts.onAnchor && opts.onAnchor(decodeURIComponent(href.slice(1))); } }, inline(label)));
+        else if (/^https?:\/\//.test(href)) out.push(h('a', { href, target: '_blank', rel: 'noopener noreferrer' }, label));
+        else out.push(label);
+      }
+      last = m.index + t.length;
+    }
+    if (last < str.length) out.push(str.slice(last));
+    return out;
+  };
+  const lines = String(text || '').replace(/\r/g, '').split('\n');
+  let list = null, para = [];
+  const flushPara = () => { if (para.length) { root.append(h('p', null, inline(para.join(' ')))); para = []; } };
+  const flushList = () => { list = null; };
+  const indentOf = l => l.length - l.trimStart().length;
+  const place = (el, indent) => { if (indent >= 2 && list) (list.sub ? list.sub.el.lastChild || list.li : list.li).append(el); else { flushList(); root.append(el); } };
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i], ind = indentOf(line), tl = line.trim();
+    let m;
+    if (/^```/.test(tl)) {
+      flushPara();
+      const code = [];
+      while (++i < lines.length && !/^\s*```/.test(lines[i])) code.push(lines[i].slice(Math.min(ind, indentOf(lines[i]))));
+      place(codeBlock(code.join('\n')), ind);
+      continue;
+    }
+    if (/^>/.test(tl)) {
+      flushPara();
+      const q = [];
+      while (i < lines.length && /^\s*>/.test(lines[i])) { q.push(lines[i].trim().replace(/^>\s?/, '')); i++; }
+      i--;
+      place(h('div', { class: 'quote' }, md(q.join('\n'), opts)), ind);
+      continue;
+    }
+    if (/^\|.*\|$/.test(tl)) {
+      flushPara();
+      const rows = [];
+      while (i < lines.length && /^\|.*\|$/.test(lines[i].trim())) { rows.push(lines[i].trim()); i++; }
+      i--;
+      const cells = r => r.replace(/^\||\|$/g, '').split('|').map(x => x.trim());
+      const body = rows.filter(r => !/^\|[\s:|-]+\|$/.test(r));
+      place(h('div', { class: 'tw' }, h('table', null,
+        h('thead', null, h('tr', null, cells(body[0] || '').map(x => h('th', null, inline(x))))),
+        h('tbody', null, body.slice(1).map(r => h('tr', null, cells(r).map(x => h('td', null, inline(x)))))))), ind);
+      continue;
+    }
+    if (/^-{3,}$/.test(tl) && ind === 0) { flushPara(); flushList(); root.append(h('hr')); continue; }
+    if ((m = /^(#{1,4})\s+(.*)/.exec(tl)) && ind === 0) {
+      flushPara(); flushList();
+      const level = Math.min(m[1].length + (opts.levelOffset ?? 1), 5); // reports demote headings under the panel title
+      root.append(h('h' + level, { id: (opts.idPrefix || '') + slugify(m[2]) }, inline(m[2])));
+      continue;
+    }
+    if ((m = /^([-*]|(\d+)[.)])\s+(.*)/.exec(tl))) {
+      flushPara();
+      const ordered = !!m[2];
+      if (ind >= 2 && list) { // nested item
+        if (!list.sub || list.sub.ordered !== ordered) { list.sub = { el: h(ordered ? 'ol' : 'ul'), ordered }; list.li.append(list.sub.el); }
+        list.sub.el.append(h('li', null, inline(m[3])));
+        continue;
+      }
+      if (!list || list.ordered !== ordered) { list = { el: h(ordered ? 'ol' : 'ul', ordered ? { start: m[2] } : null), ordered }; root.append(list.el); }
+      list.li = h('li', null, inline(m[3]));
+      list.sub = null;
+      list.el.append(list.li);
+      continue;
+    }
+    if (!tl) { flushPara(); continue; } // blank lines keep lists open (numbering continues)
+    if (ind >= 2 && list) { list.li.append(' ', ...inline(tl)); continue; }
+    flushList();
+    para.push(tl);
+  }
+  flushPara();
+  return root;
+}
+
+function codeBlock(text) {
+  const pre = h('pre', { title: 'Bấm để chọn toàn bộ' }, text);
+  pre.addEventListener('click', () => { const r = document.createRange(); r.selectNodeContents(pre); const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r); });
+  const copy = h('button', { type: 'button', class: 'sm copy', onclick: async () => {
+    try { await navigator.clipboard.writeText(text); toast('Đã sao chép lệnh', 'ok'); }
+    catch { pre.click(); toast('Đã chọn lệnh – nhấn Ctrl+C để sao chép'); }
+  } }, 'Sao chép');
+  return h('div', { class: 'codewrap' }, copy, pre);
+}
+
+function scoreCard(label, v) {
+  const cls = v >= 80 ? 'up' : v >= 50 ? 'waiting' : 'down';
+  return h('div', { class: 'tile score ' + cls }, h('div', { class: 'k' }, label), h('div', { class: 'v' }, v, h('span', { class: 'muted small' }, '/100')));
+}
+
+function tabAudit(id) {
+  let head, body, histSel, runBtn, provSel, cur = null, lastList = 0, info = null, loadedId = 0;
+  const showReport = async aid => {
+    try { cur = await api('GET', `/api/audits/${aid}`); loadedId = aid; render(); } catch (e) { toast(e.message, 'bad'); }
+  };
+  const render = () => {
+    if (!info) return;
+    const running = info.running;
+    runBtn && (runBtn.disabled = !!running);
+    const parts = [];
+    if (running) parts.push(h('div', { class: 'box' }, h('b', null, '⏳ Đang kiểm tra… '), running.progress || '',
+      running.steps && running.steps.length ? h('div', { class: 'muted small' }, 'Đã xem: ' + running.steps.join(' · ')) : null));
+    if (!info.aiReady && me.role === 'admin') parts.push(h('div', { class: 'hint' }, 'Trợ lý AI chưa bật: báo cáo chỉ dùng bộ kiểm tra có sẵn (miễn phí, chạy trên máy này). ', h('a', { href: '#/admin/settings' }, 'Bật trợ lý AI trong Cài đặt →')));
+    if (!cur) {
+      parts.push(h('div', { class: 'panel panel-b empty' }, info.reports.length ? 'Chọn một báo cáo.' : 'Chưa có báo cáo. ' + (me.role === 'admin' ? 'Bấm “Chạy kiểm tra” để bắt đầu.' : '')));
+      fill(body, parts);
+      return;
+    }
+    const r = cur;
+    const findings = r.findings || [];
+    const u = r.usage;
+    parts.push(h('div', { class: 'grid tiles' }, scoreCard('Bảo mật', r.secScore), scoreCard('Hiệu suất & ổn định', r.perfScore),
+      h('div', { class: 'tile' }, h('div', { class: 'k' }, 'Nguồn'), h('div', { class: 'v sm' }, r.source === 'ai' ? (r.provider || 'Trợ lý AI') + ' · ' + (r.model || '') : 'Bộ kiểm tra có sẵn'),
+        h('div', { class: 'muted small' }, fmtTime(r.startedAt) + (r.trigger === 'weekly' ? ' · định kỳ' : ''))),
+      u ? h('div', { class: 'tile' }, h('div', { class: 'k' }, 'Chi phí AI (ước tính)'), h('div', { class: 'v sm' }, u.costKnown ? '$' + u.costUsd.toFixed(3) : 'chưa rõ giá'),
+        h('div', { class: 'muted small' }, `${Math.round((u.inputTokens + u.cacheRead + u.cacheWrite) / 1000)}k vào · ${Math.round(u.outputTokens / 1000)}k ra · ${u.turns} lượt`)) : null));
+    if (r.summary) parts.push(h('div', { class: 'panel panel-b' }, h('b', null, 'Tóm tắt: '), r.summary));
+    if (r.error) parts.push(h('div', { class: 'box bad' }, r.error));
+    else if (r.attempts && r.attempts.length) parts.push(h('div', { class: 'hint' }, 'Đã tự chuyển tài khoản AI vì: ' + r.attempts.join('; ')));
+    if (r.note) parts.push(h('div', { class: 'hint' }, r.note));
+    const fp = tablePanel('Vấn đề và cách khắc phục', 'audit-f-' + id);
+    fp.draw([
+      { t: 'Mức', v: f => -({ critical: 4, high: 3, medium: 2, low: 1, info: 0 })[f.severity], r: f => badge(SEV[f.severity][0], SEV[f.severity][1]) },
+      { t: 'Loại', v: f => AREA[f.area] || f.area },
+      { t: 'Vấn đề', v: f => f.title + ' ' + f.evidence, r: f => h('div', null, h('b', null, f.title), f.evidence ? h('div', { class: 'muted small' }, f.evidence) : null) },
+      { t: 'Cách khắc phục', v: f => f.fix, r: f => h('div', { class: 'fix' }, f.fix, f.commands && f.commands.length ? codeBlock(f.commands.join('\n')) : null) },
+    ], findings, { empty: 'Không phát hiện vấn đề.' });
+    if (fp.state.sort == null) { fp.state.sort = 0; fp.redraw(); }
+    parts.push(fp.el);
+    if (r.markdown) parts.push(h('details', { class: 'panel', open: r.source === 'ai' }, h('summary', { class: 'panel-h' }, h('h2', null, 'Báo cáo đầy đủ')), h('div', { class: 'panel-b' }, md(r.markdown))));
+    if (r.source === 'ai' && (r.ruleFindings || []).length) parts.push(h('details', { class: 'panel' }, h('summary', { class: 'panel-h' }, h('h2', null, `Kết quả bộ kiểm tra có sẵn (${r.ruleFindings.length})`)),
+      h('div', { class: 'panel-b' }, h('ul', null, r.ruleFindings.map(f => h('li', null, badge(SEV[f.severity][0], SEV[f.severity][1]), ' ', f.title))))));
+    if (r.steps && r.steps.length) parts.push(h('p', { class: 'hint' }, 'Trợ lý AI đã xem: ' + r.steps.join(' · ') + '. Dữ liệu được đọc một lần ở chế độ chỉ đọc; mật khẩu và khoá không được gửi đi.'));
+    if (me.role === 'admin') parts.push(h('div', null, h('button', { class: 'sm danger', onclick: async () => {
+      if (!confirm('Xoá báo cáo này?')) return;
+      await api('DELETE', `/api/admin/audits/${r.id}`).catch(e => toast(e.message, 'bad'));
+      cur = null; loadedId = 0; lastList = 0; refresh();
+    } }, 'Xoá báo cáo')));
+    fill(body, parts);
+  };
+  return {
+    mount(el) {
+      head = h('div', { class: 'row' });
+      body = h('div', { class: 'stack' });
+      histSel = h('select', { class: 'search', onchange: e => e.target.value && showReport(+e.target.value) });
+      provSel = me.role === 'admin' ? h('select', { class: 'search hidden', title: 'Tài khoản AI dùng cho lần kiểm tra này' }) : null;
+      runBtn = me.role === 'admin' ? h('button', { class: 'primary', onclick: e => busy(e.target, async () => {
+        await api('POST', `/api/admin/routers/${id}/audit`, { provider: provSel && !provSel.classList.contains('hidden') ? provSel.value : '' });
+        lastList = 0; cur = null; loadedId = 0; toast('Đã bắt đầu kiểm tra', 'ok'); refresh();
+      }) }, 'Chạy kiểm tra') : null;
+      el.append(h('div', { class: 'stack' }, h('div', { class: 'panel' }, h('div', { class: 'panel-h' },
+        h('h2', null, 'Kiểm tra bảo mật & hiệu suất'), h('span', { class: 'muted small' }, 'đọc cấu hình ở chế độ chỉ đọc, không thay đổi router'),
+        h('div', { class: 'grow' }), histSel, provSel, runBtn)), body));
+    },
+    async update() {
+      const wasRunning = info && info.running;
+      if (Date.now() - lastList < 4000 && !wasRunning) return;
+      lastList = Date.now();
+      try { info = await api('GET', `/api/routers/${id}/audits`); } catch (e) { return toast(e.message, 'bad'); }
+      const opts = info.reports.map(r => h('option', { value: r.id, selected: r.id === loadedId },
+        `${fmtTime(r.startedAt)} · ${r.status === 'running' ? 'đang chạy' : r.status === 'error' ? 'lỗi' : `bảo mật ${r.secScore} · hiệu suất ${r.perfScore}`}${r.source === 'ai' ? ' · AI' : ''}`));
+      fill(histSel, info.reports.length ? opts : h('option', { value: '' }, 'Chưa có báo cáo'));
+      if (provSel) {
+        const usable = (info.providers || []).filter(p => p.usable);
+        const prev = provSel.value || info.aiDefault;
+        provSel.classList.toggle('hidden', !info.aiReady || usable.length < 2);
+        fill(provSel, usable.map(p => h('option', { value: p.id, selected: p.id === prev }, p.name + ' · ' + p.model)));
+      }
+      const newest = info.reports.find(r => r.status !== 'running');
+      if (wasRunning && !info.running && newest) { await showReport(newest.id); return; }
+      if (!loadedId && newest) { await showReport(newest.id); return; }
+      render();
+    },
+  };
+}
+
+// --- events tab
+function tabEvents(id) {
+  let panel, last = 0;
+  return {
+    mount(el) { panel = eventsPanel('Sự kiện của router', 'events-' + id, false); el.append(panel.el); },
+    async update() {
+      if (Date.now() - last < 10000) return;
+      last = Date.now();
+      try { panel.draw(await api('GET', `/api/events?router=${id}&limit=1000`), {}); } catch (e) { toast(e.message, 'bad'); }
+    },
+  };
+}
+
+// ---------- chart ----------
+function lineChart(series, o = {}) {
+  const W = 900, H = o.height || 200, L = 70, R = 12, T = 10, B = 24;
+  const all = series.flatMap(x => x.pts.filter(p => p[1] != null));
+  if (!all.length) return h('div', { class: 'empty' }, 'Chưa có dữ liệu');
+  const t0 = Math.min(...series.flatMap(x => x.pts.map(p => p[0]))), t1 = Math.max(...series.flatMap(x => x.pts.map(p => p[0])));
+  let vmax = o.max || Math.max(...all.map(p => p[1]));
+  if (!vmax || vmax <= 0) vmax = 1;
+  vmax *= o.max ? 1 : 1.1;
+  const X = t => L + (t1 === t0 ? 0.5 : (t - t0) / (t1 - t0)) * (W - L - R);
+  const Y = v => T + (1 - v / vmax) * (H - T - B);
+  const svg = s('svg', { class: 'chart', viewBox: `0 0 ${W} ${H}`, role: 'img' });
+  for (let i = 0; i <= 4; i++) {
+    const v = vmax * i / 4, y = Y(v);
+    svg.append(s('line', { class: 'grid-l', x1: L, x2: W - R, y1: y, y2: y }), s('text', { x: L - 6, y: y + 4, 'text-anchor': 'end' }, o.fmt ? o.fmt(v) : v.toFixed(0)));
+  }
+  const span = t1 - t0;
+  for (let i = 0; i <= 5; i++) {
+    const t = t0 + span * i / 5, d = new Date(t);
+    const lbl = span > 2 * 86400000 ? d.toLocaleDateString('vi-VN', { day: '2-digit', month: '2-digit' }) + ' ' + d.toLocaleTimeString('vi-VN', { hour: '2-digit' }) + 'h' : d.toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit' });
+    svg.append(s('text', { x: X(t), y: H - 6, 'text-anchor': i === 0 ? 'start' : i === 5 ? 'end' : 'middle' }, lbl));
+  }
+  for (const se of series) {
+    // break the line on missing values or gaps longer than o.gap
+    let seg = [];
+    const flush = () => {
+      if (seg.length > 1) {
+        const d = seg.map((p, i) => (i ? 'L' : 'M') + X(p[0]).toFixed(1) + ',' + Y(p[1]).toFixed(1)).join('');
+        if (se.area) svg.append(s('path', { class: 'ar ' + se.cls, d: d + `L${X(seg.at(-1)[0]).toFixed(1)},${Y(0)}L${X(seg[0][0]).toFixed(1)},${Y(0)}Z` }));
+        svg.append(s('path', { class: 'ln ' + se.cls, d }));
+      } else if (seg.length === 1) svg.append(s('circle', { class: se.cls, cx: X(seg[0][0]), cy: Y(seg[0][1]), r: 2 }));
+      seg = [];
+    };
+    let prev = null;
+    for (const p of se.pts) {
+      if (p[1] == null || (prev && o.gap && p[0] - prev[0] > o.gap)) flush();
+      if (p[1] != null) seg.push(p);
+      prev = p;
+    }
+    flush();
+  }
+  // hover readout
+  const cur = s('line', { class: 'cur hidden', y1: T, y2: H - B });
+  const tipText = s('text', { x: 8, y: 16 });
+  const tipBox = s('rect', { rx: 5, width: 10, height: 10 });
+  const tip = s('g', { class: 'tip hidden' }, tipBox, tipText);
+  const hit = s('rect', { x: L, y: T, width: W - L - R, height: H - T - B, fill: 'transparent' });
+  svg.append(cur, tip, hit);
+  const times = series[0].pts.map(p => p[0]);
+  hit.addEventListener('pointermove', e => {
+    const p = new DOMPoint(e.clientX, e.clientY).matrixTransform(svg.getScreenCTM().inverse());
+    const t = t0 + (p.x - L) / (W - L - R) * (t1 - t0);
+    let i = 0, best = Infinity;
+    times.forEach((x, j) => { const d = Math.abs(x - t); if (d < best) { best = d; i = j; } });
+    const x = X(times[i]);
+    cur.setAttribute('x1', x); cur.setAttribute('x2', x); cur.classList.remove('hidden');
+    fill(tipText, s('tspan', { x: 8, dy: 0 }, new Date(times[i]).toLocaleString('vi-VN', { hour: '2-digit', minute: '2-digit', day: '2-digit', month: '2-digit' })),
+      series.map(se => s('tspan', { x: 8, dy: 16 }, `${se.name}: ${se.pts[i] && se.pts[i][1] != null ? (o.fmt ? o.fmt(se.pts[i][1]) : se.pts[i][1]) : '–'}`)));
+    const bw = 170, bh = 22 + series.length * 16;
+    tipBox.setAttribute('width', bw); tipBox.setAttribute('height', bh);
+    const tx = x + bw + 12 > W ? x - bw - 8 : x + 8;
+    tip.setAttribute('transform', `translate(${tx},${T + 4})`); tip.classList.remove('hidden');
+  });
+  hit.addEventListener('pointerleave', () => { cur.classList.add('hidden'); tip.classList.add('hidden'); });
+  return svg;
+}
+
+// ---------- admin: routers ----------
+function connText(r) {
+  if (r.mode === 'demo') return 'Mô phỏng';
+  const o = r.opts || {}, parts = [];
+  if (o.snmpVersion && o.snmpVersion !== 'off') parts.push('SNMPv' + o.snmpVersion);
+  if (o.cli) parts.push(o.cli === 'ssh' ? 'SSH' : 'Telnet');
+  return `${parts.join(' + ') || '–'} · ${r.host}`;
+}
+
+function adminRoutersPage() {
+  let p, list = [], sys = null;
+  const editId = +(new URLSearchParams(location.hash.split('?')[1] || '').get('edit') || 0);
+  let opened = false;
+  const sysNote = h('p', { class: 'hint' });
+  return {
+    every: 10000,
+    mount(main) {
+      p = tablePanel('Router DrayTek', 'adm-routers', h('button', { class: 'primary', onclick: () => routerForm({}, null, sys) }, '+ Thêm router'));
+      main.append(h('div', { class: 'stack' }, p.el, sysNote));
+    },
+    async load() {
+      const [a, ov] = await Promise.all([api('GET', '/api/admin/routers'), api('GET', '/api/overview')]);
+      sys = a.syslog || null;
+      return { routers: a.routers, views: Object.fromEntries(ov.routers.map(v => [v.id, v])) };
+    },
+    update(d) {
+      list = d.routers;
+      p.draw([
+        { t: 'Tên', v: r => r.name, r: r => h('a', { href: `#/r/${r.id}/overview` }, h('b', null, r.name)) },
+        { t: 'Trạng thái', v: r => d.views[r.id]?.status, r: r => badge(d.views[r.id]?.status || 'unknown') },
+        { t: 'Kết nối', v: r => connText(r), r: r => h('span', { class: 'small' }, connText(r)) },
+        { t: 'Model', v: r => d.views[r.id]?.resource?.['board-name'], r: r => [d.views[r.id]?.resource?.['board-name'], d.views[r.id]?.resource?.version].filter(Boolean).join(' · ') || '–' },
+        { t: 'WAN theo dõi', v: r => r.wans.length, r: r => r.wans.map(w => w.label || w.iface).join(', ') || '–' },
+        { t: 'Lỗi gần nhất', v: r => d.views[r.id]?.lastErr, r: r => h('span', { class: 'small' }, d.views[r.id]?.status !== 'up' ? d.views[r.id]?.lastErr || '' : '') },
+        { t: '', r: r => h('button', { class: 'sm', onclick: () => routerForm(r, d.views[r.id], sys) }, 'Sửa') },
+      ], list, { empty: 'Chưa có router. Bấm “Thêm router”.', rowClass: r => r.enabled ? null : 'off' });
+      fill(sysNote, sys ? `Nhận syslog từ router tại UDP ${sys.addr.replace(/^\[::\]|^0\.0\.0\.0/, '')}` + (sys.unknown ? ` · đã bỏ qua ${sys.unknown} gói từ IP không phải router đã khai báo (gần nhất: ${sys.lastFrom})` : '') + '.' : 'Bộ nhận syslog đang tắt (chạy với -syslog :5514 để bật).');
+      if (editId && !opened) { opened = true; const r = list.find(x => x.id === editId); if (r) routerForm(r, d.views[r.id], sys); }
+    },
+  };
+}
+
+function routerForm(r, view, sys) {
+  const isNew = !r.id, o = r.opts || {};
+  const sel = (opts, cur) => h('select', null, opts.map(([v, t]) => h('option', { value: v, selected: cur === v }, t)));
+  const mode = sel([['pull', 'Router DrayTek thật']].concat(me.demo ? [['demo', 'Mô phỏng (demo)']] : []), r.mode || 'pull');
+  const name = h('input', { value: r.name || '', required: true, maxlength: 64 });
+  const host = h('input', { value: r.host || '', placeholder: '192.168.1.1', class: 'mono' });
+  // SNMP
+  const snmpVer = sel([['2c', 'SNMP v2c (phổ biến)'], ['3', 'SNMP v3 (mã hoá, khuyên dùng)'], ['1', 'SNMP v1'], ['off', 'Không dùng SNMP']], o.snmpVersion || '2c');
+  const snmpPort = h('input', { type: 'number', min: 0, max: 65535, value: o.snmpPort || '', placeholder: '161' });
+  const community = h('input', { type: 'password', autocomplete: 'new-password', maxlength: 23, placeholder: r.hasSnmpSecret ? '(giữ nguyên)' : 'Get Community đặt trên router' });
+  const v3user = h('input', { value: o.snmpUser || '', maxlength: 23, autocomplete: 'off' });
+  const authProto = sel([['SHA', 'SHA'], ['MD5', 'MD5']], (o.authProto || 'SHA').toUpperCase());
+  const authPass = h('input', { type: 'password', autocomplete: 'new-password', maxlength: 23, placeholder: r.hasSnmpSecret ? '(giữ nguyên)' : '≥ 8 ký tự' });
+  const privProto = sel([['AES', 'AES'], ['DES', 'DES']], (o.privProto || 'AES').toUpperCase());
+  const privPass = h('input', { type: 'password', autocomplete: 'new-password', maxlength: 23, placeholder: r.hasSnmpSecret ? '(giữ nguyên)' : '≥ 8 ký tự (trống = không mã hoá)' });
+  // CLI
+  const cli = sel([['ssh', 'SSH (khuyên dùng)'], ['telnet', 'Telnet'], ['', 'Không dùng']], isNew ? 'ssh' : (o.cli || ''));
+  const cliPort = h('input', { type: 'number', min: 0, max: 65535, value: o.cliPort || '', placeholder: 'mặc định 22/23' });
+  const user = h('input', { value: r.username || 'admin', autocomplete: 'off' });
+  const pass = h('input', { type: 'password', autocomplete: 'new-password', placeholder: r.hasPassword ? '(giữ nguyên)' : '' });
+  const pingFrom = sel([['local', 'Từ máy DrayPulse'], ['router', 'Từ router (lệnh ip ping)']], o.pingFrom || 'local');
+  const interval = h('input', { type: 'number', min: 5, max: 300, value: r.interval || 15 });
+  const target = h('input', { value: r.wanTarget || '8.8.8.8', class: 'mono' });
+  const chat = h('input', { value: r.chatId || '', placeholder: '-100123456789 (tuỳ chọn)', class: 'mono' });
+  const zchat = h('input', { value: r.zaloChat || '', placeholder: 'Chat ID Zalo (tuỳ chọn)', class: 'mono' });
+  const enabled = h('input', { type: 'checkbox', checked: isNew ? true : r.enabled });
+  const ifList = h('datalist', { id: 'np-ifaces' });
+  const known = new Set([...(view?.wans || []).map(w => w.iface)]);
+  const fillIfaces = names => { names.forEach(n => known.add(n)); fill(ifList, [...known].map(n => h('option', { value: n }))); };
+  fillIfaces([]);
+  const wanRows = h('div', { class: 'stack' });
+  const addWan = (w = {}) => {
+    const iface = h('input', { value: w.iface || '', placeholder: 'WAN1', list: 'np-ifaces', class: 'mono' });
+    const label = h('input', { value: w.label || '', placeholder: 'Tên nhà mạng (VNPT, Viettel…)', maxlength: 40 });
+    const row = h('div', { class: 'row wan-row' }, h('div', { class: 'grow' }, iface), h('div', { class: 'grow' }, label), h('button', { type: 'button', class: 'sm danger', onclick: () => row.remove() }, 'Bỏ'));
+    row._get = () => ({ iface: iface.value.trim(), label: label.value.trim() });
+    wanRows.append(row);
+  };
+  (r.wans || []).forEach(addWan);
+  let detected = (view?.detectedWans || []).filter(n => !(r.wans || []).some(w => w.iface === n));
+  const detBox = h('span', { class: 'hint' });
+  const drawDetected = () => fill(detBox, detected.length ? ['Router có: ', detected.map(n => h('button', { type: 'button', class: 'link', onclick: () => { addWan({ iface: n }); detected = detected.filter(x => x !== n); drawDetected(); } }, n))] : null);
+  drawDetected();
+  const testOut = h('div');
+
+  // --- setup command generator for DrayOS (Telnet/SSH console of the router)
+  const wzIP = h('input', { value: lanHost(), class: 'mono', placeholder: 'IP máy DrayPulse mà router nhìn thấy' });
+  const syslogPort = sys && sys.addr ? (sys.addr.match(/:(\d+)$/) || [])[1] : '';
+  const wzOut = h('div', { class: 'stack' });
+  let wzSecret = '';
+  const genSecret = n => {
+    const cs = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
+    const a = new Uint32Array(n);
+    crypto.getRandomValues(a);
+    return [...a].map(x => cs[x % cs.length]).join('');
+  };
+  const renderWizard = () => {
+    const ip = wzIP.value.trim() || '<IP-DrayPulse>';
+    const step = (title, cmds, note) => h('div', null, h('b', null, title), note ? h('div', { class: 'hint' }, note) : null, cmds ? codeBlock(cmds) : null);
+    const steps = [];
+    if (snmpVer.value === '3') {
+      const u = v3user.value.trim() || 'draypulse', ap = authPass.value || '<MatKhauXacThuc>', pp = privPass.value || '<MatKhauMaHoa>';
+      steps.push(step('Bước 1 – Bật SNMPv3 chỉ cho máy DrayPulse', `mngt snmp -e 1 -c 1 -o ${u} -p 2 -q ${ap} -r 6 -u ${pp} -m ${ip}`,
+        'Tương đương Web UI: System Maintenance → SNMP → Enable SNMP Agent, SNMPv3 Agent: USM User, Auth = SHA, Privacy = AES; Manager Host IP = IP máy DrayPulse. Mật khẩu tối đa 23 ký tự.'));
+    } else if (snmpVer.value !== 'off') {
+      const c = community.value || '<Community>';
+      steps.push(step('Bước 1 – Bật SNMP (chỉ đọc) và giới hạn cho máy DrayPulse', `mngt snmp -e 1 -${snmpVer.value === '1' ? 'a' : 'b'} 1 -g ${c} -m ${ip}`,
+        'Tương đương Web UI: System Maintenance → SNMP → Enable SNMP Agent, Get Community = chuỗi khó đoán (không dùng “public”), Manager Host IP = IP máy DrayPulse. Community tối đa 23 ký tự.'));
+    }
+    if (cli.value) steps.push(step(`Bước ${steps.length + 1} – Bật ${cli.value === 'ssh' ? 'SSH' : 'Telnet'} cho mạng LAN`, null,
+      `Web UI: System Maintenance → Management → Management Port Setup: bật ${cli.value === 'ssh' ? 'SSH Server (cổng 22)' : 'Telnet Server (cổng 23)'} và chỉ cho LAN. KHÔNG bật “Allow management from the Internet”. DrayPulse dùng tài khoản quản trị chỉ để chạy các lệnh xem (sys version, wan status, ip arp status, srv dhcp status, ip ping) – không bao giờ gửi lệnh thay đổi cấu hình.`));
+    steps.push(step(`Bước ${steps.length + 1} – (Tuỳ chọn) Gửi syslog VPN/WAN về DrayPulse`, `sys syslog -a 1 -s 1 -i ${ip} -d ${syslogPort || 5514} -f 0 -v 1 -w 1 -r 1 -e 0`,
+      'Web UI: System Maintenance → SysLog / Mail Alert → Syslog Access Setup. DrayPulse ghi sự kiện VPN kết nối/ngắt, WAN lên/xuống. Firewall log nên tắt (rất nhiều dòng).' + (sys ? '' : ' Lưu ý: bộ nhận syslog của DrayPulse đang tắt.')));
+    fill(wzOut, steps);
+  };
+  const wizard = h('details', { class: 'full box wizard', open: isNew }, h('summary', null, h('b', null, '🛠 Tạo lệnh cấu hình router'), h('span', { class: 'muted small' }, ' – dán vào Telnet/SSH của router, hoặc làm theo đường dẫn Web UI')),
+    h('div', { class: 'stack' },
+      h('div', { class: 'form' }, field('IP máy DrayPulse (router chỉ cho phép IP này)', wzIP),
+        h('div', { class: 'row' }, h('button', { type: 'button', onclick: () => {
+          wzSecret = genSecret(16);
+          if (snmpVer.value === '3') { authPass.value = wzSecret; privPass.value = genSecret(16); if (!v3user.value) v3user.value = 'draypulse'; }
+          else community.value = wzSecret;
+          renderWizard(); toast('Đã sinh chuỗi bí mật và điền vào form', 'ok');
+        } }, '🔑 Sinh community / mật khẩu SNMP'))),
+      h('p', { class: 'hint' }, '1) Điền địa chỉ router. 2) Bấm “Sinh community”. 3) Đăng nhập router (Telnet/SSH từ LAN) và chạy từng khối lệnh, hoặc cấu hình theo Web UI. 4) Quay lại bấm “Kiểm tra kết nối”. ', helpLink('router', 'Hướng dẫn chi tiết')),
+      wzOut));
+  [wzIP, community, v3user, authPass, privPass].forEach(x => x.addEventListener('input', renderWizard));
+  [snmpVer, cli].forEach(x => x.addEventListener('change', renderWizard));
+  renderWizard();
+
+  const v2Box = h('div', { class: 'form full' }, field('Community (Get)', community));
+  const v3Box = h('div', { class: 'form full' }, field('User SNMPv3', v3user), field('Xác thực', authProto), field('Mật khẩu xác thực', authPass), field('Mã hoá', privProto), field('Mật khẩu mã hoá', privPass));
+  const snmpBox = h('div', { class: 'form full' }, field('Phiên bản SNMP', snmpVer), field('Cổng SNMP', snmpPort), v2Box, v3Box,
+    h('p', { class: 'hint full' }, 'SNMP cho CPU, RAM, uptime, model/firmware, lưu lượng từng cổng/WAN và danh sách VPN đang kết nối.'));
+  const cliBox = h('div', { class: 'form full' }, field('Telnet/SSH', cli), field('Cổng', cliPort), field('Tài khoản quản trị router', user), field('Mật khẩu', pass),
+    field('Ping thiết bị LAN', pingFrom),
+    h('p', { class: 'hint full' }, 'Telnet/SSH (tuỳ chọn) cho: trạng thái WAN chi tiết, IP public, bảng ARP & DHCP (client, tên máy, cổng LAN) và kiểm tra Internet riêng từng WAN bằng “ip ping … WANx”. DrayPulse chỉ gửi lệnh xem trong danh sách cố định.'));
+  const syncSnmp = () => {
+    v2Box.classList.toggle('hidden', !['1', '2c'].includes(snmpVer.value));
+    v3Box.classList.toggle('hidden', snmpVer.value !== '3');
+    [snmpPort].forEach(x => x.disabled = snmpVer.value === 'off');
+    [cliPort, user, pass, pingFrom].forEach(x => x.disabled = !cli.value);
+  };
+  snmpVer.addEventListener('change', syncSnmp); cli.addEventListener('change', syncSnmp); syncSnmp();
+
+  const pullBox = h('div', { class: 'form full' },
+    field('Địa chỉ router (IP LAN/VPN hoặc tên miền)', host, 'full'),
+    h('div', { class: 'full stack' }, h('h3', null, 'SNMP'), snmpBox),
+    h('div', { class: 'full stack' }, h('h3', null, 'Telnet / SSH'), cliBox),
+    h('div', { class: 'full row' }, h('button', { type: 'button', onclick: e => busy(e.target, async () => {
+      const res = await api('POST', '/api/admin/routers/test', { ...collect(), id: r.id || 0 });
+      fillIfaces(res.interfaces || []);
+      (res.wans || []).forEach(n => { if (!detected.includes(n) && ![...wanRows.children].some(x => x._get().iface === n)) detected.push(n); });
+      drawDetected();
+      fill(testOut, h('div', { class: 'box ok' }, `✓ Kết nối được: ${[res.identity, res.board, res.version && 'DrayOS ' + res.version].filter(Boolean).join(' · ')} · ${res.interfaces.length} interface` + (res.cli ? ` · CLI: ${res.cli}` : ''),
+        (res.warnings || []).map(w => h('div', { class: 'err-line' }, w))));
+    }).catch(() => { }) }, 'Kiểm tra kết nối'), testOut),
+    wizard);
+  const syncMode = () => pullBox.classList.toggle('hidden', mode.value !== 'pull');
+  mode.addEventListener('change', syncMode); syncMode();
+  function collect() {
+    const body = { name: name.value, mode: mode.value, host: host.value, username: user.value,
+      opts: { snmpVersion: snmpVer.value, snmpPort: +snmpPort.value || 0, snmpUser: v3user.value, authProto: authProto.value, privProto: privProto.value,
+        cli: cli.value, cliPort: +cliPort.value || 0, pingFrom: pingFrom.value },
+      interval: +interval.value || 15, wans: [...wanRows.children].map(x => x._get()).filter(w => w.iface), wanTarget: target.value, chatId: chat.value, zaloChat: zchat.value, enabled: enabled.checked };
+    if (pass.value) body.password = pass.value;
+    if (community.value || authPass.value || privPass.value) body.snmp = { community: community.value, authPass: authPass.value, privPass: privPass.value };
+    return body;
+  }
+  const actions = [{ t: 'Huỷ', fn: c => c() }, { t: isNew ? 'Thêm router' : 'Lưu', cls: 'primary', submit: true, fn: async close => {
+    try {
+      await api(isNew ? 'POST' : 'PUT', isNew ? '/api/admin/routers' : `/api/admin/routers/${r.id}`, collect());
+      close(); toast('Đã lưu router', 'ok'); refresh();
+    } catch (e) { toast(e.message, 'bad'); }
+  } }];
+  if (!isNew) actions.unshift({ t: 'Xoá router', cls: 'danger', fn: async close => {
+    if (!confirm(`Xoá router “${r.name}” cùng toàn bộ lịch sử, thiết bị và sự kiện?`)) return;
+    try { await api('DELETE', `/api/admin/routers/${r.id}`); close(); toast('Đã xoá'); refresh(); } catch (e) { toast(e.message, 'bad'); }
+  } });
+  modal(isNew ? 'Thêm router DrayTek' : 'Sửa router: ' + r.name, h('div', { class: 'form' },
+    field('Tên hiển thị', name), field('Loại', mode), pullBox,
+    field('Chu kỳ đọc (giây)', interval), field('IP kiểm tra Internet', target), field('Chat ID Telegram riêng cho router này', chat), field('Chat ID Zalo riêng cho router này', zchat),
+    h('div', { class: 'full stack' }, h('h3', null, 'WAN cần theo dõi'),
+      h('p', { class: 'hint' }, 'DrayPulse báo khi WAN mất link hoặc mất Internet. Tên WAN theo router: WAN1, WAN2… (bấm “Kiểm tra kết nối” để lấy danh sách).'),
+      wanRows, ifList,
+      h('div', { class: 'row' }, h('button', { type: 'button', class: 'sm', onclick: () => addWan() }, '+ Thêm WAN'), detBox)),
+    h('div', { class: 'full' }, check('Đang giám sát (bỏ chọn để tạm dừng)', enabled))), actions);
+}
+
+// ---------- admin: users ----------
+function usersPage() {
+  let p, routers = [];
+  return {
+    mount(main) {
+      p = tablePanel('Người dùng', 'users', h('button', { class: 'primary', onclick: () => userForm({}, routers) }, '+ Thêm người dùng'));
+      main.append(h('div', { class: 'stack' }, p.el, h('p', { class: 'hint' }, 'Quản trị viên xem và cấu hình mọi router. Người xem chỉ thấy các router được chọn và không thay đổi được gì.')));
+    },
+    async load() {
+      const [u, r] = await Promise.all([api('GET', '/api/admin/users'), api('GET', '/api/admin/routers')]);
+      routers = r.routers; return u;
+    },
+    update(users) {
+      const rn = Object.fromEntries(routers.map(r => [r.id, r.name]));
+      p.draw([
+        { t: 'Tên đăng nhập', v: u => u.username, r: u => h('b', null, u.username) },
+        { t: 'Vai trò', v: u => u.role, r: u => u.role === 'admin' ? 'Quản trị' : 'Người xem' },
+        { t: 'Router được xem', v: u => u.routers.length, r: u => u.role === 'admin' ? 'Tất cả' : u.routers.map(id => rn[id]).filter(Boolean).join(', ') || '–' },
+        { t: 'Trạng thái', v: u => u.disabled, r: u => u.disabled ? badge('disabled', 'Đã khoá') : badge('up', 'Hoạt động') },
+        { t: '', r: u => h('button', { class: 'sm', onclick: () => userForm(u, routers) }, 'Sửa') },
+      ], users);
+    },
+  };
+}
+
+function userForm(u, routers) {
+  const isNew = !u.id;
+  const name = h('input', { value: u.username || '', required: isNew, disabled: !isNew, maxlength: 32 });
+  const role = h('select', null, [['viewer', 'Người xem (chỉ đọc)'], ['admin', 'Quản trị viên']].map(([v, t]) => h('option', { value: v, selected: (u.role || 'viewer') === v }, t)));
+  const pass = h('input', { type: 'password', autocomplete: 'new-password', placeholder: isNew ? '≥ 10 ký tự' : '(để trống = giữ nguyên)' });
+  const disabled = h('input', { type: 'checkbox', checked: !!u.disabled });
+  const boxes = routers.map(r => ({ id: r.id, cb: h('input', { type: 'checkbox', checked: (u.routers || []).includes(r.id) }), name: r.name }));
+  const rbox = h('div', { class: 'full stack' }, h('h3', null, 'Router được xem'), boxes.length ? h('div', { class: 'form' }, boxes.map(b => check(b.name, b.cb))) : h('p', { class: 'hint' }, 'Chưa có router.'));
+  const sync = () => rbox.classList.toggle('hidden', role.value === 'admin');
+  role.addEventListener('change', sync); sync();
+  const actions = [{ t: 'Huỷ', fn: c => c() }, { t: 'Lưu', cls: 'primary', submit: true, fn: async close => {
+    try {
+      await api(isNew ? 'POST' : 'PUT', isNew ? '/api/admin/users' : `/api/admin/users/${u.id}`, { username: name.value, role: role.value, password: pass.value, disabled: disabled.checked, routers: boxes.filter(b => b.cb.checked).map(b => b.id) });
+      close(); toast('Đã lưu', 'ok'); refresh();
+    } catch (e) { toast(e.message, 'bad'); }
+  } }];
+  if (!isNew && u.id !== me.id) actions.unshift({ t: 'Xoá', cls: 'danger', fn: async close => {
+    if (!confirm(`Xoá người dùng ${u.username}?`)) return;
+    try { await api('DELETE', `/api/admin/users/${u.id}`); close(); refresh(); } catch (e) { toast(e.message, 'bad'); }
+  } });
+  modal(isNew ? 'Thêm người dùng' : 'Sửa ' + u.username, h('div', { class: 'form' }, field('Tên đăng nhập', name), field('Vai trò', role), field('Mật khẩu', pass),
+    h('div', { class: 'full' }, check('Khoá tài khoản', disabled)), rbox), actions);
+}
+
+// ---------- admin: settings ----------
+function settingsPage() {
+  let box, built = false, recentBox = h('div'), inputs = {};
+  const CH = [
+    { k: 'telegram', title: 'Telegram', tokenKey: 'tgToken', chatKey: 'adminChat', tokenPh: '123456789:AA…', how: 'Tạo bot bằng @BotFather trong Telegram, dán Bot Token vào đây và Lưu. Sau đó nhắn /start cho bot (hoặc thêm bot vào nhóm rồi gõ /id). Chat ID sẽ hiện ở bảng “Tin nhắn gần đây” bên dưới.' },
+    { k: 'zalo', title: 'Zalo', tokenKey: 'zaloToken', chatKey: 'zaloAdmin', tokenPh: '12345678:abc-xyz…', how: 'Trong Zalo, tìm OA “Zalo Bot Manager” → Tạo bot → đặt tên bắt đầu bằng “Bot”. Zalo gửi Bot Token cho bạn; dán vào đây và Lưu. Sau đó mở bot, nhắn “id”. Chat ID sẽ hiện ở bảng “Tin nhắn gần đây”.' },
+  ];
+  return {
+    every: 15000,
+    mount(main) { box = h('div'); main.append(box); },
+    load: () => api('GET', '/api/admin/settings'),
+    update(d) {
+      const useChat = (ch, id) => { inputs[ch].chat.value = id; inputs[ch].chat.focus(); toast('Đã điền Chat ID – bấm “Lưu cài đặt”', 'ok'); };
+      const recent = d.recentChats || [];
+      fill(recentBox, recent.length ? table([
+        { t: 'Kênh', v: x => x.channel, r: x => x.channel === 'zalo' ? 'Zalo' : 'Telegram' },
+        { t: 'Người gửi / nhóm', v: x => x.name, r: x => h('div', null, x.name || '–', x.kind ? h('div', { class: 'muted small' }, x.kind) : null) },
+        { t: 'Chat ID', v: x => x.chatId, r: x => h('span', { class: 'mono' }, x.chatId) },
+        { t: 'Tin nhắn', v: x => x.text },
+        { t: 'Lúc', v: x => x.at, r: x => fmtTime(x.at) },
+        { t: '', r: x => h('button', { type: 'button', class: 'sm', onclick: () => useChat(x.channel, x.chatId) }, 'Dùng làm Chat ID quản trị') },
+      ], recent) : h('div', { class: 'empty' }, 'Chưa có. Lưu Bot Token rồi nhắn bất kỳ tin nào cho bot (ví dụ “id”); bảng tự cập nhật sau vài giây.'));
+      if (built) return; // periodic refresh only updates the table above, never the form being edited
+      built = true;
+      const st = d.settings;
+      inputs = {};
+      const chPanel = c => {
+        const token = h('input', { type: 'password', autocomplete: 'off', placeholder: d.hasToken[c.k] ? '(đã lưu – để trống để giữ nguyên)' : c.tokenPh });
+        const remove = h('input', { type: 'checkbox' });
+        const chat = h('input', { value: st[c.chatKey] || '', placeholder: 'Chat ID nhận mọi cảnh báo', class: 'mono' });
+        inputs[c.k] = { token, remove, chat };
+        const err = d.errors[c.k];
+        return h('div', { class: 'panel' },
+          h('div', { class: 'panel-h' }, h('h2', null, 'Cảnh báo ' + c.title), d.hasToken[c.k] ? badge(d.tokenOk[c.k] ? 'up' : 'down', d.tokenOk[c.k] ? 'Đã có Bot Token' : 'Không giải mã được token') : badge('unknown', 'Chưa cấu hình'), err ? h('span', { class: 'st down' }, err) : null),
+          h('div', { class: 'panel-b form' },
+            field('Bot Token', token), field('Chat ID quản trị', chat),
+            d.hasToken[c.k] ? h('div', { class: 'full' }, check('Xoá Bot Token đã lưu', remove)) : null,
+            h('div', { class: 'full row' }, h('button', { type: 'button', onclick: e => busy(e.target, async () => {
+              await api('POST', '/api/admin/settings/test', { channel: c.k, chat: chat.value }); toast('Đã gửi tin thử qua ' + c.title + ' – kiểm tra điện thoại', 'ok');
+            }) }, 'Gửi tin thử'), h('span', { class: 'hint' }, 'Lưu cài đặt trước khi gửi thử.')),
+            h('p', { class: 'hint full' }, c.how)));
+      };
+      const aiConsent = h('input', { type: 'checkbox', checked: st.aiConsent });
+      const aiAnon = h('input', { type: 'checkbox', checked: st.aiAnonymize });
+      const aiFallback = h('input', { type: 'checkbox', checked: st.aiFallback });
+      const autoAudit = h('input', { type: 'checkbox', checked: st.autoAudit });
+      const provs = d.aiProviders || [];
+      const setDefault = async pid => { try { await api('PUT', '/api/admin/ai/default', { id: pid }); built = false; refresh(); } catch (e) { toast(e.message, 'bad'); } };
+      const aiPanel = h('div', { class: 'panel' }, h('div', { class: 'panel-h' }, h('h2', null, 'Trợ lý AI kiểm tra router'),
+        h('span', { class: 'muted small' }, 'Claude, ChatGPT, Gemini, DeepSeek, Grok, Mistral, Ollama…'), h('div', { class: 'grow' }),
+        h('button', { type: 'button', class: 'primary', onclick: () => aiAccountForm({}, () => { built = false; refresh(); }) }, '+ Thêm tài khoản AI')),
+        provs.length ? table([
+          { t: 'Mặc định', r: p => h('input', { type: 'radio', name: 'ai-default', checked: p.id === st.aiDefault, onchange: () => setDefault(p.id), title: 'Dùng tài khoản này khi chạy kiểm tra' }) },
+          { t: 'Tài khoản', v: p => p.name, r: p => h('div', null, h('b', null, p.name), h('div', { class: 'muted small' }, p.kind === 'anthropic' ? 'Anthropic (SDK chính thức)' : p.baseUrl)) },
+          { t: 'Mô hình', v: p => p.model, r: p => h('span', { class: 'mono small' }, p.model || '– chưa chọn –') },
+          { t: 'Trạng thái', v: p => p.usable ? 1 : 0, r: p => !p.enabled ? badge('disabled', 'Tắt') : !p.keyOk ? badge('down', 'Key hỏng') : p.usable ? badge('up', p.hasKey ? 'Sẵn sàng' : 'Sẵn sàng (không key)') : badge('waiting', 'Thiếu mô hình') },
+          { t: '', r: p => h('button', { type: 'button', class: 'sm', onclick: () => aiAccountForm(p, () => { built = false; refresh(); }) }, 'Sửa') },
+        ], provs) : h('div', { class: 'empty' }, 'Chưa có tài khoản AI. Không có AI thì báo cáo chỉ gồm bộ kiểm tra có sẵn (miễn phí).'),
+        h('div', { class: 'panel-b stack' },
+          check('Cho phép gửi cấu hình router (đã xoá mật khẩu, khoá, PSK) tới nhà cung cấp AI đã chọn để phân tích', aiConsent),
+          check('Che IP public và địa chỉ MAC trước khi gửi (khuyên dùng; báo cáo vẫn hiện giá trị thật)', aiAnon),
+          check('Nếu tài khoản AI đang chọn bị lỗi (hết credit, key sai, quá tải), tự chuyển sang tài khoản khác', aiFallback),
+          check('Tự động kiểm tra mọi router sáng Chủ nhật hằng tuần và gửi tóm tắt qua Telegram/Zalo', autoAudit),
+          h('p', { class: 'hint' }, helpLink('ai', 'Cách lấy API key cho từng nhà cung cấp'), ' · ', helpLink('audit', 'Trợ lý AI hoạt động thế nào')),
+          h('p', { class: 'hint' }, 'Chi phí ước tính hiện trong từng báo cáo (với tài khoản ngoài Claude, nhập giá trong phần Sửa để tính). Ollama/LM Studio chạy trên máy của bạn: dữ liệu không ra khỏi mạng nội bộ, nhưng cần mô hình đủ mạnh và hỗ trợ gọi công cụ (tools).')));
+      const sumOn = h('input', { type: 'checkbox', checked: st.summaryOn });
+      const sumAt = h('input', { type: 'time', value: st.summaryAt });
+      const notifyNew = h('input', { type: 'checkbox', checked: st.notifyNew });
+      const repeat = h('select', null, [[0, 'Không nhắc lại'], [15, '15 phút'], [30, '30 phút'], [60, '1 giờ'], [120, '2 giờ']].map(([v, t]) => h('option', { value: v, selected: st.repeatMin === v }, t)));
+      const tz = h('input', { value: st.timezone });
+      const keep = h('input', { type: 'number', min: 1, max: 400, value: st.retentionDays });
+      const base = h('input', { value: st.pushBase, placeholder: 'http://192.168.1.10:8080', class: 'mono' });
+      const save = h('button', { class: 'primary', type: 'submit' }, 'Lưu cài đặt');
+      const recentPanel = h('div', { class: 'panel' }, h('div', { class: 'panel-h' }, h('h2', null, 'Tin nhắn gần đây gửi tới bot'), h('span', { class: 'muted small' }, 'dùng để lấy Chat ID')), recentBox);
+      const form = h('form', { class: 'stack', onsubmit: e => { e.preventDefault(); busy(save, async () => {
+        const body = { adminChat: inputs.telegram.chat.value, zaloAdmin: inputs.zalo.chat.value, summaryOn: sumOn.checked, summaryAt: sumAt.value, notifyNew: notifyNew.checked,
+          repeatMin: +repeat.value, timezone: tz.value, retentionDays: +keep.value, pushBase: base.value,
+          aiFallback: aiFallback.checked, aiConsent: aiConsent.checked, aiAnonymize: aiAnon.checked, autoAudit: autoAudit.checked };
+        for (const c of CH) {
+          const i = inputs[c.k];
+          if (i.remove.checked) body[c.tokenKey] = ''; else if (i.token.value) body[c.tokenKey] = i.token.value;
+        }
+        const res = await api('PUT', '/api/admin/settings', body);
+        built = false; page.update(res); toast('Đã lưu cài đặt', 'ok');
+      }); } },
+        h('div', { class: 'grid two' }, chPanel(CH[0]), chPanel(CH[1])),
+        aiPanel,
+        recentPanel,
+        h('div', { class: 'panel' }, h('div', { class: 'panel-h' }, h('h2', null, 'Khi nào gửi cảnh báo')),
+          h('div', { class: 'panel-b form' },
+            h('div', { class: 'full row' }, check('Gửi bản tin tổng hợp hằng ngày lúc', sumOn), h('div', null, sumAt)),
+            field('Nhắc lại khi WAN/router vẫn lỗi', repeat),
+            h('div', { class: 'full' }, check('Báo khi có thiết bị lạ lần đầu vào mạng', notifyNew)),
+            h('p', { class: 'hint full' }, 'Cảnh báo gửi tới Chat ID quản trị của mọi kênh đã cấu hình, và tới Chat ID riêng của từng router (nếu có). Gõ /status (Telegram) hoặc “status” (Zalo) cho bot để xem tình trạng bất cứ lúc nào.'))),
+        h('div', { class: 'panel' }, h('div', { class: 'panel-h' }, h('h2', null, 'Hệ thống')),
+          h('div', { class: 'panel-b form' },
+            field('Múi giờ', tz), field('Số ngày lưu lịch sử', keep),
+            field('Địa chỉ DrayPulse mà router nhìn thấy (dùng khi tạo lệnh cấu hình SNMP/Syslog)', base, 'full'),
+            h('p', { class: 'hint full' }, 'Để trống thì dùng địa chỉ bạn đang mở trang. Phải là địa chỉ router gọi tới được, ví dụ IP LAN hoặc tên miền.'))),
+        h('div', { class: 'row' }, save));
+      const backup = h('div', { class: 'panel' }, h('div', { class: 'panel-h' }, h('h2', null, 'Sao lưu')),
+        h('div', { class: 'panel-b stack' },
+          h('p', null, 'Tải bản sao database (nhất quán, an toàn khi đang chạy). Để khôi phục: dừng DrayPulse, chép file vào ', h('code', null, d.dataDir + '/draypulse.db'), ' và giữ nguyên file ', h('code', null, 'secret.key'), ' (dùng để giải mã mật khẩu router và Bot Token).'),
+          h('div', null, h('a', { class: 'btn', href: '/api/admin/backup' }, 'Tải bản sao lưu')),
+          h('p', { class: 'hint' }, `DrayPulse ${d.version}`)));
+      fill(box, h('div', { class: 'stack' }, form, backup));
+    },
+  };
+}
+
+// ---------- in-app guide ----------
+const HELP = { router: '2-thêm-router-draytek', syslog: 'bước-d3-tuỳ-chọn-gửi-syslog-về-draypulse', telegram: '4-nhận-cảnh-báo-qua-telegram', zalo: '5-nhận-cảnh-báo-qua-zalo', ai: 'thêm-tài-khoản-ai', audit: '7-trợ-lý-ai-kiểm-tra-bảo-mật-và-hiệu-suất', trouble: '8-xử-lý-sự-cố' };
+const helpLink = (key, text = 'Xem hướng dẫn') => h('a', { href: '#/help/' + encodeURIComponent(HELP[key]), target: '_blank', rel: 'noopener' }, text + ' ↗');
+
+function lanHost() {
+  const hst = location.hostname;
+  return /^\d+\.\d+\.\d+\.\d+$/.test(hst) && !hst.startsWith('127.') ? hst : '';
+}
+
+function helpPage(section) {
+  let box;
+  return {
+    mount(main) { box = h('div', null, h('div', { class: 'empty' }, 'Đang tải hướng dẫn…')); main.append(box); },
+    load: () => api('GET', '/api/help'),
+    update(d) {
+      if (box.dataset.loaded) return;
+      box.dataset.loaded = '1';
+      const host = lanHost();
+      let text = d.markdown;
+      if (host && host !== '192.168.1.4') text = text.split('192.168.1.4').join(host); // examples use this server's real address
+      const go = slug => {
+        const el = document.getElementById('h-' + slug);
+        if (!el) return;
+        el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        history.replaceState(null, '', '#/help/' + encodeURIComponent(slug));
+      };
+      const content = md(text, { onAnchor: go, idPrefix: 'h-', levelOffset: 0 });
+      const heads = [...content.querySelectorAll('h2, h3')];
+      const toc = h('nav', { class: 'toc panel' }, h('b', null, 'Mục lục'),
+        heads.map(x => h('a', { href: '#', class: x.tagName === 'H3' ? 'sub' : null, onclick: e => { e.preventDefault(); go(x.id.slice(2)); } }, x.textContent)));
+      fill(box, h('div', { class: 'help-grid' }, toc, h('div', { class: 'panel panel-b help-body' },
+        host ? h('div', { class: 'hint' }, `Các lệnh mẫu đã dùng địa chỉ DrayPulse bạn đang mở: ${host}. Nếu router kết nối tới DrayPulse qua địa chỉ khác (VPN, NAT…), thay cho phù hợp.`) : null,
+        content, h('p', { class: 'hint' }, 'DrayPulse ' + d.version))));
+      if (section) setTimeout(() => go(section), 60);
+    },
+  };
+}
+
+// ---------- AI accounts ----------
+const AI_PRESETS = [
+  { k: 'anthropic', name: 'Claude (Anthropic)', kind: 'anthropic', base: '', model: 'claude-opus-5-5', key: 'console.anthropic.com → API Keys', url: 'https://console.anthropic.com/settings/keys',
+    steps: ['Đăng nhập console.anthropic.com (đăng ký bằng email nếu chưa có).', 'Vào Settings → Billing, nạp credit (thanh toán thẻ quốc tế).', 'Vào API Keys → Create Key, đặt tên “DrayPulse”, sao chép key (bắt đầu bằng sk-ant-).', 'Dán key vào ô bên dưới. Mô hình mặc định Claude Opus 5.5 đã được điền sẵn.'],
+    note: 'Key chỉ hiện một lần khi tạo. Có thể đặt giới hạn chi tiêu hằng tháng trong Settings → Limits.' },
+  { k: 'openai', name: 'ChatGPT (OpenAI)', kind: 'openai', base: 'https://api.openai.com/v1', key: 'platform.openai.com → API keys', url: 'https://platform.openai.com/api-keys',
+    steps: ['Đăng nhập platform.openai.com (trang dành cho lập trình viên, khác với chatgpt.com).', 'Vào Settings → Billing, nạp credit.', 'Vào API keys → Create new secret key, sao chép key (bắt đầu bằng sk-).', 'Dán key, bấm “Kiểm tra & lấy danh sách mô hình”, chọn mô hình GPT mới và mạnh nhất.'],
+    note: 'Gói ChatGPT Plus/Pro KHÔNG kèm API – API tính tiền riêng theo lượng dùng.' },
+  { k: 'gemini', name: 'Gemini (Google)', kind: 'openai', base: 'https://generativelanguage.googleapis.com/v1beta/openai', key: 'aistudio.google.com → Get API key', url: 'https://aistudio.google.com/apikey',
+    steps: ['Đăng nhập aistudio.google.com bằng tài khoản Google.', 'Bấm Get API key → Create API key (chọn hoặc tạo một Google Cloud project).', 'Sao chép key (thường bắt đầu bằng AIza).', 'Dán key, bấm “Kiểm tra & lấy danh sách mô hình”, chọn mô hình Gemini Pro mới nhất.'],
+    note: 'Có gói miễn phí (giới hạn tần suất). Theo điều khoản Gemini API, dữ liệu gửi qua gói miễn phí có thể được Google dùng để cải thiện sản phẩm – nên bật thanh toán (Billing) nếu gửi cấu hình mạng thật.' },
+  { k: 'deepseek', name: 'DeepSeek', kind: 'openai', base: 'https://api.deepseek.com/v1', key: 'platform.deepseek.com → API keys', url: 'https://platform.deepseek.com/api_keys',
+    steps: ['Đăng nhập platform.deepseek.com.', 'Vào Top up, nạp tiền.', 'Vào API keys → Create new API key, sao chép key (bắt đầu bằng sk-).', 'Dán key và lấy danh sách mô hình.'],
+    note: 'Giá rẻ. Máy chủ DeepSeek đặt tại Trung Quốc – cân nhắc trước khi gửi cấu hình mạng của doanh nghiệp.' },
+  { k: 'xai', name: 'Grok (xAI)', kind: 'openai', base: 'https://api.x.ai/v1', key: 'console.x.ai → API Keys', url: 'https://console.x.ai',
+    steps: ['Đăng nhập console.x.ai (bằng tài khoản X hoặc email).', 'Nạp credit trong mục Billing.', 'Vào API Keys → Create API Key, sao chép key (bắt đầu bằng xai-).', 'Dán key và lấy danh sách mô hình.'] },
+  { k: 'mistral', name: 'Mistral', kind: 'openai', base: 'https://api.mistral.ai/v1', key: 'console.mistral.ai → API Keys', url: 'https://console.mistral.ai/api-keys',
+    steps: ['Đăng nhập console.mistral.ai.', 'Chọn gói (có gói dùng thử) trong mục Billing/Subscriptions.', 'Vào API Keys → Create new key, sao chép key.', 'Dán key và lấy danh sách mô hình (chọn bản “large”).'] },
+  { k: 'groq', name: 'Groq', kind: 'openai', base: 'https://api.groq.com/openai/v1', key: 'console.groq.com → API Keys', url: 'https://console.groq.com/keys',
+    steps: ['Đăng nhập console.groq.com.', 'Vào API Keys → Create API Key, sao chép key (bắt đầu bằng gsk_).', 'Dán key và lấy danh sách mô hình (chọn mô hình lớn có hỗ trợ tool use).'],
+    note: 'Có gói miễn phí giới hạn tần suất; tốc độ trả lời rất nhanh.' },
+  { k: 'openrouter', name: 'OpenRouter (nhiều mô hình)', kind: 'openai', base: 'https://openrouter.ai/api/v1', key: 'openrouter.ai → Keys', url: 'https://openrouter.ai/keys',
+    steps: ['Đăng nhập openrouter.ai.', 'Vào Credits, nạp tiền.', 'Vào Keys → Create Key, sao chép key (bắt đầu bằng sk-or-).', 'Dán key, lấy danh sách và chọn mô hình theo dạng hãng/tên (ví dụ của Anthropic, OpenAI, Google…).'],
+    note: 'Một key dùng được mô hình của nhiều hãng; giá theo từng mô hình trên openrouter.ai/models.' },
+  { k: 'qwen', name: 'Qwen (Alibaba Cloud)', kind: 'openai', base: 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1', key: 'Alibaba Cloud Model Studio → API Key', url: 'https://www.alibabacloud.com/help/en/model-studio/get-api-key',
+    steps: ['Đăng nhập Alibaba Cloud (bản quốc tế), kích hoạt Model Studio.', 'Tạo API Key trong Model Studio, sao chép key (bắt đầu bằng sk-).', 'Dán key và lấy danh sách mô hình (chọn qwen-max hoặc bản mới hơn).'],
+    note: 'Địa chỉ API mặc định là máy chủ quốc tế (Singapore).' },
+  { k: 'ollama', name: 'Ollama (máy cục bộ)', kind: 'openai', base: 'http://localhost:11434/v1', key: 'không cần key', local: true, url: 'https://ollama.com/download',
+    steps: ['Cài Ollama trên máy chạy DrayPulse (hoặc một máy có GPU trong LAN).', 'Tải một mô hình hỗ trợ tools: chạy “ollama pull <tên-mô-hình>” (danh sách: ollama.com/search?c=tools).', 'Nếu Ollama ở máy khác: đặt biến môi trường OLLAMA_HOST=0.0.0.0, khởi động lại Ollama, và đổi “localhost” bên dưới thành IP máy đó.', 'Để trống API key, bấm “Kiểm tra & lấy danh sách mô hình”.'],
+    note: 'Miễn phí, dữ liệu không rời mạng nội bộ. Mô hình nhỏ phân tích kém hơn nhiều so với mô hình đám mây; nên dùng mô hình từ ~30B tham số trở lên.' },
+  { k: 'lmstudio', name: 'LM Studio (máy cục bộ)', kind: 'openai', base: 'http://localhost:1234/v1', key: 'không cần key', local: true, url: 'https://lmstudio.ai',
+    steps: ['Cài LM Studio, tải một mô hình có hỗ trợ tool use.', 'Vào tab Developer → Start Server (cổng 1234). Nếu ở máy khác, bật “Serve on Local Network” và đổi “localhost” thành IP máy đó.', 'Để trống API key, bấm “Kiểm tra & lấy danh sách mô hình”.'],
+    note: 'Miễn phí, dữ liệu không rời mạng nội bộ.' },
+  { k: 'custom', name: 'Khác (tương thích OpenAI)', kind: 'openai', base: '', key: 'theo nhà cung cấp',
+    steps: ['Dùng cho dịch vụ có API tương thích OpenAI Chat Completions và hỗ trợ tools (function calling).', 'Nhập địa chỉ API theo tài liệu nhà cung cấp (thường kết thúc bằng /v1).', 'Dán API key (nếu có) và lấy danh sách mô hình.'] },
+];
+
+function aiAccountForm(p, done) {
+  const isNew = !p.id;
+  const preset = h('select', null, AI_PRESETS.map(x => h('option', { value: x.k, selected: !isNew && (p.kind === 'anthropic' ? x.k === 'anthropic' : x.base === p.baseUrl) }, x.name)));
+  const name = h('input', { value: p.name || '', maxlength: 40, required: true });
+  const base = h('input', { value: p.baseUrl || '', class: 'mono', placeholder: 'https://…/v1' });
+  const key = h('input', { type: 'password', autocomplete: 'off', placeholder: p.hasKey ? '(đã lưu – để trống để giữ nguyên)' : 'API key' });
+  const removeKey = h('input', { type: 'checkbox' });
+  const models = h('datalist', { id: 'np-ai-models' });
+  const model = h('input', { value: p.model || '', class: 'mono', list: 'np-ai-models', placeholder: 'chọn sau khi bấm “Kiểm tra & lấy danh sách”' });
+  const priceIn = h('input', { type: 'number', min: 0, step: 'any', value: p.priceIn || '', placeholder: 'tuỳ chọn' });
+  const priceOut = h('input', { type: 'number', min: 0, step: 'any', value: p.priceOut || '', placeholder: 'tuỳ chọn' });
+  const enabled = h('input', { type: 'checkbox', checked: isNew ? true : p.enabled });
+  const keyHint = h('div', { class: 'full' });
+  const testOut = h('div', { class: 'full' });
+  const cur = () => AI_PRESETS.find(x => x.k === preset.value);
+  const sync = (fromPreset) => {
+    const x = cur();
+    base.closest('label').classList.toggle('hidden', x.kind === 'anthropic');
+    if (fromPreset) {
+      if (!name.value || AI_PRESETS.some(y => y.name === name.value)) name.value = x.name;
+      if (x.kind === 'openai' && x.base) base.value = x.base;
+      model.value = x.model || '';
+      fill(models);
+    }
+    fill(keyHint, h('div', { class: 'box keyguide' },
+      h('div', { class: 'row' }, h('b', { class: 'grow' }, x.local ? 'Cách cài đặt ' + x.name : 'Cách lấy API key ' + x.name),
+        x.url ? h('a', { class: 'btn sm', href: x.url, target: '_blank', rel: 'noopener noreferrer' }, x.local ? 'Trang tải về ↗' : 'Mở trang lấy key ↗') : null),
+      h('ol', null, (x.steps || []).map(t => h('li', null, t))),
+      x.note ? h('div', { class: 'hint' }, '⚠ ', x.note) : null,
+      h('div', { class: 'hint' }, helpLink('ai', 'Hướng dẫn đầy đủ'))));
+  };
+  preset.addEventListener('change', () => sync(true));
+  const collect = () => {
+    const x = cur();
+    const b = { id: p.id || '', name: name.value, kind: x.kind, baseUrl: base.value, model: model.value, priceIn: +priceIn.value || 0, priceOut: +priceOut.value || 0, enabled: enabled.checked };
+    if (removeKey.checked) b.key = ''; else if (key.value) b.key = key.value;
+    return b;
+  };
+  const actions = [{ t: 'Huỷ', fn: c => c() }, { t: isNew ? 'Thêm tài khoản' : 'Lưu', cls: 'primary', submit: true, fn: async close => {
+    try { await api('POST', '/api/admin/ai/providers', collect()); close(); toast('Đã lưu tài khoản AI', 'ok'); done(); } catch (e) { toast(e.message, 'bad'); }
+  } }];
+  if (!isNew) actions.unshift({ t: 'Xoá', cls: 'danger', fn: async close => {
+    if (!confirm(`Xoá tài khoản AI “${p.name}”?`)) return;
+    try { await api('DELETE', `/api/admin/ai/providers/${p.id}`); close(); done(); } catch (e) { toast(e.message, 'bad'); }
+  } });
+  modal(isNew ? 'Thêm tài khoản AI' : 'Sửa tài khoản AI: ' + p.name, h('div', { class: 'form' },
+    field('Nhà cung cấp', preset, 'full'), field('Tên hiển thị', name), field('Địa chỉ API (OpenAI-compatible)', base),
+    field('API key', key), p.hasKey ? h('div', null, check('Xoá key đã lưu', removeKey)) : null, keyHint,
+    h('div', { class: 'full row' }, h('button', { type: 'button', onclick: e => busy(e.target, async () => {
+      const res = await api('POST', '/api/admin/ai/models', collect());
+      fill(models, res.models.map(m => h('option', { value: m })));
+      if (!model.value && res.models.length) model.value = res.models[0];
+      fill(testOut, h('div', { class: 'box ok' }, `✓ Key hợp lệ · ${res.models.length} mô hình. Gõ hoặc chọn trong ô Mô hình.`,
+        h('div', { class: 'muted small' }, res.models.slice(0, 40).join(' · ') + (res.models.length > 40 ? ' …' : ''))));
+    }) }, 'Kiểm tra & lấy danh sách mô hình'), testOut),
+    field('Mô hình', model, 'full'), models,
+    field('Giá đầu vào (USD / 1 triệu token)', priceIn), field('Giá đầu ra (USD / 1 triệu token)', priceOut),
+    h('div', { class: 'full' }, check('Đang dùng', enabled)),
+    h('p', { class: 'hint full' }, 'Mô hình cần hỗ trợ gọi công cụ (tools / function calling). Nên chọn mô hình mạnh nhất của nhà cung cấp cho phân tích bảo mật. Giá chỉ dùng để ước tính chi phí; Claude có sẵn giá.')), actions);
+  sync(isNew); // after the form is in the modal (sync looks up the field labels)
+}
+
+// ---------- account ----------
+function accountPage() {
+  return {
+    mount(main) {
+      const old = h('input', { type: 'password', required: true, autocomplete: 'current-password' });
+      const p1 = h('input', { type: 'password', required: true, minlength: 10, autocomplete: 'new-password' });
+      const p2 = h('input', { type: 'password', required: true, autocomplete: 'new-password' });
+      const btn = h('button', { class: 'primary', type: 'submit' }, 'Đổi mật khẩu');
+      main.append(h('form', { class: 'panel', onsubmit: e => { e.preventDefault(); busy(btn, async () => {
+        if (p1.value !== p2.value) throw new Error('Hai mật khẩu mới không khớp');
+        await api('POST', '/api/me/password', { old: old.value, new: p1.value });
+        old.value = p1.value = p2.value = ''; toast('Đã đổi mật khẩu. Các thiết bị khác đã bị đăng xuất.', 'ok');
+      }); } }, h('div', { class: 'panel-h' }, h('h2', null, 'Tài khoản: ' + me.username)),
+        h('div', { class: 'panel-b form' }, field('Mật khẩu hiện tại', old), field('Mật khẩu mới (≥ 10 ký tự)', p1), field('Nhập lại mật khẩu mới', p2), h('div', { class: 'full' }, btn))));
+    },
+  };
+}
+
+boot();

@@ -1,0 +1,378 @@
+package app
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+func TestDraytekRuleChecks(t *testing.T) {
+	snap := &auditSnapshot{Sections: map[string]*auditSection{}}
+	set := func(path string, rows ...Row) { snap.Sections[path] = &auditSection{Rows: rows, Total: len(rows)} }
+	set("/system/resource", Row{"board-name": "Vigor2927", "version": "4.4.2.3", "build": "Jan 10 2023 14:04:32"})
+	set("/draytek/access", Row{"snmp-version": "2c", "snmp-community-default": "true", "cli": "telnet"})
+	set("/draytek/cli/mngt rmtcfg status", Row{"line": "%% Remote configure function has been enabled."})
+	set("/ppp/active", Row{"name": "kho (lan2lan)", "service": "PPTP"})
+	set("/draytek/wan", Row{"name": "WAN2", "label": "WAN2", "state": "Offline", "status": "down", "enabled": "true", "mode": "PPPoE"},
+		Row{"name": "WAN3", "label": "USB_WAN3", "state": "Offline", "status": "down", "enabled": "false", "mode": ""})
+	fs := ruleChecks(snap, perfStats{Hours: 24, CPU: statSummary{P95: 92, Max: 99, Avg: 60, N: 100}}, nil)
+	titles := ""
+	for _, f := range fs {
+		titles += f.Severity + ": " + f.Title + "\n"
+	}
+	for _, want := range []string{
+		"critical: Cho phép quản trị router từ Internet",
+		"high: SNMP dùng community mặc định",
+		"high: Firmware DrayOS đã cũ",
+		"medium: Đăng nhập router bằng Telnet",
+		"medium: Còn dùng VPN PPTP",
+		"medium: WAN WAN2 đang bật nhưng mất kết nối",
+		"medium: CPU cao kéo dài",
+	} {
+		if !strings.Contains(titles, want) {
+			t.Errorf("missing finding %q in:\n%s", want, titles)
+		}
+	}
+	if strings.Contains(titles, "USB_WAN3") {
+		t.Error("disabled WAN must not be reported")
+	}
+	if fs[0].Severity != "critical" {
+		t.Fatalf("findings must be sorted by severity: %+v", fs[0])
+	}
+	if sec, _ := scores(fs); sec >= 50 {
+		t.Fatalf("insecure router must score low, got %d", sec)
+	}
+	// a clean router: no security findings
+	clean := &auditSnapshot{Sections: map[string]*auditSection{
+		"/draytek/access":                 {Rows: []Row{{"snmp-version": "3", "snmp-v3-level": "authPriv", "cli": "ssh"}}},
+		"/draytek/cli/mngt rmtcfg status": {Rows: []Row{{"line": "Remote configure function: disabled"}}},
+		"/system/resource":                {Rows: []Row{{"build": time.Now().AddDate(0, -2, 0).Format("Jan 2 2006") + " 10:00:00"}}},
+	}}
+	if fs := ruleChecks(clean, perfStats{}, nil); len(fs) != 0 {
+		t.Fatalf("clean router findings: %+v", fs)
+	}
+}
+
+func TestRedactAndAnonymize(t *testing.T) {
+	r := redactRow(Row{"name": "backup", "password": "x", "source": `/tool fetch url="ftp://a" user=bk password=Secret123 dst-path=b.rsc`}, 600)
+	if _, ok := r["password"]; ok || strings.Contains(r["source"], "Secret123") || !strings.Contains(r["source"], "password=***") {
+		t.Fatalf("redaction failed: %v", r)
+	}
+	a := newAnonymizer()
+	in := "login failure from 45.141.80.17 and 45.141.80.17 to 192.168.88.1 mac DC:A6:32:00:10:00 dns 8.8.8.8 cgnat 100.64.1.2"
+	m := a.Mask(in)
+	if strings.Contains(m, "45.141.80.17") || strings.Contains(m, "DC:A6:32") || !strings.Contains(m, "PUBLIC-IP-1 and PUBLIC-IP-1") ||
+		!strings.Contains(m, "192.168.88.1") || !strings.Contains(m, "8.8.8.8") || !strings.Contains(m, "100.64.1.2") || !strings.Contains(m, "MAC-1") {
+		t.Fatalf("mask = %q", m)
+	}
+	v := newAnonymizer()
+	v.Keep("4.4.5.2")
+	if got := v.Mask("Vigor2927 4.4.5.2, Version: 4.3.2.5, fw 3.9.1.2 from 4.2.2.1 mac 08-00-27-5D-1A-09"); got != "Vigor2927 4.4.5.2, Version: 4.3.2.5, fw 3.9.1.2 from PUBLIC-IP-1 mac MAC-1" {
+		t.Fatalf("version masking = %q", got)
+	}
+	if a.Unmask(m) != in {
+		t.Fatalf("unmask = %q", a.Unmask(m))
+	}
+}
+
+// fakeClaude imitates the Messages API: first reads WAN status and VPNs, then submits.
+type fakeClaude struct {
+	mu     sync.Mutex
+	bodies []string
+	betas  []string
+	turn   int
+}
+
+func (f *fakeClaude) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	b, _ := io.ReadAll(r.Body)
+	f.mu.Lock()
+	f.bodies = append(f.bodies, string(b))
+	f.betas = append(f.betas, r.Header.Get("anthropic-beta"))
+	f.turn++
+	turn := f.turn
+	f.mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	var content string
+	stop := "tool_use"
+	switch turn {
+	case 1:
+		content = `[{"type":"text","text":"Tôi sẽ xem dịch vụ và log."},
+			{"type":"tool_use","id":"tu_1","name":"get_router_data","input":{"path":"/draytek/wan"}},
+			{"type":"tool_use","id":"tu_2","name":"get_router_data","input":{"path":"/ppp/active"}},
+			{"type":"tool_use","id":"tu_3","name":"get_history","input":{"kind":"events","hours":24,"interface":""}}]`
+	default:
+		// find the placeholder the agent was given for the attacker IP and echo it back
+		ph := "PUBLIC-IP-1"
+		content = `[{"type":"tool_use","id":"tu_9","name":"submit_report","input":{"security_score":35,"performance_score":88,
+			"summary":"Router bị dò mật khẩu từ ` + ph + `.",
+			"findings":[{"severity":"low","area":"performance","title":"Ít quan trọng","evidence":"x","fix":"y","commands":[]},
+			            {"severity":"critical","area":"security","title":"VPN lạ từ ` + ph + `","evidence":"phiên VPN","fix":"chặn","commands":[]}],
+			"report_markdown":"## Tổng quan\nNguồn tấn công ` + ph + `.\n"}}]`
+	}
+	io.WriteString(w, `{"id":"msg_`+string(rune('0'+turn))+`","type":"message","role":"assistant","model":"claude-opus-5-5","content":`+content+
+		`,"stop_reason":"`+stop+`","stop_sequence":null,"usage":{"input_tokens":1000,"output_tokens":200,"cache_read_input_tokens":500,"cache_creation_input_tokens":0}}`)
+}
+
+func TestAgentEndToEnd(t *testing.T) {
+	dir := t.TempDir()
+	st, _ := OpenStore(filepath.Join(dir, "db"))
+	defer st.Close()
+	box, _ := LoadBox(filepath.Join(dir, "key"))
+	settings, _ := NewSettingsStore(st, box)
+	key := "sk-ant-test-0123456789abcdefghij"
+	if err := settings.Update(SettingsInput{AIConsent: true, AIAnonymize: true, AIFallback: true,
+		SummaryAt: "08:00", RepeatMin: 30, Timezone: "Asia/Ho_Chi_Minh", RetentionDays: 30}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := settings.SaveProvider(AIProviderInput{Name: "Claude", Kind: "anthropic", Model: "claude-opus-5-5", Key: &key, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	h := NewHub(st, box, settings, true)
+	r := &Router{Name: "Demo", Mode: "demo", Enabled: true, Interval: 300, WANTarget: "8.8.8.8"}
+	st.SaveRouter(r)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() { cancel(); h.Wait() }()
+	if err := h.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	fc := &fakeClaude{}
+	srv := httptest.NewServer(fc)
+	defer srv.Close()
+	a := NewAuditor(h, st, settings, nil)
+	a.ctx, a.apiBase = ctx, srv.URL
+
+	id, err := a.Start(r.ID, "manual", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Start(r.ID, "manual", ""); err == nil {
+		t.Fatal("second concurrent audit must be refused")
+	}
+	waitFor(t, "audit finished", func() bool { return a.Running(r.ID) == nil })
+	rep, err := st.GetAudit(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Status != "done" || rep.Source != "ai" || rep.Error != "" {
+		t.Fatalf("report status=%s source=%s err=%s note=%s", rep.Status, rep.Source, rep.Error, rep.Note)
+	}
+	if rep.SecScore != 35 || rep.Findings[0].Severity != "critical" || !strings.Contains(rep.Findings[0].Title, "113.161.") {
+		t.Fatalf("findings not sorted/unmasked: %+v", rep.Findings)
+	}
+	if !strings.Contains(rep.Markdown, "113.161.") || !strings.Contains(rep.Summary, "113.161.") {
+		t.Fatalf("report not unmasked: %q / %q", rep.Markdown, rep.Summary)
+	}
+	if len(rep.Steps) < 3 || rep.Usage == nil || rep.Usage.Turns != 2 || rep.Usage.CostUSD <= 0 || len(rep.RuleFindings) == 0 {
+		t.Fatalf("steps=%v usage=%+v rules=%d", rep.Steps, rep.Usage, len(rep.RuleFindings))
+	}
+
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	if len(fc.bodies) != 2 {
+		t.Fatalf("calls = %d", len(fc.bodies))
+	}
+	for i, body := range fc.bodies {
+		if strings.Contains(body, "113.161.") || strings.Contains(body, "DC:A6:32") {
+			t.Fatalf("request %d leaked a public IP or MAC", i)
+		}
+		if !strings.Contains(fc.betas[i], "server-side-fallback-2026-07-01") {
+			t.Fatalf("missing fallback beta header: %q", fc.betas[i])
+		}
+	}
+	var req map[string]any
+	json.Unmarshal([]byte(fc.bodies[1]), &req)
+	if req["model"] != "claude-opus-5-5" || req["fallbacks"] != "default" {
+		t.Fatalf("model/fallbacks = %v / %v", req["model"], req["fallbacks"])
+	}
+	if oc, _ := req["output_config"].(map[string]any); oc["effort"] != "high" {
+		t.Fatalf("effort = %v", req["output_config"])
+	}
+	tools, _ := req["tools"].([]any)
+	if len(tools) != 4 || tools[0].(map[string]any)["strict"] != true {
+		t.Fatalf("tools = %v", tools)
+	}
+	if !strings.Contains(fc.bodies[1], `"tool_use_id":"tu_2"`) || !strings.Contains(fc.bodies[1], "PUBLIC-IP-1") {
+		t.Fatal("second request must carry the masked tool results")
+	}
+	_ = time.Second
+}
+
+func TestAuditWithoutAI(t *testing.T) {
+	dir := t.TempDir()
+	st, _ := OpenStore(filepath.Join(dir, "db"))
+	defer st.Close()
+	box, _ := LoadBox(filepath.Join(dir, "key"))
+	settings, _ := NewSettingsStore(st, box)
+	h := NewHub(st, box, settings, true)
+	r := &Router{Name: "Demo", Mode: "demo", Enabled: true, Interval: 300, WANTarget: "8.8.8.8"}
+	st.SaveRouter(r)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() { cancel(); h.Wait() }()
+	h.Start(ctx)
+	a := NewAuditor(h, st, settings, nil)
+	a.ctx = ctx
+	id, err := a.Start(r.ID, "manual", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "audit finished", func() bool { return a.Running(r.ID) == nil })
+	rep, _ := st.GetAudit(id)
+	if rep.Status != "done" || rep.Source != "rules" || !strings.Contains(rep.Note, "Chưa có tài khoản AI") || !strings.Contains(rep.Markdown, "## Bảo mật") {
+		t.Fatalf("rules-only report: %+v", rep)
+	}
+	list, _ := st.ListAudits(r.ID, 10)
+	if len(list) != 1 || list[0].Markdown != "" {
+		t.Fatalf("list = %+v", list)
+	}
+}
+
+// fakeOpenAI is an OpenAI-compatible Chat Completions server (as used by
+// OpenAI, Gemini, DeepSeek, Grok, Ollama...). It checks the history it gets back.
+type fakeOpenAI struct {
+	mu     sync.Mutex
+	bodies []string
+	auth   []string
+}
+
+func (f *fakeOpenAI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	b, _ := io.ReadAll(r.Body)
+	f.mu.Lock()
+	f.bodies = append(f.bodies, string(b))
+	f.auth = append(f.auth, r.Header.Get("Authorization"))
+	f.mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	if r.URL.Path == "/v1/models" {
+		io.WriteString(w, `{"data":[{"id":"models/gemini-x-flash"},{"id":"models/gemini-x-pro"}]}`)
+		return
+	}
+	var req struct {
+		Messages []map[string]any `json:"messages"`
+	}
+	json.Unmarshal(b, &req)
+	last := req.Messages[len(req.Messages)-1]
+	if last["role"] == "user" { // first turn: ask for two tools (one without id, like some local servers)
+		io.WriteString(w, `{"model":"gemini-x-pro","choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","content":null,"tool_calls":[
+			{"id":"c1","type":"function","function":{"name":"get_router_data","arguments":"{\"path\":\"/draytek/access\"}"}},
+			{"type":"function","function":{"name":"get_clients","arguments":{}}}]}}],"usage":{"prompt_tokens":900,"completion_tokens":60}}`)
+		return
+	}
+	io.WriteString(w, `{"model":"gemini-x-pro","choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","content":"","tool_calls":[
+		{"id":"c9","type":"function","function":{"name":"submit_report","arguments":"{\"security_score\":40,\"performance_score\":80,\"summary\":\"Tóm tắt từ Gemini\",\"findings\":[{\"severity\":\"high\",\"area\":\"security\",\"title\":\"Telnet bật\",\"evidence\":\"/ip service\",\"fix\":\"tắt\",\"commands\":[\"/ip service disable telnet\"]}],\"report_markdown\":\"## Tổng quan\\nOK\"}"}}]}}],
+		"usage":{"prompt_tokens":1500,"completion_tokens":300,"prompt_tokens_details":{"cached_tokens":500}}}`)
+}
+
+func TestOpenAICompatibleWithFallback(t *testing.T) {
+	dir := t.TempDir()
+	st, _ := OpenStore(filepath.Join(dir, "db"))
+	defer st.Close()
+	box, _ := LoadBox(filepath.Join(dir, "key"))
+	settings, _ := NewSettingsStore(st, box)
+	settings.Update(SettingsInput{AIConsent: true, AIAnonymize: true, AIFallback: true, SummaryAt: "08:00", RepeatMin: 30, Timezone: "Asia/Ho_Chi_Minh", RetentionDays: 30})
+
+	// first account: Claude with a key the (fake) API rejects
+	badClaude := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(401)
+		io.WriteString(w, `{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}`)
+	}))
+	defer badClaude.Close()
+	k1 := "sk-ant-bad-0123456789abcdefghij"
+	claude, err := settings.SaveProvider(AIProviderInput{Name: "Claude", Kind: "anthropic", Model: "claude-opus-5-5", Key: &k1, Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fo := &fakeOpenAI{}
+	srv := httptest.NewServer(fo)
+	defer srv.Close()
+	k2 := "AIza-test-key"
+	gem, err := settings.SaveProvider(AIProviderInput{Name: "Gemini", Kind: "openai", BaseURL: srv.URL + "/v1/", Model: "gemini-x-pro", Key: &k2, Enabled: true, PriceIn: 1, PriceOut: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gem.BaseURL != srv.URL+"/v1" || settings.Get().AIDefault != claude.ID {
+		t.Fatalf("base=%q default=%q", gem.BaseURL, settings.Get().AIDefault)
+	}
+	models, err := listModels(context.Background(), gem, k2, "")
+	if err != nil || strings.Join(models, ",") != "gemini-x-flash,gemini-x-pro" {
+		t.Fatalf("models = %v %v", models, err)
+	}
+
+	h := NewHub(st, box, settings, true)
+	r := &Router{Name: "Demo", Mode: "demo", Enabled: true, Interval: 300, WANTarget: "8.8.8.8"}
+	st.SaveRouter(r)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() { cancel(); h.Wait() }()
+	h.Start(ctx)
+	a := NewAuditor(h, st, settings, nil)
+	a.ctx, a.apiBase = ctx, badClaude.URL
+	id, err := a.Start(r.ID, "manual", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "audit finished", func() bool { return a.Running(r.ID) == nil })
+	rep, _ := st.GetAudit(id)
+	if rep.Status != "done" || rep.Source != "ai" || rep.Provider != "Gemini" || rep.Model != "gemini-x-pro" {
+		t.Fatalf("report: status=%s source=%s provider=%s model=%s err=%s", rep.Status, rep.Source, rep.Provider, rep.Model, rep.Error)
+	}
+	if len(rep.Attempts) != 1 || !strings.Contains(rep.Attempts[0], "Claude: API key không hợp lệ") {
+		t.Fatalf("attempts = %v", rep.Attempts)
+	}
+	if rep.SecScore != 40 || rep.Summary != "Tóm tắt từ Gemini" || rep.Findings[0].Commands[0] != "/ip service disable telnet" {
+		t.Fatalf("report content: %+v", rep)
+	}
+	if u := rep.Usage; u == nil || !u.CostKnown || u.InputTokens != 900+1000 || u.CacheRead != 500 || u.Turns != 2 {
+		t.Fatalf("usage = %+v", rep.Usage)
+	}
+	fo.mu.Lock()
+	defer fo.mu.Unlock()
+	if len(fo.bodies) != 3 || fo.auth[1] != "Bearer "+k2 { // /models + 2 chat turns
+		t.Fatalf("calls=%d auth=%v", len(fo.bodies), fo.auth)
+	}
+	var second struct {
+		Messages []map[string]any `json:"messages"`
+		Tools    []map[string]any `json:"tools"`
+	}
+	json.Unmarshal([]byte(fo.bodies[2]), &second)
+	roles := ""
+	for _, m := range second.Messages {
+		roles += m["role"].(string) + ","
+	}
+	if roles != "system,user,assistant,tool,tool," || second.Messages[4]["tool_call_id"] != "call_1" || len(second.Tools) != 4 {
+		t.Fatalf("history roles=%s msg=%v tools=%d", roles, second.Messages[4], len(second.Tools))
+	}
+	if _, strict := second.Tools[0]["function"].(map[string]any)["strict"]; strict {
+		t.Fatal("strict must only be sent to api.openai.com")
+	}
+	for _, b := range fo.bodies {
+		if strings.Contains(b, "113.161.") {
+			t.Fatal("public IP leaked to the AI provider")
+		}
+	}
+}
+
+func TestSettingsMigrationFromSingleKey(t *testing.T) {
+	dir := t.TempDir()
+	st, _ := OpenStore(filepath.Join(dir, "db"))
+	defer st.Close()
+	box, _ := LoadBox(filepath.Join(dir, "key"))
+	old := defaultSettings()
+	old.AIKey, old.AIModel = box.Seal("sk-ant-old-0123456789abcdefghij"), "claude-sonnet-5-5"
+	st.SetJSON("settings", old)
+	s, err := NewSettingsStore(st, box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ps := s.Providers()
+	if len(ps) != 1 || ps[0].Kind != "anthropic" || ps[0].Model != "claude-sonnet-5-5" || s.ProviderKey(ps[0].ID) != "sk-ant-old-0123456789abcdefghij" || s.Get().AIDefault != ps[0].ID {
+		t.Fatalf("migrated = %+v key=%q", ps, s.ProviderKey("claude"))
+	}
+	if ps[0].Key != "" {
+		t.Fatal("Providers() must not expose keys")
+	}
+}

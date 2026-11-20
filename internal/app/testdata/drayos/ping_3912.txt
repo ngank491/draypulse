@@ -1,0 +1,5 @@
+Pinging 192.0.2.10 with 64 bytes of Data:
+Receive reply from 192.0.2.10, time=0ms
+Receive reply from 192.0.2.10, time=2ms
+Receive reply from 192.0.2.10, time=1ms
+Packets: Sent = 5, Received = 3, Lost = 2 <40% loss>

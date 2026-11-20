@@ -1,0 +1,36 @@
+System Uptime:177:30:48
+LAN Status
+Primary DNS:203.162.4.191     Secondary DNS:8.8.8.8
+IP Address:192.168.1.1        Tx Rate:1514820311    Rx Rate:820114577
+
+WAN 1 Status: Connected
+Enable:Yes       Line:Ethernet    Name:VNPT
+Mode:DHCP Client Up Time:39:12:55    IP:198.51.100.20 GW IP:198.51.100.1
+TX Packets:71230118   TX Rate(bps):61210 RX Packets:140027783  RX Rate(bps):2311874
+
+WAN 2 Status: Connected
+Enable:Yes       Line:Ethernet    Name:Viettel
+Mode:PPPoE       Up Time:177:30:31   IP:203.0.113.77 GW IP:203.0.113.1
+TX Packets:150020112  TX Rate(bps):30119 RX Packets:171882001  RX Rate(bps):40212
+
+WAN 3 Status: Disconnected
+Enable:No        Line:Ethernet    Name:
+Mode:---         Up Time:00:00:00    IP:---            GW IP:---
+TX Packets:0          TX Rate(bps):0   RX Packets:0          RX Rate(bps):0
+
+WAN 4 Status: Disconnected
+Enable:No        Line:Ethernet    Name:
+
+--- MORE ---   ['q': Quit, 'Enter': New Lines, 'Space Bar': Next Page] ---
+Mode:---         Up Time:00:00:00    IP:---            GW IP:---
+TX Packets:0          TX Rate(bps):0   RX Packets:0          RX Rate(bps):0
+
+WAN 5 Status: Disconnected
+Enable:No        Line:USB         Name:
+Mode:---         Up Time:00:00:00    IP:---            GW IP:---
+TX Packets:0          TX Rate(bps):0   RX Packets:0          RX Rate(bps):0
+
+WAN 6 Status: Disconnected
+Enable:No        Line:USB         Name:
+Mode:---         Up Time:00:00:00    IP:---            GW IP:---
+TX Packets:0          TX Rate(bps):0   RX Packets:0          RX Rate(bps):0
