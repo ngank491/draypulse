@@ -95,6 +95,7 @@ type RState struct {
 	WANs      map[string]*WanState
 	IfLinks   map[string]*ProbeState // link state of every port (events)
 	WanIPs    map[string]string      // last public IP per WAN interface
+	PoolFull  map[string]bool        // DHCP pools currently reported as nearly full
 	Version   string                 // last firmware version seen
 	Uptime    float64                // last uptime seen (reboot detection)
 	Clients   map[string]*Client     // by MAC
@@ -111,6 +112,9 @@ type RState struct {
 
 	stop context.CancelFunc
 	done chan struct{}
+
+	src     Source     // the running reader (CLI session reused for blocking)
+	blockMu sync.Mutex // one block/unblock at a time per router
 }
 
 type persisted struct {
@@ -126,6 +130,7 @@ type persisted struct {
 	WANs      map[string]*WanState   `json:"wans"`
 	IfLinks   map[string]*ProbeState `json:"ifLinks"`
 	WanIPs    map[string]string      `json:"wanIps"`
+	PoolFull  map[string]bool        `json:"poolFull"`
 	Version   string                 `json:"version"`
 	Uptime    float64                `json:"uptime"`
 }
@@ -133,7 +138,7 @@ type persisted struct {
 func newRState(r Router, mons []Monitor) *RState {
 	return &RState{id: r.ID, cfg: r, monitors: mons, Conn: *newProbe(), Sections: map[string][]Row{}, SectionAt: map[string]int64{},
 		Probes: map[int64]*ProbeState{}, WANs: map[string]*WanState{},
-		IfLinks: map[string]*ProbeState{}, WanIPs: map[string]string{}, Clients: map[string]*Client{}, aliases: map[string]string{}}
+		IfLinks: map[string]*ProbeState{}, WanIPs: map[string]string{}, PoolFull: map[string]bool{}, Clients: map[string]*Client{}, aliases: map[string]string{}}
 }
 
 func (rs *RState) restore(b []byte) {
@@ -160,6 +165,9 @@ func (rs *RState) restore(b []byte) {
 	if p.WanIPs != nil {
 		rs.WanIPs = p.WanIPs
 	}
+	if p.PoolFull != nil {
+		rs.PoolFull = p.PoolFull
+	}
 	rs.Version, rs.Uptime = p.Version, p.Uptime
 	// Rates from before the restart are meaningless.
 	for i := range rs.Ifaces {
@@ -171,7 +179,7 @@ func (rs *RState) restore(b []byte) {
 // snapshotLocked must be called with rs.mu held.
 func (rs *RState) snapshotLocked() []byte {
 	b, _ := json.Marshal(persisted{rs.Conn, rs.LastSeen, rs.LastErr, rs.Identity, rs.Resource, rs.Ifaces, rs.Sections, rs.SectionAt, rs.Probes, rs.WANs,
-		rs.IfLinks, rs.WanIPs, rs.Version, rs.Uptime})
+		rs.IfLinks, rs.WanIPs, rs.PoolFull, rs.Version, rs.Uptime})
 	return b
 }
 
@@ -457,6 +465,9 @@ func (h *Hub) startLoop(rs *RState) {
 	ctx, cancel := context.WithCancel(h.ctx)
 	done := make(chan struct{})
 	rs.stop, rs.done = cancel, done
+	rs.mu.Lock()
+	rs.src = src
+	rs.mu.Unlock()
 	h.wg.Add(1)
 	go func() {
 		defer h.wg.Done()
@@ -473,6 +484,9 @@ func (h *Hub) stopLoop(rs *RState) {
 		rs.stop()
 		<-rs.done
 		rs.stop, rs.done = nil, nil
+		rs.mu.Lock()
+		rs.src = nil
+		rs.mu.Unlock()
 	}
 }
 
@@ -745,13 +759,19 @@ func (h *Hub) observeSection(rs *RState, name string, rows []Row, now int64) {
 	}
 	rows = cleanRows(rows, sec.Props)
 	rs.mu.Lock()
+	var eff effects
+	if name == "vlan" {
+		h.vlanEvents(rs, &eff, rs.Sections["vlan"], rows, now)
+	}
 	rs.Sections[name], rs.SectionAt[name] = rows, now
 	if name == "identity" && len(rows) > 0 {
 		rs.Identity = rows[0]["name"]
 	}
-	var eff effects
 	if name == "address" {
 		h.wanIPEvents(rs, &eff, now)
+	}
+	if name == "lease" || name == "lan" {
+		h.poolEvents(rs, &eff, now)
 	}
 	h.finish(rs, &eff, now)
 	cfg := rs.cfg
@@ -1070,6 +1090,9 @@ type RouterView struct {
 	Clients       []Client         `json:"clients"`
 	Ifaces        []Iface          `json:"ifaces"`
 	Monitors      []MonitorView    `json:"monitors"`
+	VLANs         []VlanView       `json:"vlans"`
+	Blocking      *BlockInfo       `json:"blocking,omitempty"`
+	LANs          []LanView        `json:"lans"`
 	Sections      map[string][]Row `json:"sections"`
 	SectionAt     map[string]int64 `json:"sectionAt"`
 	MapX          *float64         `json:"mapX"`
@@ -1097,8 +1120,10 @@ func (h *Hub) View(id int64) (RouterView, bool) {
 
 func (h *Hub) view(rs *RState, detail bool) RouterView {
 	var avail map[int64]float64
+	var blocks []Block
 	if detail {
 		avail, _ = h.st.Availability(rs.id, nowMs()-86400000)
+		blocks, _ = h.st.ListBlocks(rs.id)
 	}
 	loc := h.settings.Loc()
 	rs.mu.RLock()
@@ -1174,6 +1199,10 @@ func (h *Hub) view(rs *RState, detail bool) RouterView {
 	}
 	if detail {
 		v.Clients = rs.clientList()
+		v.VLANs, v.LANs = rs.vlanViews()
+		if bc := c.Opts.Block; bc.Enabled {
+			v.Blocking = &BlockInfo{Ready: bc.Ready, Set: bc.Set, Rule: bc.Rule, Group: bc.Group, Blocks: blocks}
+		}
 		v.Ifaces = append([]Iface{}, rs.Ifaces...)
 		v.Sections, v.SectionAt = map[string][]Row{}, map[string]int64{}
 		for k, rows := range rs.Sections {

@@ -52,6 +52,8 @@ var sections = []section{
 	{"ppp_active", "/ppp/active", vpnProps},
 	{"wan_list", "/interface/list/member?list=WAN", []string{"list", "interface", "disabled"}},
 	{"wan_status", "/draytek/wan", wanStatusProps},
+	{"vlan", "/draytek/vlan", vlanProps},
+	{"lan", "/draytek/lan", lanProps},
 	{"health", "/system/health", []string{"name", "value", "type"}},
 	{"identity", "/system/identity", []string{"name"}},
 }

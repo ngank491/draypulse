@@ -40,14 +40,28 @@ const (
 
 // DrayOpts holds the DrayTek-specific connection settings of a router.
 type DrayOpts struct {
-	SNMPVersion string `json:"snmpVersion"` // "2c" | "1" | "3" | "off"
-	SNMPPort    int    `json:"snmpPort"`
-	SNMPUser    string `json:"snmpUser,omitempty"`
-	AuthProto   string `json:"authProto,omitempty"`
-	PrivProto   string `json:"privProto,omitempty"`
-	CLI         string `json:"cli"` // "" (off) | "telnet" | "ssh"
-	CLIPort     int    `json:"cliPort"`
-	PingFrom    string `json:"pingFrom"` // "local" (DrayPulse host, default) | "router"
+	SNMPVersion string   `json:"snmpVersion"` // "2c" | "1" | "3" | "off"
+	SNMPPort    int      `json:"snmpPort"`
+	SNMPUser    string   `json:"snmpUser,omitempty"`
+	AuthProto   string   `json:"authProto,omitempty"`
+	PrivProto   string   `json:"privProto,omitempty"`
+	CLI         string   `json:"cli"` // "" (off) | "telnet" | "ssh"
+	CLIPort     int      `json:"cliPort"`
+	PingFrom    string   `json:"pingFrom"` // "local" (DrayPulse host, default) | "router"
+	Block       BlockCfg `json:"block"`
+}
+
+// BlockCfg reserves router resources for MAC blocking: a firewall rule the
+// admin built once in the web UI (source = IP group, action = Block), the IP
+// group, and a range of IP object indexes DrayPulse may use.
+type BlockCfg struct {
+	Enabled bool `json:"enabled"`
+	Set     int  `json:"set"`     // filter set 1-12
+	Rule    int  `json:"rule"`    // rule 1-7
+	Group   int  `json:"group"`   // IP group 1-32
+	ObjFrom int  `json:"objFrom"` // IP object range, 1-192
+	ObjTo   int  `json:"objTo"`
+	Ready   bool `json:"ready"` // set by the readiness check, cleared when the slots change
 }
 
 // SNMPSecrets are stored encrypted, separately from the options.
@@ -115,7 +129,7 @@ func (d *draytekSource) Close() {
 var errNeedCLI = errors.New("cần bật Telnet/SSH để đọc mục này")
 
 // slow-cycle CLI commands, read together in one session and cached briefly
-var drayCLICmds = []string{"sys version", "wan status", "ip arp status", "srv dhcp status"}
+var drayCLICmds = []string{"sys version", "wan status", "ip arp status", "srv dhcp status", "vlan status", "show lan"}
 
 func (d *draytekSource) cliData(ctx context.Context) (map[string]string, error) {
 	if d.cli == nil {
@@ -191,6 +205,18 @@ func (d *draytekSource) Fetch(ctx context.Context, path string, _ []string) ([]R
 			return nil, errNotSupported
 		}
 		return rows, nil
+	case "/draytek/vlan":
+		out, err := d.cliData(ctx)
+		if err != nil {
+			return nil, errNotSupported
+		}
+		return parseVlanStatus(out["vlan status"]), nil
+	case "/draytek/lan":
+		out, err := d.cliData(ctx)
+		if err != nil {
+			return nil, errNotSupported
+		}
+		return parseShowLan(out["show lan"]), nil
 	case "/system/health":
 		return d.health(ctx)
 	case "/draytek/access":
@@ -622,6 +648,12 @@ func validDrayOpts(o *DrayOpts) error {
 	}
 	if o.SNMPVersion == "off" && o.CLI == "" {
 		return errors.New("cần bật ít nhất SNMP hoặc Telnet/SSH")
+	}
+	if err := validBlockCfg(&o.Block); err != nil {
+		return err
+	}
+	if o.Block.Enabled && o.CLI == "" {
+		return errors.New("chặn client theo MAC cần bật Telnet/SSH")
 	}
 	if o.SNMPPort < 0 || o.SNMPPort > 65535 || o.CLIPort < 0 || o.CLIPort > 65535 {
 		return errors.New("cổng không hợp lệ")

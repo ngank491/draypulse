@@ -138,6 +138,20 @@ ALTER TABLE routers ADD COLUMN opts TEXT NOT NULL DEFAULT '{}';
 ALTER TABLE routers ADD COLUMN snmp_secret TEXT NOT NULL DEFAULT '';
 `
 
+// schemaV5: clients blocked by MAC through the router firewall.
+const schemaV5 = `
+CREATE TABLE blocks(
+  router_id INTEGER NOT NULL REFERENCES routers(id) ON DELETE CASCADE,
+  mac TEXT NOT NULL,
+  obj INTEGER NOT NULL,
+  ip TEXT NOT NULL DEFAULT '',
+  name TEXT NOT NULL DEFAULT '',
+  note TEXT NOT NULL DEFAULT '',
+  by_user TEXT NOT NULL DEFAULT '',
+  at INTEGER NOT NULL,
+  PRIMARY KEY(router_id, mac)) WITHOUT ROWID;
+`
+
 type Store struct{ db *sql.DB }
 
 func OpenStore(path string) (*Store, error) {
@@ -168,7 +182,7 @@ func (s *Store) migrate() error {
 	if err := s.db.QueryRow("PRAGMA user_version").Scan(&v); err != nil {
 		return err
 	}
-	migrations := []string{schemaV1, schemaV2, schemaV3, schemaV4}
+	migrations := []string{schemaV1, schemaV2, schemaV3, schemaV4, schemaV5}
 	if v > len(migrations) {
 		return fmt.Errorf("database được tạo bởi phiên bản mới hơn (schema %d)", v)
 	}
@@ -1034,4 +1048,44 @@ func (s *Store) FailStaleAudits() error {
 		}
 	}
 	return nil
+}
+
+// ---------- MAC blocks ----------
+
+type Block struct {
+	MAC    string `json:"mac"`
+	Obj    int    `json:"obj"` // router IP object index holding the MAC
+	IP     string `json:"ip"`
+	Name   string `json:"name"`
+	Note   string `json:"note"`
+	ByUser string `json:"byUser"`
+	At     int64  `json:"at"`
+}
+
+func (s *Store) ListBlocks(routerID int64) ([]Block, error) {
+	rows, err := s.db.Query("SELECT mac,obj,ip,name,note,by_user,at FROM blocks WHERE router_id=? ORDER BY at", routerID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Block{}
+	for rows.Next() {
+		var b Block
+		if err := rows.Scan(&b.MAC, &b.Obj, &b.IP, &b.Name, &b.Note, &b.ByUser, &b.At); err != nil {
+			return nil, err
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) AddBlock(routerID int64, b Block) error {
+	_, err := s.db.Exec("INSERT INTO blocks(router_id,mac,obj,ip,name,note,by_user,at) VALUES(?,?,?,?,?,?,?,?)",
+		routerID, b.MAC, b.Obj, b.IP, b.Name, b.Note, b.ByUser, b.At)
+	return err
+}
+
+func (s *Store) DeleteBlock(routerID int64, mac string) error {
+	_, err := s.db.Exec("DELETE FROM blocks WHERE router_id=? AND mac=?", routerID, mac)
+	return err
 }

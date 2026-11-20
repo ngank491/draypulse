@@ -344,3 +344,41 @@ func TestSyslogParseAndEvents(t *testing.T) {
 		t.Fatalf("repeated syslog lines must give one event: %+v", evs)
 	}
 }
+
+func TestParseVlanAndLan(t *testing.T) {
+	v := parseVlanStatus(fixture(t, "vlan_status.txt"))
+	if len(v) != 5 {
+		t.Fatalf("%+v", v)
+	}
+	if v[0]["vid"] != "10" || v[0]["enabled"] != "true" || v[0]["ports"] != "p1,p2,p3" || v[0]["subnet"] != "LAN1" || v[0]["vlan-on"] != "true" {
+		t.Fatalf("vlan0 %+v", v[0])
+	}
+	if v[1]["ports"] != "p4,s2" || v[1]["pri"] != "2" || v[1]["subnet"] != "LAN2" {
+		t.Fatalf("vlan1 %+v", v[1])
+	}
+	if v[2]["ports"] != "p5,p6" || v[3]["enabled"] != "false" || v[3]["ports"] != "" {
+		t.Fatalf("vlan2/3 %+v %+v", v[2], v[3])
+	}
+	l := parseShowLan(fixture(t, "show_lan.txt"))
+	if len(l) != 5 || l[0]["network"] != "192.168.1.0/24" || l[0]["pool-size"] != "200" || l[0]["dhcp"] != "true" {
+		t.Fatalf("%+v", l)
+	}
+	if l[2]["dhcp"] != "false" || l[3]["enabled"] != "false" || l[4]["name"] != "Route" {
+		t.Fatalf("%+v %+v", l[2], l[3])
+	}
+}
+
+func TestParseFirewallReadbacks(t *testing.T) {
+	o := parseIPObject(fixture(t, "ipobj_mac.txt"))
+	if o["name"] != "DP-0A1B2C" || o["type"] != "mac" || o["mac"] != "F0:2F:74:0A:1B:2C" {
+		t.Fatalf("%+v", o)
+	}
+	n, mem := parseIPGroup(fixture(t, "ipgrp.txt"))
+	if n != "DrayPulse" || len(mem) != 2 || mem[0] != 181 || mem[1] != 183 {
+		t.Fatal(n, mem)
+	}
+	r := parseFilterRule(fixture(t, "ipf_rule.txt"))
+	if r["status"] != "enable" || r["action"] != "Block Immediately" || r["source"] != "Group DrayPulse" || r["comment"] != "<null>" || !strings.Contains(r["direction"], "-> WAN") {
+		t.Fatalf("%+v", r)
+	}
+}

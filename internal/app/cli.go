@@ -33,7 +33,7 @@ type CLIConfig struct {
 var cliAllowed = map[string]bool{
 	"sys version": true, "sys iface": true, "show status": true, "show lan": true, "show statistic": true,
 	"wan status": true, "ip arp status": true, "ip dhcpc status": true, "ip route status": true,
-	"srv dhcp status": true, "mngt rmtcfg status": true, "sys syslog status": true,
+	"srv dhcp status": true, "mngt rmtcfg status": true, "sys syslog status": true, "vlan status": true,
 }
 
 var reCLIPing = regexp.MustCompile(`^ip ping \d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3} (AUTO|WAN\d{1,2})$`)
@@ -41,6 +41,34 @@ var reCLIPing = regexp.MustCompile(`^ip ping \d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3} 
 func cliCommandAllowed(cmd string) bool {
 	cmd = strings.TrimSpace(cmd)
 	return cliAllowed[cmd] || reCLIPing.MatchString(cmd)
+}
+
+// cliWriteAllowed are the only configuration changes DrayPulse can make, used
+// by MAC blocking: its own IP objects ("DP-…"), its own IP group ("DrayPulse")
+// and switching one pre-built firewall rule on/off. Read-backs (-v) included.
+var cliWriteAllowed = []*regexp.Regexp{
+	regexp.MustCompile(`^object ip obj \d{1,3} -v$`),
+	regexp.MustCompile(`^object ip obj \d{1,3} -n DP-[0-9A-Za-z]{1,11}$`),
+	regexp.MustCompile(`^object ip obj \d{1,3} -i 1$`),
+	regexp.MustCompile(`^object ip obj \d{1,3} -a 4 [0-9a-f]{2}(:[0-9a-f]{2}){5}$`),
+	regexp.MustCompile(`^object ip grp \d{1,2} -v$`),
+	regexp.MustCompile(`^object ip grp \d{1,2} -n DrayPulse$`),
+	regexp.MustCompile(`^object ip grp \d{1,2} -i 1$`),
+	regexp.MustCompile(`^object ip grp \d{1,2} -a( \d{1,3}){1,12}$`),
+	regexp.MustCompile(`^ipf rule \d{1,2} \d{1,2} -v$`),
+	regexp.MustCompile(`^ipf rule \d{1,2} \d{1,2} -e [01]$`),
+}
+
+func cliWriteCommandAllowed(cmd string) bool {
+	if cliCommandAllowed(cmd) {
+		return true
+	}
+	for _, re := range cliWriteAllowed {
+		if re.MatchString(cmd) {
+			return true
+		}
+	}
+	return false
 }
 
 var moreRe = regexp.MustCompile(`(?i)-+\s*more\s*-+.*$|--More--\s*$|press any key.*$`)
@@ -371,6 +399,20 @@ func (c *cliClient) Run(ctx context.Context, cmds ...string) (map[string]string,
 			return nil, fmt.Errorf("lệnh CLI không nằm trong danh sách chỉ-đọc: %q", cmd)
 		}
 	}
+	return c.run(ctx, cmds)
+}
+
+// RunWrite also allows the fixed configuration commands of MAC blocking.
+func (c *cliClient) RunWrite(ctx context.Context, cmds ...string) (map[string]string, error) {
+	for _, cmd := range cmds {
+		if !cliWriteCommandAllowed(cmd) {
+			return nil, fmt.Errorf("lệnh CLI không được phép: %q", cmd)
+		}
+	}
+	return c.run(ctx, cmds)
+}
+
+func (c *cliClient) run(ctx context.Context, cmds []string) (map[string]string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.cc != nil && time.Since(c.cc.lastUse) > cliIdle {

@@ -95,6 +95,7 @@ type Client struct {
 	Host        string `json:"host"`
 	Iface       string `json:"iface"`
 	Port        string `json:"port"`
+	VLAN        string `json:"vlan,omitempty"` // ARP "VLAN" column, e.g. VLAN0
 	DHCP        string `json:"dhcp"`
 	ARP         string `json:"arp"`
 	Online      bool   `json:"online"`
@@ -160,8 +161,8 @@ func (h *Hub) updateClients(rs *RState, now int64) {
 	rs.mu.Lock()
 	sec := rs.Sections
 	type obs struct {
-		ip, host, comment, dhcp, arp, iface, port string
-		strong, failed                            bool
+		ip, host, comment, dhcp, arp, iface, port, vlan string
+		strong, failed                                  bool
 	}
 	seen := map[string]*obs{}
 	get := func(mac string) *obs {
@@ -189,7 +190,7 @@ func (h *Hub) updateClients(rs *RState, now int64) {
 		if a["address"] != "" {
 			o.ip = a["address"] // ARP is the live IP↔MAC mapping
 		}
-		o.arp, o.iface = a["status"], a["interface"]
+		o.arp, o.iface, o.vlan = a["status"], a["interface"], a["vlan"]
 		if o.host == "" {
 			o.host = a["host"] // DrayOS ARP table carries the DHCP HOST ID
 		}
@@ -236,10 +237,13 @@ func (h *Hub) updateClients(rs *RState, now int64) {
 			if c.IP != o.ip {
 				c.IP, c.Resolved, c.ResolvedSrc, c.ResolvedAt, c.dirty = o.ip, "", "", 0, true
 			}
-			if c.Host != o.host || c.DHCP != o.dhcp || c.Port != o.port || c.Iface != o.iface {
+			if c.Host != o.host || c.DHCP != o.dhcp || c.Port != o.port || c.Iface != o.iface || (o.vlan != "" && c.VLAN != o.vlan) {
 				c.dirty = true
 			}
 			c.Host, c.DHCP, c.ARP, c.Iface, c.Port = o.host, o.dhcp, o.arp, o.iface, o.port
+			if o.vlan != "" {
+				c.VLAN = o.vlan
+			}
 		} else {
 			c.ARP, c.Port = "", ""
 		}

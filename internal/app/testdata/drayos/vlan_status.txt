@@ -1,0 +1,12 @@
+VLAN is Enable :
+--------------------------------------------------------------------------------
+VLAN Enable VID Pri  p1 p2 p3 p4 p5 p6 s1 s2 s3 s4 subnet
+--------------------------------------------------------------------------------
+  0    ON    10   0  V  V  V                       1:LAN1
+  1    ON    20   2           V           V        2:LAN2
+  2    ON    30   0              V  V              3:LAN3
+  3    OFF    0   0                                1:LAN1
+  4    OFF    0   0                                1:LAN1
+--------------------------------------------------------------------------------
+ Note: they are only untag for s1/s2/s3/s4, but they can join tag vlan with lan ports.
+ Permit untagged device in P1 to access router: ON....

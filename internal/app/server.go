@@ -79,6 +79,10 @@ func (s *Server) Handler() http.Handler {
 	admin("POST /api/admin/routers", s.saveRouter)
 	admin("PUT /api/admin/routers/{id}", s.saveRouter)
 	admin("DELETE /api/admin/routers/{id}", s.deleteRouter)
+	user("GET /api/routers/{id}/blocks", s.listBlocks)
+	admin("POST /api/admin/routers/{id}/blocks/check", s.checkBlocks)
+	admin("POST /api/admin/routers/{id}/blocks", s.blockClient)
+	admin("DELETE /api/admin/routers/{id}/blocks/{mac}", s.unblockClient)
 	admin("POST /api/admin/routers/test", s.testRouter)
 	admin("POST /api/admin/routers/{id}/monitors", s.saveMonitor)
 	admin("PUT /api/admin/monitors/{mid}", s.saveMonitor)
@@ -691,6 +695,8 @@ func (s *Server) applyRouter(r *Router, in routerInput) error {
 	r.Interval, r.WANs, r.WANTarget, r.ChatID, r.Enabled = in.Interval, in.WANs, in.WANTarget, in.ChatID, in.Enabled
 	r.ZaloChat = in.ZaloChat
 	if in.Mode == "pull" {
+		// readiness of MAC blocking survives a save only if its slots are unchanged
+		in.Opts.Block.Ready = r.Opts.Block.Ready && sameBlockSlots(r.Opts.Block, in.Opts.Block)
 		r.Opts = in.Opts
 	}
 	if r.WANs == nil {
@@ -1294,4 +1300,67 @@ func (s *Server) backup(w http.ResponseWriter, r *http.Request, u *User) {
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", `attachment; filename="draypulse-`+time.Now().Format("20060102-1504")+`.db"`)
 	io.Copy(w, f)
+}
+
+// ---------- MAC blocking ----------
+
+func (s *Server) listBlocks(w http.ResponseWriter, r *http.Request, u *User) {
+	id := pathID(r, "id")
+	if !u.CanSee(id) {
+		errJSON(w, 404, "không tìm thấy")
+		return
+	}
+	live := r.URL.Query().Get("live") == "1" && u.Role == "admin"
+	st, err := s.hub.BlockState(r.Context(), id, live)
+	if err != nil {
+		errJSON(w, 502, err.Error())
+		return
+	}
+	writeJSON(w, 200, st)
+}
+
+func (s *Server) checkBlocks(w http.ResponseWriter, r *http.Request, u *User) {
+	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
+	defer cancel()
+	res, err := s.hub.CheckBlocking(ctx, pathID(r, "id"))
+	if err != nil {
+		errJSON(w, 502, err.Error())
+		return
+	}
+	writeJSON(w, 200, res)
+}
+
+func (s *Server) blockClient(w http.ResponseWriter, r *http.Request, u *User) {
+	var in struct {
+		MAC  string `json:"mac"`
+		IP   string `json:"ip"`
+		Name string `json:"name"`
+		Note string `json:"note"`
+	}
+	if !readJSON(w, r, &in) {
+		return
+	}
+	in.Name, in.Note = truncateUTF8(strings.TrimSpace(in.Name), 64), truncateUTF8(strings.TrimSpace(in.Note), 200)
+	if in.IP != "" && net.ParseIP(in.IP) == nil {
+		errJSON(w, 400, "IP không hợp lệ")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
+	defer cancel()
+	b, err := s.hub.BlockClient(ctx, pathID(r, "id"), in.MAC, in.IP, in.Name, in.Note, u.Username)
+	if err != nil {
+		errJSON(w, 502, err.Error())
+		return
+	}
+	writeJSON(w, 200, b)
+}
+
+func (s *Server) unblockClient(w http.ResponseWriter, r *http.Request, u *User) {
+	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
+	defer cancel()
+	if err := s.hub.UnblockClient(ctx, pathID(r, "id"), r.PathValue("mac"), u.Username); err != nil {
+		errJSON(w, 502, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]bool{"ok": true})
 }

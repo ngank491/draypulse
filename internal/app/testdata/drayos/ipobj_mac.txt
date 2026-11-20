@@ -1,0 +1,8 @@
+ IP Object Profile 181
+ Name   :[DP-0A1B2C]
+ Interface:[Lan]
+ Address type:[mac]
+ Start ip address:[0.0.0.0]
+ End/Mask ip address:[0.0.0.0]
+ MAC Address:[f0:2f:74:0a:1b:2c]
+ Invert Selection:[0]

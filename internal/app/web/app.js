@@ -363,12 +363,12 @@ function eventsPage() {
 }
 
 // ---------- router page ----------
-const TABS = [['overview', 'Tổng quan'], ['wan', 'WAN'], ['devices', 'Thiết bị'], ['map', 'Sơ đồ'], ['ports', 'Cổng'], ['clients', 'Client'], ['ppp', 'VPN'], ['ip', 'IP & định tuyến'], ['syslog', 'Syslog'], ['audit', 'Kiểm tra AI'], ['events', 'Sự kiện']];
+const TABS = [['overview', 'Tổng quan'], ['wan', 'WAN'], ['devices', 'Thiết bị'], ['map', 'Sơ đồ'], ['ports', 'Cổng'], ['clients', 'Client'], ['vlan', 'VLAN'], ['ppp', 'VPN'], ['ip', 'IP & định tuyến'], ['syslog', 'Syslog'], ['audit', 'Kiểm tra AI'], ['events', 'Sự kiện']];
 
 function routerPage(id, tab) {
   if (!TABS.some(t => t[0] === tab)) tab = 'overview';
   let head, tabsEl, body, view;
-  const t = ({ overview: tabOverview, wan: tabWan, devices: tabDevices, map: tabMap, ports: tabPorts, clients: tabClients, ppp: tabPpp, ip: tabIp, syslog: tabSyslog, audit: tabAudit, events: tabEvents })[tab](id);
+  const t = ({ overview: tabOverview, wan: tabWan, devices: tabDevices, map: tabMap, ports: tabPorts, clients: tabClients, vlan: tabVlan, ppp: tabPpp, ip: tabIp, syslog: tabSyslog, audit: tabAudit, events: tabEvents })[tab](id);
   return {
     every: 5000,
     mount(main) {
@@ -391,7 +391,8 @@ function routerPage(id, tab) {
         me.role === 'admin' ? h('a', { class: 'btn', href: `#/admin/routers?edit=${id}` }, 'Cấu hình') : null),
         view.lastErr && view.status !== 'up' ? h('div', { class: 'err-line' }, view.lastErr) : null);
       const down = view.monitorsDown, wanDown = view.wans.filter(w => w.configured && (w.inet.status === 'down' || w.link.status === 'down')).length;
-      const counts = { devices: [view.monitorsTotal, down], wan: [view.wans.length, wanDown], clients: [view.clientsTotal, 0], ppp: [(view.sections.ppp_active || []).length, 0] };
+      const counts = { devices: [view.monitorsTotal, down], wan: [view.wans.length, wanDown], clients: [view.clientsTotal, 0], ppp: [(view.sections.ppp_active || []).length, 0],
+        vlan: [(view.vlans || []).filter(x => x.enabled).length, 0] };
       fill(tabsEl, TABS.map(([k, label]) => h('a', { href: `#/r/${id}/${k}`, class: k === tab ? 'on' : null }, label,
         k === 'clients' && view.clientsTotal ? h('span', { class: 'n', title: 'đang hoạt động / tổng' }, view.clientsOnline + '/' + view.clientsTotal) :
         counts[k] && counts[k][0] ? h('span', { class: 'n ' + (counts[k][1] ? 'bad' : '') }, counts[k][1] ? counts[k][1] + '/' + counts[k][0] : counts[k][0]) : null)));
@@ -731,39 +732,126 @@ function clientNameForm(routerId, c) {
     } }]);
 }
 
+function blockForm(routerId, c) {
+  const note = h('input', { maxlength: 200, placeholder: 'Lý do (tuỳ chọn)' });
+  modal('Chặn client ' + (c.name || c.ip || c.mac), h('div', { class: 'stack' },
+    h('p', null, 'DrayPulse sẽ ghi MAC ', h('b', { class: 'mono' }, c.mac), ' vào IP object riêng, thêm vào IP group “DrayPulse” và bật rule chặn trên router. Thiết bị sẽ không ra được Internet (phiên đang mở có thể còn chạy tới khi hết hạn).'),
+    h('p', { class: 'hint' }, 'Thiết bị đổi MAC (ví dụ điện thoại bật “địa chỉ Wi-Fi riêng tư”) có thể lách được. Kiểm tra lại bằng cách truy cập Internet từ thiết bị đó.'),
+    field('Ghi chú', note)),
+    [{ t: 'Huỷ', fn: x => x() }, { t: 'Chặn', cls: 'danger', submit: true, fn: async close => {
+      try {
+        await api('POST', `/api/admin/routers/${routerId}/blocks`, { mac: c.mac, ip: c.ip || '', name: c.name || '', note: note.value });
+        close(); toast('Đã chặn ' + (c.name || c.mac), 'ok'); refresh();
+      } catch (e) { toast(e.message, 'bad'); }
+    } }]);
+}
+
+async function unblock(routerId, b, btn) {
+  if (!confirm(`Bỏ chặn ${b.name || b.ip || b.mac}?`)) return;
+  await busy(btn, async () => { await api('DELETE', `/api/admin/routers/${routerId}/blocks/${encodeURIComponent(b.mac)}`); toast('Đã bỏ chặn', 'ok'); refresh(); });
+}
+
 function tabClients(id) {
-  let p, view, filter = ui.clientFilter || 'all';
+  let p, bp, bnote, view, filter = ui.clientFilter || 'all';
   const seg = h('div', { class: 'seg' });
-  const filters = [['all', 'Tất cả'], ['online', 'Đang hoạt động'], ['offline', 'Ngừng'], ['noname', 'Chưa có tên']];
+  const filters = [['all', 'Tất cả'], ['online', 'Đang hoạt động'], ['offline', 'Ngừng'], ['noname', 'Chưa có tên'], ['blocked', 'Bị chặn']];
   const drawSeg = () => fill(seg, filters.map(([k, t]) => h('button', { type: 'button', class: filter === k ? 'on' : null, onclick: () => { filter = ui.clientFilter = k; drawSeg(); render(); } }, t)));
   const render = () => {
     if (!view) return;
     const watched = new Set(view.monitors.map(m => m.ip));
-    const rows = view.clients.filter(c => filter === 'online' ? c.online : filter === 'offline' ? !c.online : filter === 'noname' ? !c.name : true);
+    const bl = view.blocking, blocked = new Map(((bl && bl.blocks) || []).map(b => [b.mac, b]));
+    const rows = view.clients.filter(c => filter === 'online' ? c.online : filter === 'offline' ? !c.online : filter === 'noname' ? !c.name : filter === 'blocked' ? blocked.has(c.mac) : true);
     const cols = [
-      { t: 'Trạng thái', v: c => c.online ? 1 : 0, r: c => c.online ? badge('up', 'Hoạt động') : badge(c.since ? 'down' : 'unknown', c.since ? 'Ngừng' : 'Chưa rõ') },
+      { t: 'Trạng thái', v: c => (blocked.has(c.mac) ? 2 : 0) + (c.online ? 1 : 0), r: c => h('div', { class: 'row' }, c.online ? badge('up', 'Hoạt động') : badge(c.since ? 'down' : 'unknown', c.since ? 'Ngừng' : 'Chưa rõ'), blocked.has(c.mac) ? badge('down', '⛔ Bị chặn') : null) },
       { t: 'Tên máy', v: c => (c.name || '~' + (c.vendor || '')) + ' ' + c.mac + ' ' + (c.host || ''), r: clientName },
       { t: 'IP', v: c => ipKey(c.ip), r: c => h('span', { class: 'mono' }, c.ip) },
       { t: 'MAC', v: c => c.mac, r: c => h('div', null, h('span', { class: 'mono small' }, c.mac), c.randomMac ? h('div', { class: 'muted small' }, 'ngẫu nhiên') : null) },
       { t: 'Thời gian hoạt động / dừng', v: c => (c.online ? 1e15 : 0) + (c.online ? -c.since : c.since), r: clientTime },
       { t: 'Cổng', v: c => c.port || c.iface, r: c => c.port ? h('span', null, c.port, c.iface && c.iface !== c.port ? h('div', { class: 'muted small' }, c.iface) : null) : c.iface || '–' },
+      { t: 'VLAN', v: c => c.vlan || '', r: c => c.vlan ? h('span', { class: 'chip' }, c.vlan.replace(/^VLAN/i, 'VLAN ')) : '–' },
       { t: 'DHCP', v: c => c.dhcp, r: c => c.dhcp ? badge(c.dhcp === 'bound' ? 'up' : 'unknown', c.dhcp) : h('span', { class: 'muted small' }, 'IP tĩnh') },
       { t: 'Lần đầu thấy', v: c => c.firstSeen, r: c => h('span', { class: 'small' }, fmtTime(c.firstSeen)) },
     ];
     if (me.role === 'admin') cols.push({ t: '', r: c => h('div', { class: 'row' },
       h('button', { class: 'sm', title: 'Đặt tên', onclick: () => clientNameForm(id, c) }, 'Đặt tên'),
+      bl && bl.ready ? (blocked.has(c.mac) ? h('button', { class: 'sm', onclick: e => unblock(id, blocked.get(c.mac), e.target) }, 'Bỏ chặn')
+        : h('button', { class: 'sm danger', title: 'Chặn thiết bị này ra Internet qua firewall của router', onclick: () => blockForm(id, c) }, 'Chặn')) : null,
       watched.has(c.ip) ? null : h('button', { class: 'sm', title: 'Ping định kỳ và báo khi mất kết nối', onclick: () => monitorForm(id, view, { name: c.name || c.ip, ip: c.ip }) }, '+ Theo dõi')) });
-    p.draw(cols, rows, { empty: 'Chưa có dữ liệu client (cập nhật mỗi phút).', rowClass: c => c.online ? null : 'off' });
+    p.draw(cols, rows, { empty: filter === 'blocked' ? 'Không có client nào bị chặn.' : 'Chưa có dữ liệu client (cập nhật mỗi phút).', rowClass: c => c.online ? null : 'off' });
+    // blocked list (also shows blocked devices that left the ARP table)
+    bp.el.classList.toggle('hidden', !bl);
+    if (bl) {
+      bp.draw([
+        { t: 'Thiết bị', v: b => b.name || b.ip || b.mac, r: b => h('div', null, h('b', null, b.name || b.ip || '–'), h('div', { class: 'mono small muted' }, b.mac)) },
+        { t: 'IP lúc chặn', v: b => ipKey(b.ip || ''), r: b => h('span', { class: 'mono' }, b.ip || '–') },
+        { t: 'IP object', num: true, v: b => b.obj },
+        { t: 'Chặn lúc', v: b => b.at, r: b => h('span', { class: 'small' }, fmtTime(b.at) + ' · ' + b.byUser) },
+        { t: 'Ghi chú', v: b => b.note },
+        { t: '', r: b => me.role === 'admin' ? h('button', { class: 'sm', onclick: e => unblock(id, b, e.target) }, 'Bỏ chặn') : null },
+      ], bl.blocks || [], { empty: 'Chưa chặn client nào.' });
+      fill(bnote, bl.ready ? `Chặn qua Firewall rule ${bl.rule} của filter set ${bl.set} và IP group ${bl.group} trên router.` :
+        ['Chặn client đã bật nhưng chưa kiểm tra cấu hình trên router. ', me.role === 'admin' ? h('a', { href: `#/admin/routers?edit=${id}` }, 'Mở cấu hình router →') : '']);
+    }
   };
   return {
     mount(el) {
       drawSeg();
       p = tablePanel('Client', 'clients-' + id, seg);
       if (p.state.sort == null) { p.state.sort = 0; p.state.desc = true; }
-      el.append(h('div', { class: 'stack' }, p.el, h('p', { class: 'hint' },
+      const live = me.role === 'admin' ? h('button', { class: 'sm', onclick: e => busy(e.target, async () => {
+        const st = await api('GET', `/api/routers/${id}/blocks?live=1`);
+        if (st.drift) toast('Lệch với router: ' + st.drift, 'bad');
+        else toast(`Khớp với router: rule ${st.ruleEnabled ? 'đang bật' : 'đang tắt'}, ${st.members.length} object trong group`, 'ok');
+      }) }, 'Đối chiếu với router') : null;
+      bp = tablePanel('Client bị chặn', 'blocked-' + id, live);
+      bnote = h('p', { class: 'hint' });
+      bp.el.append(h('div', { class: 'panel-b' }, bnote));
+      el.append(h('div', { class: 'stack' }, p.el, bp.el, h('p', { class: 'hint' },
         'Hoạt động = thiết bị có trong bảng ARP của router (đọc mỗi phút qua Telnet/SSH). Cổng = cổng LAN (P1…) router ghi nhận. Tên máy lấy theo thứ tự: tên tự đặt → thiết bị theo dõi → DHCP (HOST ID) → NetBIOS/mDNS/DNS ngược (DrayPulse hỏi trực tiếp thiết bị). Nếu vẫn không có, hiện hãng sản xuất theo MAC.')));
     },
     update(v) { view = v; render(); },
+  };
+}
+
+// --- VLAN tab: profiles from "vlan status", subnets from "show lan"
+function tabVlan(id) {
+  let a, l, note;
+  const portChip = pv => h('span', { class: 'chip ' + (pv.running == null ? '' : pv.running ? 'ok' : 'bad'), title: pv.label + (pv.running == null ? '' : pv.running ? ': có link' : ': mất link') }, pv.name.toUpperCase());
+  const usage = (used, size) => {
+    if (!size) return h('span', { class: 'muted small' }, used ? used + ' lease' : '–');
+    const pct = Math.min(100, Math.round(used * 100 / size));
+    const fillEl = h('i', { class: pct >= 90 ? 'bad' : pct >= 75 ? 'warn' : '' });
+    fillEl.style.width = pct + '%'; // CSSOM, allowed by the page's CSP (inline style attributes are not)
+    return h('div', { class: 'usage', title: `${used}/${size} địa chỉ` }, h('div', { class: 'bar' }, fillEl), h('span', { class: 'small' }, `${used}/${size}`));
+  };
+  return {
+    mount(el) {
+      a = tablePanel('VLAN', 'vlan-' + id); l = tablePanel('Mạng LAN (subnet)', 'lan-' + id); note = h('p', { class: 'hint' });
+      el.append(h('div', { class: 'stack' }, a.el, l.el, note));
+    },
+    update(v) {
+      const vl = v.vlans || [], lans = v.lans || [];
+      a.draw([
+        { t: 'VLAN', v: x => x.id, r: x => h('div', null, h('b', null, 'VLAN ' + x.id), h('div', { class: 'muted small' }, 'VID ' + x.vid + (x.pri ? ' · ưu tiên ' + x.pri : ''))) },
+        { t: 'Trạng thái', v: x => x.enabled, r: x => x.enabled ? badge('up', 'Bật') : badge('disabled', 'Tắt') },
+        { t: 'Subnet', v: x => x.subnet, r: x => h('div', null, h('b', null, x.subnet || '–'), x.network ? h('div', { class: 'mono small muted' }, x.network) : null) },
+        { t: 'Cổng thành viên', v: x => x.ports.length, r: x => x.ports.length ? h('div', { class: 'row wrap' }, x.ports.map(portChip)) : h('span', { class: 'muted small' }, 'không có') },
+        { t: 'Cổng có link', num: true, v: x => x.portsUp, r: x => { const lan = x.ports.filter(p => p.running != null); return lan.length ? `${x.portsUp}/${lan.length}` : '–'; } },
+        { t: 'Client hoạt động', num: true, v: x => x.online, r: x => x.clients ? `${x.online}/${x.clients}` : '0' },
+        { t: 'DHCP đã cấp', v: x => x.poolSize ? x.leases / x.poolSize : -1, r: x => usage(x.leases, x.poolSize) },
+      ], vl, { empty: v.sections.vlan ? 'Router chưa cấu hình VLAN.' : 'Cần bật Telnet/SSH để đọc VLAN (lệnh “vlan status”).', rowClass: x => x.enabled ? null : 'off' });
+      l.draw([
+        { t: 'Subnet', v: x => x.name, r: x => h('b', null, x.name) },
+        { t: 'Mạng', v: x => x.network, r: x => h('span', { class: 'mono' }, x.network || '–') },
+        { t: 'Gateway', v: x => x.gateway, r: x => h('span', { class: 'mono' }, x.gateway || '–') },
+        { t: 'VLAN', v: x => x.vlans.join(','), r: x => x.vlans.length ? x.vlans.map(n => 'VLAN ' + n).join(', ') : '–' },
+        { t: 'Client hoạt động', num: true, v: x => x.online, r: x => x.clients ? `${x.online}/${x.clients}` : '0' },
+        { t: 'DHCP', v: x => x.poolSize ? x.leases / x.poolSize : -1, r: x => x.dhcp ? usage(x.leases, x.poolSize) : h('span', { class: 'muted small' }, 'tắt') },
+      ], lans, { empty: 'Chưa đọc được danh sách LAN (lệnh “show lan”).', rowClass: x => x.enabled ? null : 'off' });
+      const on = (v.sections.vlan || [])[0];
+      fill(note, (on && on['vlan-on'] === 'false' ? 'Chức năng VLAN trên router đang TẮT. ' : '') +
+        'Đọc mỗi phút qua Telnet/SSH. Cổng xanh/đỏ = có/mất link (SNMP); S1…S4 là SSID Wi-Fi. DrayPulse báo khi VLAN bị bật/tắt hoặc đổi VID/cổng/subnet, và khi DHCP của một subnet dùng ≥ 90% địa chỉ.');
+    },
   };
 }
 
@@ -1254,6 +1342,35 @@ function routerForm(r, view, sys) {
   const cliBox = h('div', { class: 'form full' }, field('Telnet/SSH', cli), field('Cổng', cliPort), field('Tài khoản quản trị router', user), field('Mật khẩu', pass),
     field('Ping thiết bị LAN', pingFrom),
     h('p', { class: 'hint full' }, 'Telnet/SSH (tuỳ chọn) cho: trạng thái WAN chi tiết, IP public, bảng ARP & DHCP (client, tên máy, cổng LAN) và kiểm tra Internet riêng từng WAN bằng “ip ping … WANx”. DrayPulse chỉ gửi lệnh xem trong danh sách cố định.'));
+  // --- MAC blocking (writes to the router: off by default)
+  const bk = o.block || {};
+  const bkOn = h('input', { type: 'checkbox', checked: !!bk.enabled });
+  const num = (v, min, max) => h('input', { type: 'number', min, max, value: v });
+  const bkSet = num(bk.set || 2, 1, 12), bkRule = num(bk.rule || 7, 1, 7), bkGroup = num(bk.group || 32, 1, 32);
+  const bkFrom = num(bk.objFrom || 181, 1, 192), bkTo = num(bk.objTo || 192, 1, 192);
+  const bkOut = h('div');
+  const bkSteps = h('ol', { class: 'small' });
+  const drawBkSteps = () => fill(bkSteps, [
+    h('li', null, 'Web UI router: ', h('b', null, 'Objects Setting → IP Group'), ` → chọn group số ${bkGroup.value}, để trống (DrayPulse tự đặt tên “DrayPulse” khi kiểm tra). Kiểm tra các IP Object ${bkFrom.value}–${bkTo.value} đang trống.`),
+    h('li', null, h('b', null, 'Firewall → Filter Setup'), ` → Set ${bkSet.value} → Rule ${bkRule.value} (rule đang trống). Comments: “DrayPulse block”; Direction: LAN/DMZ/RT/VPN → WAN; Source IP: IP Group số ${bkGroup.value}; Destination: Any; Filter: `, h('b', null, 'Block Immediately'), '; bỏ tick Enable (DrayPulse tự bật khi có client bị chặn). Rule phải nằm trong filter set đang chạy và đứng trước các rule “Pass Immediately” áp cho cùng máy.'),
+    h('li', null, 'Lưu router ở đây, rồi bấm “Kiểm tra cấu hình chặn”. Chỉ khi kiểm tra đạt, nút “Chặn” mới hiện ở tab Client.'),
+  ]);
+  [bkSet, bkRule, bkGroup, bkFrom, bkTo].forEach(x => x.addEventListener('input', drawBkSteps));
+  drawBkSteps();
+  const bkFields = h('div', { class: 'form full' }, field('Filter set', bkSet), field('Rule', bkRule), field('IP group', bkGroup), field('IP object từ', bkFrom), field('đến (tối đa 12 object)', bkTo),
+    h('div', { class: 'full box' }, h('b', null, 'Chuẩn bị một lần trên router'), bkSteps),
+    h('div', { class: 'full row' }, isNew ? h('span', { class: 'hint' }, 'Lưu router trước, sau đó mở lại để kiểm tra cấu hình chặn.') :
+      h('button', { type: 'button', onclick: e => busy(e.target, async () => {
+        const res = await api('POST', `/api/admin/routers/${r.id}/blocks/check`);
+        fill(bkOut, h('div', { class: 'box ' + (res.ok ? 'ok' : 'bad') }, res.ok ? '✓ Sẵn sàng chặn client.' : 'Chưa dùng được:',
+          (res.problems || []).map(x => h('div', { class: 'err-line' }, x)), (res.notes || []).map(x => h('div', { class: 'small' }, x))));
+        if (res.ok) r.opts = { ...(r.opts || {}), block: { ...(r.opts?.block || {}), ready: true } };
+      }).catch(() => { }) }, 'Kiểm tra cấu hình chặn'),
+      bk.enabled ? (bk.ready ? badge('up', 'Đã kiểm tra') : badge('waiting', 'Chưa kiểm tra')) : null, bkOut));
+  const blockBox = h('div', { class: 'form full' }, h('div', { class: 'full' }, check('Cho phép DrayPulse chặn client theo MAC qua Firewall của router (cần Telnet/SSH)', bkOn)), bkFields,
+    h('p', { class: 'hint full' }, 'Tính năng này GHI cấu hình router, nhưng chỉ trong phạm vi bạn dành riêng: các IP Object đã chọn, IP Group đã chọn và bật/tắt đúng một rule. Mỗi thay đổi được đọc lại để xác minh và hoàn tác nếu router không nhận. Lệnh Firewall chưa được kiểm chứng trên mọi model/firmware: hãy thử với một thiết bị trước.'));
+  const syncBlock = () => bkFields.classList.toggle('hidden', !bkOn.checked);
+  bkOn.addEventListener('change', syncBlock); syncBlock();
   const syncSnmp = () => {
     v2Box.classList.toggle('hidden', !['1', '2c'].includes(snmpVer.value));
     v3Box.classList.toggle('hidden', snmpVer.value !== '3');
@@ -1280,7 +1397,8 @@ function routerForm(r, view, sys) {
   function collect() {
     const body = { name: name.value, mode: mode.value, host: host.value, username: user.value,
       opts: { snmpVersion: snmpVer.value, snmpPort: +snmpPort.value || 0, snmpUser: v3user.value, authProto: authProto.value, privProto: privProto.value,
-        cli: cli.value, cliPort: +cliPort.value || 0, pingFrom: pingFrom.value },
+        cli: cli.value, cliPort: +cliPort.value || 0, pingFrom: pingFrom.value,
+        block: { enabled: bkOn.checked, set: +bkSet.value, rule: +bkRule.value, group: +bkGroup.value, objFrom: +bkFrom.value, objTo: +bkTo.value } },
       interval: +interval.value || 15, wans: [...wanRows.children].map(x => x._get()).filter(w => w.iface), wanTarget: target.value, chatId: chat.value, zaloChat: zchat.value, enabled: enabled.checked };
     if (pass.value) body.password = pass.value;
     if (community.value || authPass.value || privPass.value) body.snmp = { community: community.value, authPass: authPass.value, privPass: privPass.value };
@@ -1298,6 +1416,7 @@ function routerForm(r, view, sys) {
   } });
   modal(isNew ? 'Thêm router DrayTek' : 'Sửa router: ' + r.name, h('div', { class: 'form' },
     field('Tên hiển thị', name), field('Loại', mode), pullBox,
+    h('div', { class: 'full stack' }, h('h3', null, 'Chặn client theo MAC (thử nghiệm)'), blockBox),
     field('Chu kỳ đọc (giây)', interval), field('IP kiểm tra Internet', target), field('Chat ID Telegram riêng cho router này', chat), field('Chat ID Zalo riêng cho router này', zchat),
     h('div', { class: 'full stack' }, h('h3', null, 'WAN cần theo dõi'),
       h('p', { class: 'hint' }, 'DrayPulse báo khi WAN mất link hoặc mất Internet. Tên WAN theo router: WAN1, WAN2… (bấm “Kiểm tra kết nối” để lấy danh sách).'),

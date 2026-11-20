@@ -1,6 +1,7 @@
 package app
 
 import (
+	"net"
 	"regexp"
 	"strconv"
 	"strings"
@@ -263,4 +264,183 @@ func parseRouterPing(s string) (PingResult, bool) {
 		res.RTT = sum / float64(n)
 	}
 	return res, true
+}
+
+// ---------- VLAN and LAN subnets ----------
+
+var (
+	reVlanGlobal = regexp.MustCompile(`(?i)VLAN is\s+(Enable|Disable)`)
+	reVlanRow    = regexp.MustCompile(`^\s*(\d{1,2})\s+(ON|OFF)\s+(\d{1,4})\s+(\d)\b`)
+	reVlanSubnet = regexp.MustCompile(`(\d+):((?:LAN|DMZ|IP_ROUTED)\S*)\s*$`)
+	reVlanPort   = regexp.MustCompile(`\b(p\d+|s\d+|5gs\d+)\b`)
+)
+
+// parseVlanStatus reads "vlan status":
+//
+//	VLAN is Enable :
+//	VLAN Enable VID Pri    p1 p2 p3 p4 p5 s1 s2 s3 s4 subnet
+//	  0    ON    10   0    V  V                       1:LAN1
+//
+// Port membership is the "V" under each port column of the header. Rows:
+// id, enabled, vid, pri, ports ("p1,p2"), subnet ("LAN1"), vlan-on (global).
+func parseVlanStatus(s string) []Row {
+	global := ""
+	if m := reVlanGlobal.FindStringSubmatch(s); m != nil {
+		global = strconv.FormatBool(strings.EqualFold(m[1], "Enable"))
+	}
+	type col struct {
+		name string
+		pos  int
+	}
+	var cols []col
+	var out []Row
+	for _, line := range strings.Split(s, "\n") {
+		if strings.Contains(line, "Enable") && strings.Contains(line, "VID") {
+			cols = nil
+			for _, loc := range reVlanPort.FindAllStringIndex(line, -1) {
+				cols = append(cols, col{line[loc[0]:loc[1]], loc[0]})
+			}
+			continue
+		}
+		m := reVlanRow.FindStringSubmatchIndex(line)
+		if m == nil {
+			continue
+		}
+		r := Row{"id": line[m[2]:m[3]], "enabled": strconv.FormatBool(line[m[4]:m[5]] == "ON"),
+			"vid": line[m[6]:m[7]], "pri": line[m[8]:m[9]], "vlan-on": global}
+		end := len(line)
+		if sm := reVlanSubnet.FindStringSubmatchIndex(line); sm != nil {
+			r["subnet"] = line[sm[4]:sm[5]]
+			end = sm[0]
+		}
+		var ports []string
+		for i := m[1]; i < end; i++ {
+			if line[i] != 'V' && line[i] != 'v' {
+				continue
+			}
+			best, bd := "", 3 // nearest port column, at most 2 characters away
+			for _, c := range cols {
+				if d := abs(c.pos - i); d < bd || (d == bd && best == "") {
+					if d <= 2 {
+						best, bd = c.name, d
+					}
+				}
+				// columns may be right-aligned under longer names ("5gs1")
+				if d := abs(c.pos + len(c.name) - 1 - i); d < bd && d <= 1 {
+					best, bd = c.name, d
+				}
+			}
+			if best != "" && !slicesContains(ports, best) {
+				ports = append(ports, best)
+			}
+		}
+		r["ports"] = strings.Join(ports, ",")
+		out = append(out, r)
+	}
+	return out
+}
+
+func abs(x int) int {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
+func slicesContains(l []string, s string) bool {
+	for _, x := range l {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
+
+var reShowLanRow = regexp.MustCompile(`^\s*\[(V|X)\]\s*(\S+)\s+(\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)\s+(?:(V)\s+)?(\d+\.\d+\.\d+\.\d+)\s+(\d+)\s+(\d+\.\d+\.\d+\.\d+)`)
+
+// parseShowLan reads "show lan": one row per LAN subnet with its DHCP pool.
+//
+//	[V]LAN1 192.168.1.1     255.255.255.0 V   192.168.1.10    200 192.168.1.1
+func parseShowLan(s string) []Row {
+	var out []Row
+	for _, line := range strings.Split(s, "\n") {
+		m := reShowLanRow.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		r := Row{"name": m[2], "enabled": strconv.FormatBool(m[1] == "V"), "address": m[3], "mask": m[4],
+			"dhcp": strconv.FormatBool(m[5] == "V"), "pool-start": m[6], "pool-size": m[7], "gateway": m[8]}
+		if bits := maskBits(m[4]); bits > 0 {
+			if _, nw, err := net.ParseCIDR(m[3] + "/" + strconv.Itoa(bits)); err == nil {
+				r["network"] = nw.String()
+			}
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+// ---------- firewall object / group / rule read-backs (MAC blocking) ----------
+
+var reBracket = regexp.MustCompile(`(?m)^\s*([A-Za-z/ ]+?)\s*:\s*\[(.*?)\]\s*$`)
+
+// parseIPObject reads "object ip obj N -v" into name, interface, type, mac…
+func parseIPObject(s string) Row {
+	r := Row{}
+	for _, m := range reBracket.FindAllStringSubmatch(s, -1) {
+		switch strings.ToLower(strings.TrimSpace(m[1])) {
+		case "name":
+			r["name"] = strings.TrimSpace(m[2])
+		case "interface":
+			r["interface"] = m[2]
+		case "address type":
+			r["type"] = strings.ToLower(m[2])
+		case "start ip address":
+			r["start"] = m[2]
+		case "mac address":
+			r["mac"] = dashMAC(m[2])
+		}
+	}
+	return r
+}
+
+var reGrpMember = regexp.MustCompile(`\[(\d+):\]\s*\[(\d+)\]`)
+
+// parseIPGroup reads "object ip grp N -v": name and the member object indexes.
+func parseIPGroup(s string) (name string, members []int) {
+	for _, m := range reBracket.FindAllStringSubmatch(s, -1) {
+		if strings.EqualFold(strings.TrimSpace(m[1]), "name") {
+			name = strings.TrimSpace(m[2])
+		}
+	}
+	for _, m := range reGrpMember.FindAllStringSubmatch(s, -1) {
+		if n, _ := strconv.Atoi(m[2]); n > 0 {
+			members = append(members, n)
+		}
+	}
+	return name, members
+}
+
+var reRuleField = regexp.MustCompile(`(?m)^\s*([A-Za-z][A-Za-z /]*?)\s*:\s*(.*?)\s*$`)
+
+// parseFilterRule reads "ipf rule S R -v": status, comments, direction, source, action.
+func parseFilterRule(s string) Row {
+	r := Row{}
+	for _, m := range reRuleField.FindAllStringSubmatch(s, -1) {
+		switch strings.ToLower(strings.TrimSpace(m[1])) {
+		case "status":
+			r["status"] = strings.ToLower(m[2])
+		case "comments":
+			r["comment"] = m[2]
+		case "direction":
+			r["direction"] = m[2]
+		case "source ip":
+			r["source"] = m[2]
+		case "destination ip":
+			r["destination"] = m[2]
+		case "pass or block":
+			r["action"] = m[2]
+		}
+	}
+	return r
 }

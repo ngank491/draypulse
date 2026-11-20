@@ -19,6 +19,7 @@ import (
 type demoRouter struct {
 	snmp *simSNMP
 	cli  *simCLI
+	fw   *simFirewall
 
 	mu      sync.Mutex
 	started time.Time
@@ -41,23 +42,25 @@ var demoIfs = []struct {
 	{27, "LAN_PORT1", 6, true, 6e6, 30e6, 0},
 	{28, "LAN_PORT2", 6, true, 4e6, 12e6, 0},
 	{29, "LAN_PORT3", 6, true, 2e6, 9e6, 0},
-	{30, "LAN_PORT4", 6, false, 0, 0, 0},
+	{30, "LAN_PORT4", 6, true, 3e6, 7e6, 0},
 	{31, "LAN_PORT5", 6, true, 5e6, 1e6, 0},
 	{32, "LAN_PORT6", 6, false, 0, 0, 0},
 	{33, "Loopback", 24, true, 0, 0, 0},
 }
 
-var demoClients = []struct{ ip, mac, host, port string }{
-	{"192.168.1.10", "00-11-32-AA-10-01", "NAS-Synology", "P1"},
-	{"192.168.1.2", "1C-2A-A3-00-00-02", "SW-Tang1", "P1"},
-	{"192.168.1.3", "1C-2A-A3-00-00-03", "AP-Tang2", "P2"},
-	{"192.168.1.13", "3C-52-82-11-22-33", "HP-LaserJet", "P2"},
-	{"192.168.1.20", "DC-A6-32-00-10-00", "PC-KETOAN", "P3"},
-	{"192.168.1.21", "F0-2F-74-55-00-21", "LAPTOP-GD", "P3"},
-	{"192.168.1.22", "62-1B-77-00-00-22", "iPhone-Lan", "P2"},
-	{"192.168.1.23", "A4-C6-9A-00-00-23", "Galaxy-S24", "P2"},
-	{"192.168.1.30", "BC-32-5F-00-00-11", "", "P5"},
-	{"192.168.1.31", "BC-32-5F-00-00-12", "", "P5"},
+// Three networks: office (VLAN 0, LAN1), guest Wi-Fi (VLAN 1, LAN2) and
+// cameras (VLAN 2, LAN3).
+var demoClients = []struct{ ip, mac, host, port, lan, vlan string }{
+	{"192.168.1.10", "00-11-32-AA-10-01", "NAS-Synology", "P1", "LAN1", "VLAN0"},
+	{"192.168.1.2", "1C-2A-A3-00-00-02", "SW-Tang1", "P1", "LAN1", "VLAN0"},
+	{"192.168.1.3", "1C-2A-A3-00-00-03", "AP-Tang2", "P2", "LAN1", "VLAN0"},
+	{"192.168.1.13", "3C-52-82-11-22-33", "HP-LaserJet", "P2", "LAN1", "VLAN0"},
+	{"192.168.1.20", "DC-A6-32-00-10-00", "PC-KETOAN", "P3", "LAN1", "VLAN0"},
+	{"192.168.1.21", "F0-2F-74-55-00-21", "LAPTOP-GD", "P3", "LAN1", "VLAN0"},
+	{"192.168.20.22", "62-1B-77-00-00-22", "iPhone-Lan", "P4", "LAN2", "VLAN1"},
+	{"192.168.20.23", "A4-C6-9A-00-00-23", "Galaxy-S24", "P4", "LAN2", "VLAN1"},
+	{"10.10.30.11", "BC-32-5F-00-00-11", "", "P5", "LAN3", "VLAN2"},
+	{"10.10.30.12", "BC-32-5F-00-00-12", "", "P5", "LAN3", "VLAN2"},
 }
 
 func startDemoRouter(ctx context.Context, seed int64) (*demoRouter, error) {
@@ -68,6 +71,9 @@ func startDemoRouter(ctx context.Context, seed int64) (*demoRouter, error) {
 		d.bytes[it.idx] = [2]float64{4.29e9 - it.rx*5, 4.29e9 - it.tx*7}
 	}
 	var err error
+	d.fw = newSimFirewall()
+	d.fw.prepareDemoRule(2, 7, "DrayPulse")
+	d.fw.handle("object ip obj 1 -n Server")
 	if d.snmp, err = startSimSNMP(ctx, "public", d.snmpData); err != nil {
 		return nil, err
 	}
@@ -126,7 +132,8 @@ func (d *demoRouter) snmpData() map[string]gosnmp.SnmpPDU {
 		m["1.3.6.1.2.1.2.2.1.10."+i] = pduC32(uint(uint64(b[0]) & 0xffffffff))
 		m["1.3.6.1.2.1.2.2.1.16."+i] = pduC32(uint(uint64(b[1]) & 0xffffffff))
 	}
-	for _, a := range [][3]string{{"192.168.1.1", "1", "255.255.255.0"}, {"113.161.20.45", "4", "255.255.255.255"}, {"171.244.8.19", "5", "255.255.255.0"}} {
+	for _, a := range [][3]string{{"192.168.1.1", "1", "255.255.255.0"}, {"192.168.20.1", "1", "255.255.255.0"}, {"10.10.30.1", "1", "255.255.255.0"},
+		{"113.161.20.45", "4", "255.255.255.255"}, {"171.244.8.19", "5", "255.255.255.0"}} {
 		m["1.3.6.1.2.1.4.20.1.1."+a[0]] = pduIP(a[0])
 		m["1.3.6.1.2.1.4.20.1.2."+a[0]] = pduInt(atoiDef(a[1], 0))
 		m["1.3.6.1.2.1.4.20.1.3."+a[0]] = pduIP(a[2])
@@ -163,6 +170,9 @@ func atoiDef(s string, def int) int {
 func wan2Down() bool { return time.Now().Minute()%15 < 2 }
 
 func (d *demoRouter) cliReply(cmd string) string {
+	if out, ok := d.fw.handle(cmd); ok {
+		return out
+	}
 	up := time.Since(d.started)
 	clk := func(t time.Duration) string {
 		return fmt.Sprintf("%02d:%02d:%02d", int(t.Hours()), int(t.Minutes())%60, int(t.Seconds())%60)
@@ -184,20 +194,43 @@ func (d *demoRouter) cliReply(cmd string) string {
 		b.WriteString("[ARP Table]\nIndex IP Address     MAC Address      HOST ID    Interface  VLAN   Port\n")
 		b.WriteString("   1   113.161.1.1    00-1E-49-00-01-01             WAN1        ---    --\n")
 		for i, c := range demoClients {
-			if c.ip == "192.168.1.31" && time.Now().Minute()%20 < 10 {
+			if c.ip == "10.10.30.12" && time.Now().Minute()%20 < 10 {
 				continue // a camera that comes and goes
 			}
-			fmt.Fprintf(&b, "%4d   %-15s%s  %-10s LAN1       VLAN0   %s\n", i+2, c.ip, c.mac, c.host, c.port)
+			fmt.Fprintf(&b, "%4d   %-15s%s  %-10s %-10s %-6s %s\n", i+2, c.ip, c.mac, c.host, c.lan, c.vlan, c.port)
 		}
 		return b.String()
 	case cmd == "srv dhcp status":
 		var b strings.Builder
 		b.WriteString("LAN1       : DHCP Server On    IP Pool: 192.168.1.10 ~ 192.168.1.209\n             Default Gateway: 192.168.1.1\n")
-		b.WriteString(strings.Repeat("-", 72) + "\nIndex   IP Address      MAC Address             Leased Time     HOST ID\n" + strings.Repeat("-", 72) + "\nLAN1\n")
-		for i, c := range demoClients[4:] {
-			fmt.Fprintf(&b, "%-8d%-16s%-24s%-16s%s\n", i+1, c.ip, c.mac, fmt.Sprintf("%02d:%02d:%02d", 20+i, i*7%60, i*13%60), c.host)
+		b.WriteString("LAN2       : DHCP Server On    IP Pool: 192.168.20.10 ~ 192.168.20.59\n             Default Gateway: 192.168.20.1\n")
+		b.WriteString(strings.Repeat("-", 72) + "\nIndex   IP Address      MAC Address             Leased Time     HOST ID\n" + strings.Repeat("-", 72) + "\n")
+		for _, lan := range []string{"LAN1", "LAN2"} {
+			b.WriteString(lan + "\n")
+			n := 0
+			for i, c := range demoClients[4:] {
+				if c.lan != lan {
+					continue
+				}
+				n++
+				fmt.Fprintf(&b, "%-8d%-16s%-24s%-16s%s\n", n, c.ip, c.mac, fmt.Sprintf("%02d:%02d:%02d", 20+i, i*7%60, i*13%60), c.host)
+			}
 		}
 		return b.String()
+	case cmd == "vlan status":
+		return "VLAN is Enable :\n" + strings.Repeat("-", 64) + "\n" +
+			"VLAN Enable VID Pri  p1 p2 p3 p4 p5 p6 s1 s2 s3 s4 subnet\n" + strings.Repeat("-", 64) + "\n" +
+			"  0    ON    10   0  V  V  V                       1:LAN1\n" +
+			"  1    ON    20   2           V           V        2:LAN2\n" +
+			"  2    ON    30   0              V  V              3:LAN3\n" +
+			"  3    OFF    0   0                                1:LAN1\n" + strings.Repeat("-", 64) + "\n" +
+			" Permit untagged device in P1 to access router: ON...."
+	case cmd == "show lan":
+		return "The LAN settings:\n         ip             mask      dhcp star_ip           pool gateway\n" + strings.Repeat("-", 72) + "\n" +
+			"[V]LAN1 192.168.1.1     255.255.255.0 V   192.168.1.10    200 192.168.1.1\n" +
+			"[V]LAN2 192.168.20.1    255.255.255.0 V   192.168.20.10   50 192.168.20.1\n" +
+			"[V]LAN3 10.10.30.1      255.255.255.0     10.10.30.10     0 10.10.30.1\n" +
+			"[X]LAN4 192.168.4.1     255.255.255.0 V   192.168.4.10    100 192.168.4.1\n"
 	case cmd == "show status":
 		return "System Uptime:" + clk(up) + "\nLAN Status\n"
 	case strings.HasPrefix(cmd, "ip ping "):
@@ -269,7 +302,8 @@ func seedDemo(st *Store) error {
 	}
 	r := &Router{Name: "Văn phòng Hà Nội (demo)", Mode: "demo", Host: "127.0.0.1", Interval: 10, Enabled: true, WANTarget: "8.8.8.8",
 		WANs: []WAN{{Iface: "WAN1", Label: "VNPT"}, {Iface: "WAN2", Label: "Viettel"}},
-		Opts: DrayOpts{SNMPVersion: "2c", CLI: "telnet", PingFrom: "local"}}
+		Opts: DrayOpts{SNMPVersion: "2c", CLI: "telnet", PingFrom: "local",
+			Block: BlockCfg{Enabled: true, Set: 2, Rule: 7, Group: 32, ObjFrom: 181, ObjTo: 192}}}
 	if err := st.SaveRouter(r); err != nil {
 		return err
 	}
@@ -285,7 +319,7 @@ func seedDemo(st *Store) error {
 	ap := add("AP tầng 2", "192.168.1.3", "ap", sw)
 	add("Máy in HP", "192.168.1.13", "printer", ap)
 	cam := add("Switch camera", "", "virtual", sw)
-	add("Camera cổng", "192.168.1.30", "camera", cam)
-	add("Camera kho", "192.168.1.250", "camera", cam)
+	add("Camera cổng", "10.10.30.11", "camera", cam)
+	add("Camera kho", "10.10.30.250", "camera", cam)
 	return err
 }
