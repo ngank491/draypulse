@@ -82,6 +82,7 @@ func (s *Server) Handler() http.Handler {
 	user("GET /api/routers/{id}/blocks", s.listBlocks)
 	admin("POST /api/admin/routers/{id}/blocks", s.blockClient)
 	admin("DELETE /api/admin/routers/{id}/blocks/{ip}", s.unblockClient)
+	admin("DELETE /api/admin/routers/{id}/devices/{mac}", s.unblockDevice)
 	user("GET /api/routers/{id}/syslog", s.syslogStatus)
 	admin("POST /api/admin/routers/{id}/syslog-source", s.addSyslogSource)
 	admin("DELETE /api/admin/routers/{id}/syslog-source/{ip}", s.removeSyslogSource)
@@ -1323,23 +1324,41 @@ func (s *Server) listBlocks(w http.ResponseWriter, r *http.Request, u *User) {
 
 func (s *Server) blockClient(w http.ResponseWriter, r *http.Request, u *User) {
 	var in struct {
-		MAC  string `json:"mac"`
-		IP   string `json:"ip"`
-		Name string `json:"name"`
-		Note string `json:"note"`
+		MAC       string `json:"mac"`
+		IP        string `json:"ip"`
+		Name      string `json:"name"`
+		Host      string `json:"host"`
+		Note      string `json:"note"`
+		MatchHost bool   `json:"matchHost"`
+		IPOnly    bool   `json:"ipOnly"`
 	}
 	if !readJSON(w, r, &in) {
 		return
 	}
 	in.Name, in.Note = truncateUTF8(strings.TrimSpace(in.Name), 64), truncateUTF8(strings.TrimSpace(in.Note), 200)
+	in.Host = truncateUTF8(strings.TrimSpace(in.Host), 64)
 	in.IP = strings.TrimSpace(in.IP)
-	if net.ParseIP(in.IP) == nil {
+	if in.IP != "" && net.ParseIP(in.IP) == nil {
 		errJSON(w, 400, "IP không hợp lệ")
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
 	defer cancel()
-	b, err := s.hub.BlockClient(ctx, pathID(r, "id"), in.IP, in.MAC, in.Name, in.Note, u.Username)
+	id := pathID(r, "id")
+	if in.MAC != "" && !in.IPOnly {
+		d, err := s.hub.BlockDevice(ctx, id, in.MAC, in.IP, in.Name, in.Host, in.Note, in.MatchHost, u.Username)
+		if err != nil {
+			errJSON(w, 502, err.Error())
+			return
+		}
+		writeJSON(w, 200, d)
+		return
+	}
+	if in.IP == "" {
+		errJSON(w, 400, "cần IP hoặc MAC")
+		return
+	}
+	b, err := s.hub.BlockClient(ctx, id, in.IP, in.MAC, in.Name, in.Note, u.Username)
 	if err != nil {
 		errJSON(w, 502, err.Error())
 		return
@@ -1351,6 +1370,16 @@ func (s *Server) unblockClient(w http.ResponseWriter, r *http.Request, u *User) 
 	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
 	defer cancel()
 	if err := s.hub.UnblockClient(ctx, pathID(r, "id"), r.PathValue("ip"), u.Username); err != nil {
+		errJSON(w, 502, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+
+func (s *Server) unblockDevice(w http.ResponseWriter, r *http.Request, u *User) {
+	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
+	defer cancel()
+	if err := s.hub.UnblockDevice(ctx, pathID(r, "id"), r.PathValue("mac"), u.Username); err != nil {
 		errJSON(w, 502, err.Error())
 		return
 	}

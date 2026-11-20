@@ -166,6 +166,24 @@ CREATE TABLE ip_blocks(
   PRIMARY KEY(router_id, ip)) WITHOUT ROWID;
 `
 
+// schemaV7: blocking by device. A blocked device (MAC) owns the IPs blocked
+// for it; ip_blocks rows with mac=” are manual IP-only blocks.
+const schemaV7 = `
+CREATE TABLE blocked_devices(
+  router_id INTEGER NOT NULL REFERENCES routers(id) ON DELETE CASCADE,
+  mac TEXT NOT NULL,
+  name TEXT NOT NULL DEFAULT '',
+  host TEXT NOT NULL DEFAULT '',
+  note TEXT NOT NULL DEFAULT '',
+  by_user TEXT NOT NULL DEFAULT '',
+  at INTEGER NOT NULL,
+  match_host INTEGER NOT NULL DEFAULT 0,
+  origin TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY(router_id, mac)) WITHOUT ROWID;
+INSERT OR IGNORE INTO blocked_devices(router_id,mac,name,note,by_user,at)
+  SELECT router_id, mac, name, note, by_user, at FROM ip_blocks WHERE mac != '';
+`
+
 type Store struct{ db *sql.DB }
 
 func OpenStore(path string) (*Store, error) {
@@ -196,7 +214,7 @@ func (s *Store) migrate() error {
 	if err := s.db.QueryRow("PRAGMA user_version").Scan(&v); err != nil {
 		return err
 	}
-	migrations := []string{schemaV1, schemaV2, schemaV3, schemaV4, schemaV5, schemaV6}
+	migrations := []string{schemaV1, schemaV2, schemaV3, schemaV4, schemaV5, schemaV6, schemaV7}
 	if v > len(migrations) {
 		return fmt.Errorf("database được tạo bởi phiên bản mới hơn (schema %d)", v)
 	}
@@ -1064,15 +1082,30 @@ func (s *Store) FailStaleAudits() error {
 	return nil
 }
 
-// ---------- blocked client IPs ----------
+// ---------- blocked devices and IPs ----------
 
+// Block is one IP blocked on the router (a Bind IP to MAC entry).
 type Block struct {
 	IP     string `json:"ip"`
-	MAC    string `json:"mac"` // the client's real MAC when known (display only)
+	MAC    string `json:"mac"` // owning blocked device, "" for a manual IP-only block
 	Name   string `json:"name"`
 	Note   string `json:"note"`
 	ByUser string `json:"byUser"`
 	At     int64  `json:"at"`
+}
+
+// Device is a blocked device: every IP it uses is blocked, and with
+// MatchHost a new MAC carrying the same DHCP host name is blocked too.
+type Device struct {
+	MAC       string   `json:"mac"`
+	Name      string   `json:"name"`
+	Host      string   `json:"host"`
+	Note      string   `json:"note"`
+	ByUser    string   `json:"byUser"`
+	At        int64    `json:"at"`
+	MatchHost bool     `json:"matchHost"`
+	Origin    string   `json:"origin"` // why it was added automatically
+	IPs       []string `json:"ips"`
 }
 
 func (s *Store) ListBlocks(routerID int64) ([]Block, error) {
@@ -1093,7 +1126,7 @@ func (s *Store) ListBlocks(routerID int64) ([]Block, error) {
 }
 
 func (s *Store) AddBlock(routerID int64, b Block) error {
-	_, err := s.db.Exec("INSERT INTO ip_blocks(router_id,ip,mac,name,note,by_user,at) VALUES(?,?,?,?,?,?,?)",
+	_, err := s.db.Exec("INSERT OR REPLACE INTO ip_blocks(router_id,ip,mac,name,note,by_user,at) VALUES(?,?,?,?,?,?,?)",
 		routerID, b.IP, b.MAC, b.Name, b.Note, b.ByUser, b.At)
 	return err
 }
@@ -1101,4 +1134,58 @@ func (s *Store) AddBlock(routerID int64, b Block) error {
 func (s *Store) DeleteBlock(routerID int64, ip string) error {
 	_, err := s.db.Exec("DELETE FROM ip_blocks WHERE router_id=? AND ip=?", routerID, ip)
 	return err
+}
+
+func (s *Store) ListDevices(routerID int64) ([]Device, error) {
+	rows, err := s.db.Query("SELECT mac,name,host,note,by_user,at,match_host,origin FROM blocked_devices WHERE router_id=? ORDER BY at", routerID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Device{}
+	for rows.Next() {
+		var d Device
+		if err := rows.Scan(&d.MAC, &d.Name, &d.Host, &d.Note, &d.ByUser, &d.At, &d.MatchHost, &d.Origin); err != nil {
+			return nil, err
+		}
+		d.IPs = []string{}
+		out = append(out, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	ips, err := s.ListBlocks(routerID)
+	if err != nil {
+		return nil, err
+	}
+	for i := range out {
+		for _, b := range ips {
+			if b.MAC == out[i].MAC {
+				out[i].IPs = append(out[i].IPs, b.IP)
+			}
+		}
+	}
+	return out, nil
+}
+
+func (s *Store) AddDevice(routerID int64, d Device) error {
+	_, err := s.db.Exec("INSERT INTO blocked_devices(router_id,mac,name,host,note,by_user,at,match_host,origin) VALUES(?,?,?,?,?,?,?,?,?)",
+		routerID, d.MAC, d.Name, d.Host, d.Note, d.ByUser, d.At, d.MatchHost, d.Origin)
+	return err
+}
+
+// DeleteDevice removes a device and the IP rows it owns.
+func (s *Store) DeleteDevice(routerID int64, mac string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec("DELETE FROM ip_blocks WHERE router_id=? AND mac=?", routerID, mac); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("DELETE FROM blocked_devices WHERE router_id=? AND mac=?", routerID, mac); err != nil {
+		return err
+	}
+	return tx.Commit()
 }

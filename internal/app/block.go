@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/netip"
 	"regexp"
 	"strings"
+	"time"
 )
 
 // ---------- Blocking a client IP with DrayOS "Bind IP to MAC" ----------
@@ -27,6 +29,7 @@ import (
 // blockMAC is a locally administered address no real device uses.
 const blockMAC = "02:DD:00:00:00:01"
 const blockComment = "DrayPulse"
+const zeroMAC = "00:00:00:00:00:00"
 
 var errBlockOff = errors.New("chưa bật chặn client cho router này (Router → Sửa → Chặn client)")
 
@@ -245,7 +248,242 @@ func (h *Hub) saveTurnedOn(rs *RState, v bool) error {
 	return nil
 }
 
-// BlockClient blocks an IP; on any failure the router is put back as it was.
+// bindTx applies a set of IP additions/removals to the router's table as
+// one unit: the function is switched on if needed (refusing when that would
+// activate the admin's own entries), everything is read back, and on any
+// mismatch the router is put back as it was.
+func (h *Hub) bindTx(o *bindOps, rs *RState, add, del []string) error {
+	if len(add) == 0 && len(del) == 0 {
+		return nil
+	}
+	st, err := o.show()
+	if err != nil {
+		return err
+	}
+	for _, ip := range add {
+		if e := st.find(ip); e != nil && !e.ours() {
+			return fmt.Errorf("IP %s đã có trong bảng Bind IP to MAC của router (gắn với %s): DrayPulse không sửa mục do bạn tạo", ip, e.MAC)
+		}
+	}
+	if !st.On && len(add) > 0 {
+		var others []string
+		for _, e := range st.Entries {
+			if !e.ours() {
+				others = append(others, e.IP)
+			}
+		}
+		if len(others) > 0 {
+			return fmt.Errorf("Bind IP to MAC đang TẮT nhưng bảng có %d mục do bạn tạo (%s). Bật chức năng sẽ áp dụng cả các mục này, nên DrayPulse không tự bật. Hãy kiểm tra/xoá các mục đó trong LAN → Bind IP to MAC rồi thử lại", len(others), strings.Join(others, ", "))
+		}
+	}
+	var added, removed []string
+	turnedOn := false
+	undo := func() {
+		for _, ip := range added {
+			o.run("ip bindmac del " + ip)
+		}
+		for _, ip := range removed {
+			o.run(fmt.Sprintf("ip bindmac add %s %s %s", ip, strings.ToLower(blockMAC), blockComment))
+		}
+		if turnedOn {
+			o.setOn(false)
+		}
+	}
+	for _, ip := range add {
+		if st.find(ip) != nil {
+			continue // already blocked by DrayPulse
+		}
+		if _, err := o.run(fmt.Sprintf("ip bindmac add %s %s %s", ip, strings.ToLower(blockMAC), blockComment)); err != nil {
+			undo()
+			return err
+		}
+		added = append(added, ip)
+	}
+	for _, ip := range del {
+		e := st.find(ip)
+		if e == nil {
+			continue
+		}
+		if !e.ours() {
+			undo()
+			return fmt.Errorf("mục %s trong Bind IP to MAC không phải của DrayPulse (MAC %s)", ip, e.MAC)
+		}
+		if _, err := o.run("ip bindmac del " + ip); err != nil {
+			undo()
+			return err
+		}
+		removed = append(removed, ip)
+	}
+	if !st.On && len(add) > 0 {
+		if err := o.setOn(true); err != nil {
+			undo()
+			return err
+		}
+		turnedOn = true
+	}
+	after, err := o.show()
+	if err != nil {
+		undo()
+		return err
+	}
+	for _, ip := range add {
+		if e := after.find(ip); e == nil || !e.ours() || !after.On {
+			undo()
+			return fmt.Errorf("router không lưu mục chặn cho %s (đọc lại không thấy IP này gắn với MAC chặn)", ip)
+		}
+	}
+	for _, ip := range del {
+		if after.find(ip) != nil {
+			undo()
+			return fmt.Errorf("router vẫn còn mục chặn %s sau khi xoá", ip)
+		}
+	}
+	if turnedOn {
+		if err := h.saveTurnedOn(rs, true); err != nil {
+			return err
+		}
+	}
+	// nothing of DrayPulse's left: switch the function off if DrayPulse switched it on
+	rs.mu.RLock()
+	wasOurs := rs.cfg.Opts.Block.TurnedOn
+	rs.mu.RUnlock()
+	if wasOurs && len(after.Entries) == 0 && after.On {
+		if err := o.setOn(false); err == nil {
+			h.saveTurnedOn(rs, false)
+		}
+	}
+	return nil
+}
+
+// observed maps what the router currently sees: IP → MAC and MAC → IPs,
+// plus MACs per DHCP host name. Rows carrying DrayPulse's blocking MAC
+// (a static ARP entry the router may create) are ignored.
+type observed struct {
+	ipMAC   map[string]string
+	macIPs  map[string][]string
+	hostMAC map[string][]string
+}
+
+func observe(arp, lease []Row) observed {
+	ob := observed{ipMAC: map[string]string{}, macIPs: map[string][]string{}, hostMAC: map[string][]string{}}
+	add := func(ip, mac, host string, prefer bool) {
+		mac = normMAC(mac)
+		if ip == "" || mac == "" || mac == blockMAC {
+			return
+		}
+		if _, ok := ob.ipMAC[ip]; ok && !prefer {
+			return
+		}
+		ob.ipMAC[ip] = mac
+		if !slicesContains(ob.macIPs[mac], ip) {
+			ob.macIPs[mac] = append(ob.macIPs[mac], ip)
+		}
+		if h := strings.ToLower(strings.TrimSpace(host)); h != "" && !slicesContains(ob.hostMAC[h], mac) {
+			ob.hostMAC[h] = append(ob.hostMAC[h], mac)
+		}
+	}
+	for _, l := range lease {
+		add(firstNonEmpty(l["active-address"], l["address"]), l["mac-address"], l["host-name"], false)
+	}
+	for _, a := range arp { // ARP is the live mapping: it wins over DHCP
+		if truthy(a["invalid"]) {
+			continue
+		}
+		add(a["address"], a["mac-address"], a["host"], true)
+	}
+	return ob
+}
+
+func (h *Hub) currentObs(rs *RState) observed {
+	rs.mu.RLock()
+	defer rs.mu.RUnlock()
+	return observe(rs.Sections["arp"], rs.Sections["lease"])
+}
+
+func (h *Hub) refreshHasBlocks(rs *RState, routerID int64) {
+	n := 0
+	if d, err := h.st.ListDevices(routerID); err == nil {
+		n += len(d)
+	}
+	rs.hasBlocks.Store(n > 0)
+}
+
+// BlockDevice blocks a device by MAC: every IP it uses now, and every IP it
+// gets later, is blocked. ip may name an address seen with it right now.
+func (h *Hub) BlockDevice(ctx context.Context, routerID int64, mac, ip, name, host, note string, matchHost bool, by string) (*Device, error) {
+	mac = normMAC(mac)
+	if mac == "" || mac == zeroMAC || mac == blockMAC || mac == "FF:FF:FF:FF:FF:FF" {
+		return nil, errors.New("địa chỉ MAC không hợp lệ")
+	}
+	rs, cfg, err := h.blockPrep(routerID)
+	if err != nil {
+		return nil, err
+	}
+	rs.blockMu.Lock()
+	defer rs.blockMu.Unlock()
+	devs, err := h.st.ListDevices(routerID)
+	if err != nil {
+		return nil, err
+	}
+	for _, d := range devs {
+		if d.MAC == mac {
+			return nil, errors.New("thiết bị này đã bị chặn")
+		}
+	}
+	host = strings.TrimSpace(host)
+	if matchHost && host == "" {
+		return nil, errors.New("thiết bị không có tên máy (HOST ID) nên không thể bắt theo tên khi đổi MAC")
+	}
+	ips := h.currentObs(rs).macIPs[mac]
+	if ip != "" && !slicesContains(ips, ip) {
+		ips = append(ips, ip)
+	}
+	var add []string
+	for _, x := range ips {
+		if err := h.checkBlockTarget(rs, x); err != nil {
+			return nil, fmt.Errorf("%s: %v", x, err)
+		}
+		add = append(add, x)
+	}
+	if len(add) > 0 {
+		o, done, err := h.bindSession(ctx, rs)
+		if err != nil {
+			return nil, err
+		}
+		err = h.bindTx(o, rs, add, nil)
+		done()
+		if err != nil {
+			return nil, err
+		}
+	}
+	now := nowMs()
+	d := Device{MAC: mac, Name: name, Host: host, Note: note, ByUser: by, At: now, MatchHost: matchHost, IPs: add}
+	if err := h.st.AddDevice(routerID, d); err != nil {
+		return nil, err
+	}
+	for _, x := range add {
+		h.st.AddBlock(routerID, Block{IP: x, MAC: mac, Name: name, ByUser: by, At: now})
+	}
+	rs.hasBlocks.Store(true)
+	var eff effects
+	what := "chưa thấy IP, sẽ chặn ngay khi thiết bị xuất hiện"
+	if len(add) > 0 {
+		what = "IP " + strings.Join(add, ", ")
+	}
+	eff.add(now, "warning", "⛔", fmt.Sprintf("Đã chặn thiết bị %s (%s, %s) – bởi %s", firstNonEmpty(name, host, mac), mac, what, by), false)
+	h.apply(cfg, eff)
+	return &d, nil
+}
+
+func (h *Hub) bindSession(ctx context.Context, rs *RState) (*bindOps, func(), error) {
+	cli, done, err := h.blockCLI(rs)
+	if err != nil {
+		return nil, nil, err
+	}
+	return &bindOps{cli: cli, ctx: ctx}, done, nil
+}
+
+// BlockClient blocks a single IP without tying it to a device.
 func (h *Hub) BlockClient(ctx context.Context, routerID int64, ip, mac, name, note, by string) (*Block, error) {
 	ip = strings.TrimSpace(ip)
 	rs, cfg, err := h.blockPrep(routerID)
@@ -266,70 +504,20 @@ func (h *Hub) BlockClient(ctx context.Context, routerID int64, ip, mac, name, no
 			return nil, errors.New("IP này đã bị chặn")
 		}
 	}
-	cli, done, err := h.blockCLI(rs)
+	o, done, err := h.bindSession(ctx, rs)
 	if err != nil {
 		return nil, err
 	}
 	defer done()
-	o := &bindOps{cli: cli, ctx: ctx}
-	st, err := o.show()
-	if err != nil {
+	if err := h.bindTx(o, rs, []string{ip}, nil); err != nil {
 		return nil, err
 	}
-	if e := st.find(ip); e != nil && !e.ours() {
-		return nil, fmt.Errorf("IP %s đã có trong bảng Bind IP to MAC của router (gắn với %s): DrayPulse không sửa mục do bạn tạo", ip, e.MAC)
-	}
-	if !st.On {
-		var others []string
-		for _, e := range st.Entries {
-			if !e.ours() {
-				others = append(others, e.IP)
-			}
-		}
-		if len(others) > 0 {
-			return nil, fmt.Errorf("Bind IP to MAC đang TẮT nhưng bảng có %d mục do bạn tạo (%s). Bật chức năng sẽ áp dụng cả các mục này, nên DrayPulse không tự bật. Hãy kiểm tra/xoá các mục đó trong LAN → Bind IP to MAC rồi thử lại", len(others), strings.Join(others, ", "))
-		}
-	}
-	turnedOn := false
-	undo := func() {
-		o.run("ip bindmac del " + ip)
-		if turnedOn {
-			o.setOn(false)
-		}
-	}
-	if st.find(ip) == nil {
-		if _, err := o.run(fmt.Sprintf("ip bindmac add %s %s %s", ip, strings.ToLower(blockMAC), blockComment)); err != nil {
-			undo()
-			return nil, err
-		}
-	}
-	if !st.On {
-		if err := o.setOn(true); err != nil {
-			undo()
-			return nil, err
-		}
-		turnedOn = true
-	}
-	after, err := o.show()
-	if err != nil {
-		undo()
-		return nil, err
-	}
-	if e := after.find(ip); e == nil || e.MAC != blockMAC || !after.On {
-		undo()
-		return nil, fmt.Errorf("router không lưu mục chặn cho %s (đọc lại không thấy IP này gắn với MAC chặn)", ip)
-	}
-	if turnedOn {
-		if err := h.saveTurnedOn(rs, true); err != nil {
-			return nil, err
-		}
-	}
-	b := Block{IP: ip, MAC: normMAC(mac), Name: name, Note: note, ByUser: by, At: nowMs()}
+	b := Block{IP: ip, Name: name, Note: note, ByUser: by, At: nowMs()}
 	if err := h.st.AddBlock(routerID, b); err != nil {
 		return nil, err
 	}
 	var eff effects
-	eff.add(nowMs(), "warning", "⛔", fmt.Sprintf("Đã chặn %s khỏi mạng – bởi %s", blockLabel(b), by), false)
+	eff.add(nowMs(), "warning", "⛔", fmt.Sprintf("Đã chặn IP %s khỏi mạng – bởi %s", blockLabel(b), by), false)
 	h.apply(cfg, eff)
 	return &b, nil
 }
@@ -341,8 +529,7 @@ func blockLabel(b Block) string {
 	return b.IP
 }
 
-// UnblockClient removes DrayPulse's entry for an IP. When no entries are
-// left and DrayPulse had switched the function on, it switches it off again.
+// UnblockClient removes a manual IP-only block.
 func (h *Hub) UnblockClient(ctx context.Context, routerID int64, ip, by string) error {
 	rs, cfg, err := h.blockPrep(routerID)
 	if err != nil {
@@ -363,57 +550,194 @@ func (h *Hub) UnblockClient(ctx context.Context, routerID int64, ip, by string) 
 	if target == nil {
 		return errors.New("IP này không bị chặn")
 	}
-	cli, done, err := h.blockCLI(rs)
+	if target.MAC != "" {
+		return fmt.Errorf("IP %s đang bị chặn theo thiết bị %s: hãy bỏ chặn thiết bị đó", ip, target.MAC)
+	}
+	o, done, err := h.bindSession(ctx, rs)
 	if err != nil {
 		return err
 	}
 	defer done()
-	o := &bindOps{cli: cli, ctx: ctx}
-	st, err := o.show()
-	if err != nil {
+	if err := h.bindTx(o, rs, nil, []string{ip}); err != nil {
 		return err
-	}
-	if e := st.find(ip); e != nil {
-		if !e.ours() {
-			return fmt.Errorf("mục %s trong Bind IP to MAC không còn là của DrayPulse (MAC %s): kiểm tra trên router", ip, e.MAC)
-		}
-		if _, err := o.run("ip bindmac del " + ip); err != nil {
-			return err
-		}
-		if st, err = o.show(); err != nil {
-			return err
-		}
-		if st.find(ip) != nil {
-			return fmt.Errorf("router vẫn còn mục chặn %s sau khi xoá", ip)
-		}
-	}
-	rs.mu.RLock()
-	turnedOn := rs.cfg.Opts.Block.TurnedOn
-	rs.mu.RUnlock()
-	if turnedOn && len(st.Entries) == 0 && st.On {
-		if err := o.setOn(false); err != nil {
-			return err
-		}
-		if err := h.saveTurnedOn(rs, false); err != nil {
-			return err
-		}
 	}
 	if err := h.st.DeleteBlock(routerID, ip); err != nil {
 		return err
 	}
 	var eff effects
-	eff.add(nowMs(), "info", "✅", fmt.Sprintf("Đã bỏ chặn %s – bởi %s", blockLabel(*target), by), false)
+	eff.add(nowMs(), "info", "✅", fmt.Sprintf("Đã bỏ chặn IP %s – bởi %s", blockLabel(*target), by), false)
 	h.apply(cfg, eff)
 	return nil
 }
 
+// UnblockDevice removes a device block and every IP blocked for it.
+func (h *Hub) UnblockDevice(ctx context.Context, routerID int64, mac, by string) error {
+	mac = normMAC(mac)
+	rs, cfg, err := h.blockPrep(routerID)
+	if err != nil {
+		return err
+	}
+	rs.blockMu.Lock()
+	defer rs.blockMu.Unlock()
+	devs, err := h.st.ListDevices(routerID)
+	if err != nil {
+		return err
+	}
+	var target *Device
+	for i := range devs {
+		if devs[i].MAC == mac {
+			target = &devs[i]
+		}
+	}
+	if target == nil {
+		return errors.New("thiết bị này không bị chặn")
+	}
+	if len(target.IPs) > 0 {
+		o, done, err := h.bindSession(ctx, rs)
+		if err != nil {
+			return err
+		}
+		err = h.bindTx(o, rs, nil, target.IPs)
+		done()
+		if err != nil {
+			return err
+		}
+	}
+	if err := h.st.DeleteDevice(routerID, mac); err != nil {
+		return err
+	}
+	h.refreshHasBlocks(rs, routerID)
+	var eff effects
+	eff.add(nowMs(), "info", "✅", fmt.Sprintf("Đã bỏ chặn thiết bị %s (%s) – bởi %s", firstNonEmpty(target.Name, target.Host, mac), mac, by), false)
+	h.apply(cfg, eff)
+	return nil
+}
+
+// followBlocks keeps device blocks up to date with what the router sees:
+//   - a blocked MAC that got another IP (new DHCP lease) → block that IP,
+//   - an IP blocked for a device but now used by another, unblocked MAC → release it,
+//   - with MatchHost, a new MAC carrying the device's DHCP host name → block it too.
+//
+// It runs after every client read and every 15 s while devices are blocked.
+func (h *Hub) followBlocks(ctx context.Context, rs *RState, arp, lease []Row) {
+	if !rs.hasBlocks.Load() || !rs.blockMu.TryLock() {
+		return
+	}
+	defer rs.blockMu.Unlock()
+	rs.mu.RLock()
+	cfg := rs.cfg
+	rs.mu.RUnlock()
+	if !cfg.Opts.Block.Enabled {
+		return
+	}
+	devs, err := h.st.ListDevices(cfg.ID)
+	if err != nil || len(devs) == 0 {
+		return
+	}
+	blocks, _ := h.st.ListBlocks(cfg.ID)
+	owner := map[string]string{} // blocked IP → device MAC ("" = manual)
+	for _, b := range blocks {
+		owner[b.IP] = b.MAC
+	}
+	ob := observe(arp, lease)
+	blocked := map[string]bool{}
+	for _, d := range devs {
+		blocked[d.MAC] = true
+	}
+	now := nowMs()
+	var eff effects
+	var newDevs []Device
+	// 1. same host name, new MAC
+	for _, d := range devs {
+		if !d.MatchHost || d.Host == "" {
+			continue
+		}
+		for _, m := range ob.hostMAC[strings.ToLower(d.Host)] {
+			if blocked[m] {
+				continue
+			}
+			blocked[m] = true
+			nd := Device{MAC: m, Name: d.Name, Host: d.Host, Note: d.Note, ByUser: "DrayPulse", At: now, MatchHost: true,
+				Origin: "cùng tên máy với " + d.MAC}
+			newDevs = append(newDevs, nd)
+			eff.add(now, "warning", "⛔", fmt.Sprintf("Thiết bị bị chặn %s xuất hiện với MAC mới %s (cùng tên máy) – đã tự chặn", firstNonEmpty(d.Name, d.Host), m), true)
+		}
+	}
+	for _, nd := range newDevs {
+		if err := h.st.AddDevice(cfg.ID, nd); err != nil {
+			log.Printf("chặn thiết bị %s: %v", nd.MAC, err)
+		}
+		devs = append(devs, nd)
+	}
+	// 2. IPs to add / release
+	var add, del []string
+	addFor := map[string]string{}
+	for _, d := range devs {
+		for _, ip := range ob.macIPs[d.MAC] {
+			if o, ok := owner[ip]; ok && (o == d.MAC || o == "") {
+				if o == "" { // a manual IP block now belongs to the device
+					h.st.AddBlock(cfg.ID, Block{IP: ip, MAC: d.MAC, Name: d.Name, ByUser: "DrayPulse", At: now})
+				}
+				continue
+			}
+			if h.checkBlockTarget(rs, ip) != nil {
+				continue
+			}
+			add, addFor[ip] = append(add, ip), d.MAC
+		}
+	}
+	for ip, o := range owner {
+		if o == "" {
+			continue
+		}
+		if m, seen := ob.ipMAC[ip]; seen && m != o && !blocked[m] {
+			del = append(del, ip)
+		}
+	}
+	if len(add) == 0 && len(del) == 0 {
+		if len(eff.alerts) > 0 {
+			h.apply(cfg, eff)
+		}
+		return
+	}
+	cctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	o, done, err := h.bindSession(cctx, rs)
+	if err != nil {
+		log.Printf("theo dõi thiết bị bị chặn: %v", err)
+		return
+	}
+	defer done()
+	if err := h.bindTx(o, rs, add, del); err != nil {
+		eff.add(now, "warning", "⚠️", "Không cập nhật được danh sách chặn trên router: "+err.Error(), true)
+		h.apply(cfg, eff)
+		return
+	}
+	names := map[string]string{}
+	for _, d := range devs {
+		names[d.MAC] = firstNonEmpty(d.Name, d.Host, d.MAC)
+	}
+	for _, ip := range add {
+		mac := addFor[ip]
+		h.st.AddBlock(cfg.ID, Block{IP: ip, MAC: mac, Name: names[mac], ByUser: "DrayPulse", At: now})
+		eff.add(now, "warning", "⛔", fmt.Sprintf("Thiết bị bị chặn %s nhận IP mới %s – đã chặn IP này", names[mac], ip), false)
+	}
+	for _, ip := range del {
+		h.st.DeleteBlock(cfg.ID, ip)
+		eff.add(now, "info", "↩️", fmt.Sprintf("Nhả chặn IP %s: thiết bị khác (%s) đang dùng IP này", ip, ob.ipMAC[ip]), false)
+	}
+	h.apply(cfg, eff)
+}
+
 // BlockInfo is the blocking summary shown with a router.
 type BlockInfo struct {
-	Blocks []Block `json:"blocks"`
+	Devices []Device `json:"devices"`
+	IPs     []Block  `json:"ips"` // every blocked IP (device-owned and manual)
 }
 
 // BlockStatus compares DrayPulse's list with the router (read-only).
 type BlockStatus struct {
+	Devices []Device `json:"devices"`
 	Blocks  []Block  `json:"blocks"`
 	On      *bool    `json:"on"`
 	Strict  bool     `json:"strict"`
@@ -427,7 +751,11 @@ func (h *Hub) BlockState(ctx context.Context, routerID int64, live bool) (*Block
 	if err != nil {
 		return nil, err
 	}
-	out := &BlockStatus{Blocks: blocks, Missing: []string{}, Extra: []string{}}
+	devs, err := h.st.ListDevices(routerID)
+	if err != nil {
+		return nil, err
+	}
+	out := &BlockStatus{Devices: devs, Blocks: blocks, Missing: []string{}, Extra: []string{}}
 	if !live {
 		return out, nil
 	}
@@ -437,12 +765,12 @@ func (h *Hub) BlockState(ctx context.Context, routerID int64, live bool) (*Block
 	}
 	rs.blockMu.Lock()
 	defer rs.blockMu.Unlock()
-	cli, done, err := h.blockCLI(rs)
+	o, done, err := h.bindSession(ctx, rs)
 	if err != nil {
 		return nil, err
 	}
 	defer done()
-	st, err := (&bindOps{cli: cli, ctx: ctx}).show()
+	st, err := o.show()
 	if err != nil {
 		return nil, err
 	}
@@ -464,4 +792,24 @@ func (h *Hub) BlockState(ctx context.Context, routerID int64, live bool) (*Block
 		}
 	}
 	return out, nil
+}
+
+// followTick re-reads ARP and DHCP every 15 s while devices are blocked, so a
+// blocked device that gets a new IP is cut off again within seconds.
+func (h *Hub) followTick(ctx context.Context, rs *RState, src Source) {
+	if !rs.hasBlocks.Load() || time.Since(rs.lastFollow) < 15*time.Second {
+		return
+	}
+	rs.lastFollow = time.Now()
+	d := asDraytek(src)
+	if d == nil || d.cli == nil {
+		return
+	}
+	cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	out, err := d.cli.Run(cctx, "ip arp status", "srv dhcp status")
+	if err != nil {
+		return
+	}
+	h.followBlocks(ctx, rs, parseARP(out["ip arp status"]), parseDHCP(out["srv dhcp status"]))
 }

@@ -72,7 +72,7 @@ func TestBlockUnblockFlow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bm.on || len(bm.entries) != 1 || bm.entries[0].MAC != blockMAC || bm.entries[0].Comment != "DrayPulse" || b.MAC != "F0:2F:74:55:00:21" {
+	if !bm.on || len(bm.entries) != 1 || bm.entries[0].MAC != blockMAC || bm.entries[0].Comment != "DrayPulse" || b.MAC != "" { // IP-only block: owned by no device
 		t.Fatalf("router state %+v %+v", bm, b)
 	}
 	if r2, _ := st.GetRouter(r.ID); !r2.Opts.Block.TurnedOn {
@@ -105,7 +105,7 @@ func TestBlockUnblockFlow(t *testing.T) {
 	for _, e := range evs {
 		all += e.Msg + "\n"
 	}
-	if !strings.Contains(all, "Đã chặn LAPTOP-GD (192.168.1.21) khỏi mạng – bởi admin") || !strings.Contains(all, "Đã bỏ chặn") {
+	if !strings.Contains(all, "Đã chặn IP LAPTOP-GD (192.168.1.21) khỏi mạng – bởi admin") || !strings.Contains(all, "Đã bỏ chặn") {
 		t.Fatalf("events:\n%s", all)
 	}
 	for _, c := range bm.Log {
@@ -211,3 +211,108 @@ func TestVlanEventsAndPool(t *testing.T) {
 func itoaInt(i int) string { return strconv.Itoa(i) }
 
 func hex2(i int) string { return fmt.Sprintf("%02X", i) }
+
+func TestBlockDeviceFollowsItsIPs(t *testing.T) {
+	bm := &simBindMAC{}
+	h, r, st := blockHarness(t, bm)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	rs := h.get(r.ID)
+	const A, B, C = "A4:C6:9A:00:00:23", "3C:52:82:11:22:33", "DA:11:22:33:44:55"
+	rs.mu.Lock()
+	rs.Sections["arp"] = []Row{{"address": "192.168.1.21", "mac-address": A, "host": "Galaxy-S24"}}
+	rs.mu.Unlock()
+
+	if _, err := h.BlockDevice(ctx, r.ID, A, "", "Điện thoại lạ", "Galaxy-S24", "", true, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	ips := func() []string {
+		var l []string
+		for _, e := range bm.entries {
+			l = append(l, e.IP)
+		}
+		return l
+	}
+	if got := ips(); len(got) != 1 || got[0] != "192.168.1.21" || !bm.on {
+		t.Fatalf("initial block %v", got)
+	}
+	// DHCP hands the blocked phone a new address: it must be blocked too
+	h.followBlocks(ctx, rs, nil, []Row{{"address": "192.168.1.40", "mac-address": A, "host-name": "Galaxy-S24"}})
+	if got := ips(); len(got) != 2 || got[1] != "192.168.1.40" {
+		t.Fatalf("new IP not followed: %v", got)
+	}
+	// the router may show the blocking MAC for a blocked IP: never treat that as another device
+	h.followBlocks(ctx, rs, []Row{{"address": "192.168.1.40", "mac-address": blockMAC}}, nil)
+	if len(ips()) != 2 {
+		t.Fatal("blocking MAC in ARP must be ignored")
+	}
+	// the old address now belongs to an innocent device: release it
+	h.followBlocks(ctx, rs, []Row{{"address": "192.168.1.21", "mac-address": B}}, nil)
+	if got := ips(); len(got) != 1 || got[0] != "192.168.1.40" {
+		t.Fatalf("old IP not released: %v", got)
+	}
+	// the phone randomises its MAC but keeps its host name: block the new MAC
+	h.followBlocks(ctx, rs, nil, []Row{{"address": "192.168.1.41", "mac-address": C, "host-name": "galaxy-s24"}})
+	devs, _ := st.ListDevices(r.ID)
+	if len(devs) != 2 || devs[1].MAC != C || !strings.Contains(devs[1].Origin, A) || len(devs[1].IPs) != 1 || devs[1].IPs[0] != "192.168.1.41" {
+		t.Fatalf("host-name match: %+v", devs)
+	}
+	msgs, _ := st.DueOutbox(nowMs()+1, 20)
+	_ = msgs // no chat configured; the event itself is checked below
+	evs, _ := st.ListEvents(nil, 30)
+	all := ""
+	for _, e := range evs {
+		all += e.Msg + "\n"
+	}
+	for _, want := range []string{"nhận IP mới 192.168.1.40", "Nhả chặn IP 192.168.1.21", "xuất hiện với MAC mới " + C} {
+		if !strings.Contains(all, want) {
+			t.Errorf("missing event %q in:\n%s", want, all)
+		}
+	}
+	// nothing changes when nothing moved
+	n := len(bm.Log)
+	h.followBlocks(ctx, rs, []Row{{"address": "192.168.1.40", "mac-address": A}}, nil)
+	if len(bm.Log) != n {
+		t.Fatalf("idle follow must not touch the router: %v", bm.Log[n:])
+	}
+	// unblocking a device removes all of its IPs, the other device stays blocked
+	if err := h.UnblockDevice(ctx, r.ID, A, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	if got := ips(); len(got) != 1 || got[0] != "192.168.1.41" || !bm.on {
+		t.Fatalf("after unblocking A: %v", got)
+	}
+	if err := h.UnblockDevice(ctx, r.ID, C, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	if len(bm.entries) != 0 || bm.on || rs.hasBlocks.Load() {
+		t.Fatal("everything must be cleaned up and the function switched off")
+	}
+}
+
+func TestBlockDeviceNotYetSeen(t *testing.T) {
+	bm := &simBindMAC{}
+	h, r, _ := blockHarness(t, bm)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	rs := h.get(r.ID)
+	if _, err := h.BlockDevice(ctx, r.ID, "62:1B:77:00:00:22", "", "", "", "", false, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	if len(bm.entries) != 0 || len(bm.Log) != 0 {
+		t.Fatal("no IP known yet: nothing to write")
+	}
+	h.followBlocks(ctx, rs, []Row{{"address": "192.168.1.77", "mac-address": "62-1b-77-00-00-22"}}, nil)
+	if len(bm.entries) != 1 || bm.entries[0].IP != "192.168.1.77" {
+		t.Fatalf("device not blocked when it appeared: %+v", bm.entries)
+	}
+	if _, err := h.BlockDevice(ctx, r.ID, "62:1B:77:00:00:22", "", "", "", "", false, "admin"); err == nil {
+		t.Fatal("double block must fail")
+	}
+	if _, err := h.BlockDevice(ctx, r.ID, "11:22:33:44:55:66", "", "", "", "", true, "admin"); err == nil {
+		t.Fatal("host matching without a host name must be refused")
+	}
+	if err := h.UnblockClient(ctx, r.ID, "192.168.1.77", "admin"); err == nil {
+		t.Fatal("a device-owned IP must be unblocked through its device")
+	}
+}

@@ -16,7 +16,7 @@ Telegram/Zalo và trợ lý AI, nhưng lớp đọc router được viết lại
 - **WAN đa đường**: link + Internet từng WAN, IP public, đổi IP, tự gợi ý WAN đang bật trên router.
 - **VPN**: bảng LAN-to-LAN / Remote Dial-in đang kết nối, cảnh báo VPN PPTP.
 - **VLAN**: bấm vào từng VLAN/subnet để xem client của nó; VID, cổng thành viên (kèm trạng thái link), subnet, client và mức dùng DHCP; cảnh báo khi VLAN bị đổi cấu hình hoặc DHCP sắp hết địa chỉ.
-- **Chặn client**: một nút trong tab Client chặn IP khỏi mạng qua bảng Bind IP to MAC của router – không cần chuẩn bị trên router, không đụng tới mục do bạn tạo, đọc lại sau mỗi lệnh ghi và tự hoàn tác nếu router không nhận.
+- **Chặn client theo thiết bị**: nút Chặn trong tab Client chặn mọi IP của một MAC qua bảng Bind IP to MAC của router; DrayPulse kiểm tra DHCP/ARP mỗi 15 giây để chặn ngay IP mới mà thiết bị nhận, nhả IP cũ khi máy khác dùng lại, và (tuỳ chọn) tự chặn MAC mới mang cùng tên máy. Không cần chuẩn bị trên router, không đụng tới mục do bạn tạo.
 - **Theo dõi thiết bị**: ping camera, switch, AP, NAS… mỗi 30 giây (từ máy DrayPulse hoặc từ router). Độ trễ và tỷ lệ sẵn sàng 24 giờ.
 - **Client**: gộp DHCP lease và ARP; tên máy (HOST ID, NetBIOS, mDNS), hãng theo MAC, cổng LAN (P1…).
 - **Sơ đồ mạng kéo thả**, **biểu đồ lịch sử** lưu lượng/CPU/RAM từ 1 giờ đến 30 ngày (bộ đếm 32-bit của DrayOS được tự nối dài thành 64-bit, không bị nhảy số khi tràn).

@@ -8,6 +8,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -139,9 +140,12 @@ func TestDraytekSourceSNMP2962(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	walk := loadSnmprec(t, "snmp_vigor2962.snmprec")
+	var mu sync.Mutex // the simulated agent reads these from its own goroutine
 	ticks := uint32(100000)
 	in := uint(4294967000) // close to wrap
 	sim, err := startSimSNMP(ctx, "public", func() map[string]gosnmp.SnmpPDU {
+		mu.Lock()
+		defer mu.Unlock()
 		walk[oidSysUpTime] = pduTicks(ticks)
 		walk["1.3.6.1.2.1.2.2.1.10.4"] = pduC32(in)
 		return walk
@@ -183,7 +187,9 @@ func TestDraytekSourceSNMP2962(t *testing.T) {
 	}
 	// 32-bit wrap: counter goes 4294967000 → 1000 ⇒ +1296 bytes
 	first, _ := strconv.ParseUint(w1["rx-byte"], 10, 64)
+	mu.Lock()
 	in, ticks = 1000, 101500
+	mu.Unlock()
 	ifs, _ = src.Fetch(tctx, "/interface", nil)
 	for _, i := range ifs {
 		if i["name"] == "WAN1" {

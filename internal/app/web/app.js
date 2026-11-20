@@ -736,29 +736,53 @@ function clientNameForm(routerId, c) {
 }
 
 function blockForm(routerId, c) {
-  const ip = h('input', { value: c.ip || '', class: 'mono', placeholder: '192.168.1.50', required: true });
+  const ip = h('input', { value: c.ip || '', class: 'mono', placeholder: '192.168.1.50' });
+  const mac = h('input', { value: c.mac || '', class: 'mono', placeholder: 'AA:BB:CC:DD:EE:FF (để trống = chỉ chặn IP)' });
   const note = h('input', { maxlength: 200, placeholder: 'Lý do (tuỳ chọn)' });
-  modal('Chặn ' + (c.name || c.ip || 'IP'), h('div', { class: 'stack' },
-    field('IP cần chặn', ip), field('Ghi chú', note),
-    h('p', { class: 'hint' }, 'DrayPulse thêm IP này vào bảng “Bind IP to MAC” của router, gắn với một MAC không tồn tại. Router sẽ từ chối mọi gói tin từ IP đó: thiết bị không vào được Internet và các mạng khác. Không cần cấu hình trước trên router.'),
-    h('p', { class: 'hint' }, 'Thiết bị tự đổi sang IP khác (đặt IP tĩnh) có thể lách được; với máy nhận IP qua DHCP thì router thường cấp lại đúng IP cũ.')),
+  const host = c.host || '';
+  const byHost = h('input', { type: 'checkbox', checked: !!host && !!c.randomMac });
+  const ipOnly = h('input', { type: 'checkbox' });
+  const hostRow = host ? h('div', null, check(`Chặn luôn khi thiết bị đổi MAC nhưng vẫn mang tên máy “${host}”`, byHost),
+    h('div', { class: 'hint' }, 'Hữu ích với điện thoại bật “địa chỉ Wi-Fi riêng tư”. Cảnh báo: máy khác trùng tên (ví dụ “iPhone”) cũng sẽ bị chặn.')) : null;
+  const sync = () => { if (hostRow) hostRow.classList.toggle('hidden', ipOnly.checked || !mac.value.trim()); };
+  [mac, ipOnly].forEach(x => x.addEventListener('input', sync)); ipOnly.addEventListener('change', sync);
+  modal('Chặn ' + (c.name || c.ip || c.mac || 'thiết bị'), h('div', { class: 'stack' },
+    h('div', { class: 'form' }, field('MAC thiết bị', mac), field('IP hiện tại', ip)),
+    h('p', { class: 'hint' }, h('b', null, 'Chặn theo thiết bị (MAC): '), 'DrayPulse chặn mọi IP mà MAC này đang dùng và theo dõi bảng DHCP/ARP mỗi 15 giây: router cấp IP mới nào cho thiết bị thì IP đó bị chặn ngay; IP cũ được nhả khi thiết bị khác dùng lại. Chặn thực hiện qua bảng LAN → Bind IP to MAC của router.'),
+    hostRow,
+    check('Chỉ chặn IP này (không theo dõi thiết bị)', ipOnly),
+    field('Ghi chú', note),
+    h('p', { class: 'hint' }, 'Thiết bị đổi sang MAC hoàn toàn mới và đổi cả tên máy sẽ là “thiết bị mới” với router; DrayPulse báo “Thiết bị mới vào mạng” (bật “Báo khi có thiết bị lạ lần đầu vào mạng” trong Cài đặt) để bạn chặn tiếp.')),
     [{ t: 'Huỷ', fn: x => x() }, { t: 'Chặn', cls: 'danger', submit: true, fn: async close => {
       try {
-        await api('POST', `/api/admin/routers/${routerId}/blocks`, { ip: ip.value.trim(), mac: c.mac || '', name: c.name || '', note: note.value });
-        close(); toast('Đã chặn ' + (c.name || ip.value), 'ok'); refresh();
+        const m = mac.value.trim(), i = ip.value.trim();
+        if (!m && !i) throw new Error('Cần MAC hoặc IP');
+        await api('POST', `/api/admin/routers/${routerId}/blocks`, { mac: ipOnly.checked ? '' : m, ip: i, name: c.name || '', host: host, note: note.value,
+          matchHost: !!host && byHost.checked && !ipOnly.checked, ipOnly: ipOnly.checked || !m });
+        close(); toast('Đã chặn ' + (c.name || m || i), 'ok'); refresh();
       } catch (e) { toast(e.message, 'bad'); }
     } }]);
+  sync();
 }
 
 async function unblock(routerId, b, btn) {
-  if (!confirm(`Bỏ chặn ${b.name ? b.name + ' (' + b.ip + ')' : b.ip}?`)) return;
-  await busy(btn, async () => { await api('DELETE', `/api/admin/routers/${routerId}/blocks/${encodeURIComponent(b.ip)}`); toast('Đã bỏ chặn', 'ok'); refresh(); });
+  const dev = !!b.ips; // a device record has its IP list
+  const label = b.name || b.host || (dev ? b.mac : b.ip);
+  if (!confirm(dev ? `Bỏ chặn thiết bị ${label}${b.ips.length ? ' (IP ' + b.ips.join(', ') + ')' : ''}?` : `Bỏ chặn IP ${b.ip}?`)) return;
+  await busy(btn, async () => {
+    await api('DELETE', dev ? `/api/admin/routers/${routerId}/devices/${encodeURIComponent(b.mac)}` : `/api/admin/routers/${routerId}/blocks/${encodeURIComponent(b.ip)}`);
+    toast('Đã bỏ chặn', 'ok'); refresh();
+  });
 }
 
 function clientCols(id, view) {
   const watched = new Set(view.monitors.map(m => m.ip));
-  const bl = view.blocking, blocked = new Map(((bl && bl.blocks) || []).map(b => [b.ip, b]));
-  const isBlocked = c => c.ip && blocked.has(c.ip);
+  const bl = view.blocking;
+  const devs = new Map(((bl && bl.devices) || []).map(d => [d.mac, d]));
+  const ipOnly = new Map(((bl && bl.ips) || []).filter(b => !b.mac).map(b => [b.ip, b]));
+  const blockOf = c => devs.get(c.mac) || (c.ip && ipOnly.get(c.ip)) || null;
+  const blocked = { get: blockOf };
+  const isBlocked = c => !!blockOf(c);
   const cols = [
     { t: 'Trạng thái', v: c => (isBlocked(c) ? 2 : 0) + (c.online ? 1 : 0), r: c => h('div', { class: 'row' }, c.online ? badge('up', 'Hoạt động') : badge(c.since ? 'down' : 'unknown', c.since ? 'Ngừng' : 'Chưa rõ'), isBlocked(c) ? badge('down', '⛔ Bị chặn') : null) },
     { t: 'Tên máy', v: c => (c.name || '~' + (c.vendor || '')) + ' ' + c.mac + ' ' + (c.host || ''), r: clientName },
@@ -772,8 +796,8 @@ function clientCols(id, view) {
   ];
   if (me.role === 'admin') cols.push({ t: '', r: c => h('div', { class: 'row' },
     h('button', { class: 'sm', title: 'Đặt tên', onclick: () => clientNameForm(id, c) }, 'Đặt tên'),
-    bl && c.ip ? (isBlocked(c) ? h('button', { class: 'sm', onclick: e => unblock(id, blocked.get(c.ip), e.target) }, 'Bỏ chặn')
-      : h('button', { class: 'sm danger', title: 'Chặn IP này khỏi mạng (Bind IP to MAC trên router)', onclick: () => blockForm(id, c) }, 'Chặn')) : null,
+    bl ? (isBlocked(c) ? h('button', { class: 'sm', onclick: e => unblock(id, blockOf(c), e.target) }, 'Bỏ chặn')
+      : h('button', { class: 'sm danger', title: 'Chặn thiết bị này khỏi mạng', onclick: () => blockForm(id, c) }, 'Chặn')) : null,
     watched.has(c.ip) ? null : h('button', { class: 'sm', title: 'Ping định kỳ và báo khi mất kết nối', onclick: () => monitorForm(id, view, { name: c.name || c.ip, ip: c.ip }) }, '+ Theo dõi')) });
   return { cols, isBlocked, bl, blocked };
 }
@@ -788,17 +812,20 @@ function tabClients(id) {
     const { cols, isBlocked, bl, blocked } = clientCols(id, view);
     const rows = view.clients.filter(c => filter === 'online' ? c.online : filter === 'offline' ? !c.online : filter === 'noname' ? !c.name : filter === 'blocked' ? isBlocked(c) : true);
     p.draw(cols, rows, { empty: filter === 'blocked' ? 'Không có client nào bị chặn.' : 'Chưa có dữ liệu client (cập nhật mỗi phút).', rowClass: c => c.online ? null : 'off' });
-    // blocked list (also shows blocked devices that left the ARP table)
+    // blocked devices (also those that left the ARP table) and IP-only blocks
     bp.el.classList.toggle('hidden', !bl);
     if (bl) {
+      const list = [...(bl.devices || []), ...((bl.ips || []).filter(b => !b.mac))];
       bp.draw([
-        { t: 'IP', v: b => ipKey(b.ip), r: b => h('b', { class: 'mono' }, b.ip) },
-        { t: 'Thiết bị', v: b => b.name || b.mac, r: b => h('div', null, b.name || '–', b.mac ? h('div', { class: 'mono small muted' }, b.mac) : null) },
+        { t: 'Thiết bị', v: b => b.name || b.host || b.mac || b.ip, r: b => h('div', null, h('b', null, b.name || b.host || (b.ips ? '–' : 'Chỉ IP')),
+          b.ips ? h('div', { class: 'mono small muted' }, b.mac) : null, b.origin ? h('div', { class: 'small muted' }, 'tự chặn: ' + b.origin) : null) },
+        { t: 'IP đang chặn', v: b => (b.ips || [b.ip]).join(' '), r: b => { const l = b.ips || [b.ip]; return l.length ? h('div', { class: 'row wrap' }, l.map(x => h('span', { class: 'chip bad mono' }, x))) : h('span', { class: 'muted small' }, 'chờ thiết bị xuất hiện'); } },
+        { t: 'Theo dõi', v: b => b.ips ? (b.matchHost ? 2 : 1) : 0, r: b => b.ips ? (b.matchHost ? `MAC + tên máy “${b.host}”` : 'MAC') : 'chỉ IP' },
         { t: 'Chặn lúc', v: b => b.at, r: b => h('span', { class: 'small' }, fmtTime(b.at) + ' · ' + b.byUser) },
         { t: 'Ghi chú', v: b => b.note },
         { t: '', r: b => me.role === 'admin' ? h('button', { class: 'sm', onclick: e => unblock(id, b, e.target) }, 'Bỏ chặn') : null },
-      ], bl.blocks || [], { empty: 'Chưa chặn client nào.' });
-      fill(bnote, 'Chặn bằng bảng “Bind IP to MAC” của router (LAN → Bind IP to MAC): mỗi IP bị chặn được gắn với một MAC không tồn tại, ghi chú “DrayPulse”.');
+      ], list, { empty: 'Chưa chặn thiết bị nào.' });
+      fill(bnote, 'Chặn qua bảng LAN → Bind IP to MAC của router (mỗi IP bị chặn gắn với một MAC không tồn tại, ghi chú “DrayPulse”). Với thiết bị chặn theo MAC, DrayPulse kiểm tra DHCP/ARP mỗi 15 giây và chặn ngay IP mới của thiết bị.');
     }
   };
   return {
@@ -807,7 +834,7 @@ function tabClients(id) {
       p = tablePanel('Client', 'clients-' + id, seg);
       if (p.state.sort == null) { p.state.sort = 0; p.state.desc = true; }
       const live = me.role === 'admin' ? h('div', { class: 'row' },
-        h('button', { class: 'sm danger', onclick: () => blockForm(id, {}) }, '+ Chặn IP'),
+        h('button', { class: 'sm danger', onclick: () => blockForm(id, {}) }, '+ Chặn MAC/IP'),
         h('button', { class: 'sm', onclick: e => busy(e.target, async () => {
           const st = await api('GET', `/api/routers/${id}/blocks?live=1`);
           const issues = [];
@@ -815,7 +842,7 @@ function tabClients(id) {
           if (st.extra.length) issues.push('router có mục DrayPulse lạ: ' + st.extra.join(', '));
           if (st.blocks.length && st.on === false) issues.push('Bind IP to MAC đang TẮT');
           if (issues.length) toast('Lệch với router: ' + issues.join('; '), 'bad');
-          else toast(`Khớp với router: Bind IP to MAC ${st.on ? 'đang bật' : 'đang tắt'}${st.strict ? ' (strict)' : ''}, ${st.blocks.length} IP bị chặn${st.others ? `, ${st.others} mục khác do bạn tạo` : ''}`, 'ok');
+          else toast(`Khớp với router: Bind IP to MAC ${st.on ? 'đang bật' : 'đang tắt'}${st.strict ? ' (strict)' : ''}, ${st.devices.length} thiết bị, ${st.blocks.length} IP bị chặn${st.others ? `, ${st.others} mục khác do bạn tạo` : ''}`, 'ok');
         }) }, 'Đối chiếu với router')) : null;
       bp = tablePanel('Client bị chặn', 'blocked-' + id, live);
       bnote = h('p', { class: 'hint' });

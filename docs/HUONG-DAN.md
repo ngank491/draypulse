@@ -151,20 +151,32 @@ DrayOS không có bộ đếm lưu lượng riêng cho từng VLAN qua SNMP; xem
 
 ### Chặn client
 
-Chặn một IP khỏi mạng ngay từ DrayPulse, **không cần chuẩn bị gì trên router**:
+Chặn một thiết bị khỏi mạng ngay từ DrayPulse, **không cần chuẩn bị gì trên router**:
 
 1. **Router → Sửa** → tick **Cho phép DrayPulse chặn IP client** (cần Telnet/SSH) → Lưu.
-2. Tab **Client** → nút **Chặn** ở dòng thiết bị, hoặc **+ Chặn IP** trong bảng "Client bị chặn" để nhập IP bất kỳ.
+2. Tab **Client** (hoặc danh sách client của một VLAN) → nút **Chặn** ở dòng thiết bị. Hoặc **+ Chặn MAC/IP** để nhập MAC/IP bất kỳ.
 
-**Cách hoạt động:** DrayPulse dùng chức năng **LAN → Bind IP to MAC** của router. IP bị chặn được gắn với một MAC không tồn tại (`02:dd:00:00:00:01`, ghi chú `DrayPulse`), nên router từ chối mọi gói tin từ IP đó: thiết bị không ra được Internet và không sang được mạng/VLAN khác. Các lệnh dùng: `ip bindmac show / on / off / add / del` – không lệnh nào khác.
+**Chặn theo thiết bị (MAC) – mặc định, khuyên dùng:**
 
-- Chức năng được bật ở **chế độ thường** (không strict): các IP không có trong bảng vẫn dùng bình thường. Khi bỏ chặn IP cuối cùng, nếu chính DrayPulse đã bật chức năng thì sẽ tắt lại.
-- DrayPulse **không sửa hay xoá mục do bạn tạo**. Nếu chức năng đang tắt mà bảng đã có mục của bạn, DrayPulse từ chối bật (để không áp dụng nhầm các mục cũ đó) và báo rõ IP nào.
+- DrayPulse chặn mọi IP mà MAC đó đang dùng, rồi **kiểm tra bảng DHCP và ARP của router mỗi 15 giây**: router cấp IP mới nào cho thiết bị thì IP đó bị chặn ngay (ghi sự kiện "nhận IP mới … – đã chặn").
+- Khi một IP từng bị chặn được thiết bị **khác** dùng lại, DrayPulse tự nhả IP đó để không chặn nhầm máy vô tội.
+- Chặn được cả thiết bị **chưa có mặt**: nhập MAC, khi nó xuất hiện sẽ bị chặn ngay.
+- Tuỳ chọn **"Chặn luôn khi thiết bị đổi MAC nhưng vẫn mang tên máy"**: điện thoại bật "địa chỉ Wi-Fi riêng tư" thường vẫn gửi cùng tên máy (HOST ID) khi xin DHCP. MAC mới mang tên đó sẽ bị tự chặn và **gửi cảnh báo Telegram/Zalo**. Lưu ý: máy khác trùng tên (ví dụ "iPhone") cũng bị chặn.
+
+**Chỉ chặn IP:** tick "Chỉ chặn IP này" – dùng cho thiết bị đặt IP tĩnh mà bạn không biết MAC.
+
+**Cách hoạt động:** DrayPulse dùng chức năng **LAN → Bind IP to MAC** của router. Mỗi IP bị chặn được gắn với một MAC không tồn tại (`02:dd:00:00:00:01`, ghi chú `DrayPulse`), nên router từ chối mọi gói tin từ IP đó: thiết bị không ra được Internet và không sang được mạng/VLAN khác. Các lệnh dùng: `ip bindmac show / on / off / add / del` – không lệnh nào khác.
+
+- Chế độ thường (không strict): các IP không có trong bảng vẫn dùng bình thường. Khi không còn ai bị chặn, nếu chính DrayPulse đã bật chức năng thì sẽ tắt lại.
+- DrayPulse **không sửa hay xoá mục do bạn tạo**. Nếu chức năng đang tắt mà bảng đã có mục của bạn, DrayPulse từ chối bật và báo rõ IP nào.
 - Không chặn được: IP của router, gateway, máy chạy DrayPulse, IP ngoài mạng LAN.
-- Mỗi thay đổi được đọc lại (`ip bindmac show`); nếu router không lưu, DrayPulse hoàn tác. Nút **Đối chiếu với router** so danh sách của DrayPulse với bảng trên router.
-- Mọi lần chặn/bỏ chặn được ghi vào **Sự kiện** kèm người thực hiện.
+- Mỗi thay đổi được đọc lại; nếu router không lưu, DrayPulse hoàn tác. Nút **Đối chiếu với router** so danh sách với bảng trên router.
 
-Giới hạn: máy cùng subnet vẫn nói chuyện trực tiếp với nhau qua switch (không đi qua router). Thiết bị tự đặt IP tĩnh khác có thể lách; máy nhận IP qua DHCP thường được cấp lại đúng IP cũ.
+**Giới hạn cần biết:**
+
+- Thiết bị đổi sang **MAC hoàn toàn mới và đổi cả tên máy** thì với router là một thiết bị mới – không phần mềm nào nhận ra nó chỉ qua mạng. Bật **Cài đặt → Báo khi có thiết bị lạ lần đầu vào mạng** để được báo ngay và chặn tiếp. Cách triệt để duy nhất là **danh sách trắng**: chỉ thiết bị đã duyệt mới vào được mạng.
+- Trong khoảng tối đa ~15 giây sau khi nhận IP mới, thiết bị có thể vào mạng trước khi bị chặn lại.
+- Máy cùng subnet vẫn liên lạc trực tiếp với nhau qua switch (không đi qua router).
 
 ---
 

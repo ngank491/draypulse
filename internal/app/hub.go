@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -113,8 +114,10 @@ type RState struct {
 	stop context.CancelFunc
 	done chan struct{}
 
-	src     Source     // the running reader (CLI session reused for blocking)
-	blockMu sync.Mutex // one block/unblock at a time per router
+	src        Source      // the running reader (CLI session reused for blocking)
+	blockMu    sync.Mutex  // one block/unblock at a time per router
+	hasBlocks  atomic.Bool // devices are blocked: follow their IPs every 15 s
+	lastFollow time.Time   // only touched by the poll loop
 }
 
 type persisted struct {
@@ -374,6 +377,7 @@ func (h *Hub) load(r *Router, onStart bool) error {
 	if err := h.loadClients(rs); err != nil {
 		return err
 	}
+	h.refreshHasBlocks(rs, r.ID)
 	h.mu.Lock()
 	h.rs[r.ID] = rs
 	h.mu.Unlock()
@@ -582,7 +586,14 @@ func (h *Hub) pollOnce(ctx context.Context, rs *RState, src Source, lastSlow, la
 			h.observeSection(rs, sec.Name, rows, nowMs())
 		}
 		h.updateClients(rs, nowMs())
+		if rs.hasBlocks.Load() {
+			rs.mu.RLock()
+			arp, lease := rs.Sections["arp"], rs.Sections["lease"]
+			rs.mu.RUnlock()
+			h.followBlocks(ctx, rs, arp, lease)
+		}
 	}
+	h.followTick(ctx, rs, src)
 	if time.Since(*lastProbe) >= 29*time.Second {
 		*lastProbe = time.Now()
 		h.runProbes(ctx, rs, src)
@@ -1124,9 +1135,11 @@ func (h *Hub) View(id int64) (RouterView, bool) {
 func (h *Hub) view(rs *RState, detail bool) RouterView {
 	var avail map[int64]float64
 	var blocks []Block
+	var devices []Device
 	if detail {
 		avail, _ = h.st.Availability(rs.id, nowMs()-86400000)
 		blocks, _ = h.st.ListBlocks(rs.id)
+		devices, _ = h.st.ListDevices(rs.id)
 	}
 	loc := h.settings.Loc()
 	rs.mu.RLock()
@@ -1204,7 +1217,7 @@ func (h *Hub) view(rs *RState, detail bool) RouterView {
 		v.Clients = rs.clientList()
 		v.VLANs, v.LANs = rs.vlanViews()
 		if c.Opts.Block.Enabled {
-			v.Blocking = &BlockInfo{Blocks: blocks}
+			v.Blocking = &BlockInfo{Devices: devices, IPs: blocks}
 		}
 		v.Ifaces = append([]Iface{}, rs.Ifaces...)
 		v.Sections, v.SectionAt = map[string][]Row{}, map[string]int64{}
