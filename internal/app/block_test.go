@@ -316,3 +316,59 @@ func TestBlockDeviceNotYetSeen(t *testing.T) {
 		t.Fatal("a device-owned IP must be unblocked through its device")
 	}
 }
+
+// Firmware that lists only the entries (nothing at all when empty): blocking
+// must still work, verified through the listed entry.
+func TestBlockWithEntriesOnlyFirmware(t *testing.T) {
+	bm := &simBindMAC{EntriesOnly: true}
+	h, r, st := blockHarness(t, bm)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if _, err := h.BlockDevice(ctx, r.ID, "7E:48:A0:68:B9:52", "192.168.1.216", "realme-16-5G", "realme-16-5G", "", true, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	if !bm.on || len(bm.entries) != 1 || bm.entries[0].IP != "192.168.1.216" {
+		t.Fatalf("router state %+v", bm)
+	}
+	if r2, _ := st.GetRouter(r.ID); !r2.Opts.Block.TurnedOn {
+		t.Fatal("TurnedOn must be remembered")
+	}
+	live, err := h.BlockState(ctx, r.ID, true)
+	if err != nil || live.On != nil || len(live.Missing) != 0 {
+		t.Fatalf("live %+v %v", live, err)
+	}
+	if err := h.UnblockDevice(ctx, r.ID, "7E:48:A0:68:B9:52", "admin"); err != nil {
+		t.Fatal(err)
+	}
+	if bm.on || len(bm.entries) != 0 {
+		t.Fatal("must be cleaned up and switched off")
+	}
+}
+
+// Firmware whose "show" prints nothing even with entries: DrayPulse cannot
+// verify, so it must undo and report the raw output.
+func TestBlockUndoWhenShowIsSilent(t *testing.T) {
+	bm := &simBindMAC{Silent: true}
+	h, r, st := blockHarness(t, bm)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	_, err := h.BlockDevice(ctx, r.ID, "7E:48:A0:68:B9:52", "192.168.1.216", "", "", "", false, "admin")
+	if err == nil || !strings.Contains(err.Error(), "đã hoàn tác") || !strings.Contains(err.Error(), "(rỗng)") {
+		t.Fatalf("want undo with raw output, got %v", err)
+	}
+	if bm.on || len(bm.entries) != 0 {
+		t.Fatalf("router must be back as it was: %+v", bm)
+	}
+	if d, _ := st.ListDevices(r.ID); len(d) != 0 {
+		t.Fatal("nothing may be recorded")
+	}
+}
+
+func TestBindShowUnknownOutput(t *testing.T) {
+	if st := parseBindMAC("Show all IP Bind MAC entries.\n"); st.Known || len(st.Entries) != 0 {
+		t.Fatalf("%+v", st)
+	}
+	if !reBindHeader.MatchString("Show all IP Bind MAC entries.\n") || reBindHeader.MatchString("% Unknown command") {
+		t.Fatal("header detection")
+	}
+}

@@ -842,7 +842,7 @@ function tabClients(id) {
           if (st.extra.length) issues.push('router có mục DrayPulse lạ: ' + st.extra.join(', '));
           if (st.blocks.length && st.on === false) issues.push('Bind IP to MAC đang TẮT');
           if (issues.length) toast('Lệch với router: ' + issues.join('; '), 'bad');
-          else toast(`Khớp với router: Bind IP to MAC ${st.on ? 'đang bật' : 'đang tắt'}${st.strict ? ' (strict)' : ''}, ${st.devices.length} thiết bị, ${st.blocks.length} IP bị chặn${st.others ? `, ${st.others} mục khác do bạn tạo` : ''}`, 'ok');
+          else toast(`Khớp với router: Bind IP to MAC ${st.on == null ? '(firmware không in trạng thái bật/tắt)' : st.on ? 'đang bật' : 'đang tắt'}${st.strict ? ' (strict)' : ''}, ${st.devices.length} thiết bị, ${st.blocks.length} IP bị chặn${st.others ? `, ${st.others} mục khác do bạn tạo` : ''}`, 'ok');
         }) }, 'Đối chiếu với router')) : null;
       bp = tablePanel('Client bị chặn', 'blocked-' + id, live);
       bnote = h('p', { class: 'hint' });
@@ -1469,8 +1469,17 @@ function routerForm(r, view, sys) {
   const v3Box = h('div', { class: 'form full' }, field('User SNMPv3', v3user), field('Xác thực', authProto), field('Mật khẩu xác thực', authPass), field('Mã hoá', privProto), field('Mật khẩu mã hoá', privPass));
   const snmpBox = h('div', { class: 'form full' }, field('Phiên bản SNMP', snmpVer), field('Cổng SNMP', snmpPort), v2Box, v3Box,
     h('p', { class: 'hint full' }, 'SNMP cho CPU, RAM, uptime, model/firmware, lưu lượng từng cổng/WAN và danh sách VPN đang kết nối.'));
+  const diagSel = h('select', { class: 'inline' }, ['sys version', 'wan status', 'show status', 'ip arp status', 'srv dhcp status', 'vlan status', 'show lan', 'sys iface', 'ip bindmac show', 'mngt rmtcfg status', 'ip dhcpc status'].map(c => h('option', { value: c }, c)));
+  const diagOut = h('pre', { class: 'small hidden' });
+  const diagBox = isNew ? null : h('div', { class: 'full stack' }, h('div', { class: 'row' }, h('span', { class: 'small' }, 'Thử lệnh xem trên router:'), diagSel,
+    h('button', { type: 'button', class: 'sm', onclick: e => busy(e.target, async () => {
+      const res = await api('POST', `/api/admin/routers/${r.id}/cli`, { cmd: diagSel.value });
+      diagOut.textContent = '> ' + res.cmd + '\n' + (res.output || '(router không in gì)');
+      diagOut.classList.remove('hidden');
+    }) }, 'Chạy')), diagOut,
+    h('p', { class: 'hint' }, 'Chỉ chạy được các lệnh xem trong danh sách. Dùng để kiểm tra định dạng output của firmware khi một chức năng báo lỗi đọc dữ liệu.'));
   const cliBox = h('div', { class: 'form full' }, field('Telnet/SSH', cli), field('Cổng', cliPort), field('Tài khoản quản trị router', user), field('Mật khẩu', pass),
-    field('Ping thiết bị LAN', pingFrom),
+    field('Ping thiết bị LAN', pingFrom), diagBox,
     h('p', { class: 'hint full' }, 'Telnet/SSH (tuỳ chọn) cho: trạng thái WAN chi tiết, IP public, bảng ARP & DHCP (client, tên máy, cổng LAN) và kiểm tra Internet riêng từng WAN bằng “ip ping … WANx”. DrayPulse chỉ gửi lệnh xem trong danh sách cố định.'));
   // --- client blocking (writes the router's Bind IP to MAC table: off by default)
   const bkOn = h('input', { type: 'checkbox', checked: !!(o.block && o.block.enabled) });

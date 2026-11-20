@@ -15,7 +15,11 @@ type simBindMAC struct {
 	entries []bindEntry
 	// IgnoreAdd makes "add" print OK but store nothing (firmware quirk test).
 	IgnoreAdd bool
-	Log       []string
+	// EntriesOnly: "show" prints only the entries, no ON/OFF lines.
+	EntriesOnly bool
+	// Silent: "show" prints nothing at all.
+	Silent bool
+	Log    []string
 }
 
 var reSimBind = regexp.MustCompile(`^ip bindmac (show|on|off|add (\S+) (\S+) (.*)|del (\S+))$`)
@@ -30,8 +34,13 @@ func (b *simBindMAC) handle(cmd string) (string, bool) {
 	switch {
 	case m[1] == "show":
 		var s strings.Builder
-		fmt.Fprintf(&s, "ip bind mac function is turned %s\nip bind mac function is STRICT %s\nShow all IP Bind MAC entries.\n",
-			map[bool]string{true: "ON", false: "OFF"}[b.on], map[bool]string{true: "ON", false: "OFF"}[b.strict])
+		if b.Silent {
+			return "", true
+		}
+		if !b.EntriesOnly {
+			fmt.Fprintf(&s, "ip bind mac function is turned %s\nip bind mac function is STRICT %s\nShow all IP Bind MAC entries.\n",
+				map[bool]string{true: "ON", false: "OFF"}[b.on], map[bool]string{true: "ON", false: "OFF"}[b.strict])
+		}
 		for _, e := range b.entries {
 			fmt.Fprintf(&s, "IP : %s bind MAC : %s HOST ID :              \nComment : %s\n", e.IP, strings.ToLower(strings.ReplaceAll(e.MAC, ":", "-")), e.Comment)
 		}

@@ -40,7 +40,9 @@ type bindEntry struct {
 type bindState struct {
 	On, Strict bool
 	Known      bool // the on/off line was found
+	Blank      bool // the router printed nothing (some firmware lists entries only)
 	Entries    []bindEntry
+	Raw        string
 }
 
 func (s bindState) find(ip string) *bindEntry {
@@ -147,17 +149,40 @@ func (o *bindOps) run(cmd string) (string, error) {
 	return text, nil
 }
 
+// rawSnippet quotes router output for error messages (diagnosing formats).
+func rawSnippet(t string) string {
+	t = strings.Join(strings.Fields(t), " ")
+	if t == "" {
+		return "(rỗng)"
+	}
+	if len(t) > 300 {
+		t = truncateUTF8(t, 300) + "…"
+	}
+	return "«" + t + "»"
+}
+
+// show reads the table. Firmware differs: the user guide prints an ON/OFF
+// line first, but some builds print only the entries (nothing at all when
+// the table is empty). Blank output therefore means "empty table, state
+// unknown"; output that is neither blank nor understood is an error.
 func (o *bindOps) show() (bindState, error) {
 	t, err := o.run("ip bindmac show")
 	if err != nil {
 		return bindState{}, err
 	}
 	st := parseBindMAC(t)
-	if !st.Known {
-		return st, fmt.Errorf("không đọc được trạng thái Bind IP to MAC (router trả về: %s)", firstLine(t))
+	st.Raw = t
+	switch {
+	case st.Known, len(st.Entries) > 0:
+	case strings.TrimSpace(t) == "" || reBindHeader.MatchString(t):
+		st.Blank = true
+	default:
+		return st, fmt.Errorf("không hiểu kết quả lệnh “ip bindmac show” của router: %s", rawSnippet(t))
 	}
 	return st, nil
 }
+
+var reBindHeader = regexp.MustCompile(`(?i)^\s*(show all ip bind mac entries\.?\s*)?$`)
 
 func (o *bindOps) setOn(on bool) error {
 	cmd := map[bool]string{true: "ip bindmac on", false: "ip bindmac off"}[on]
@@ -168,8 +193,8 @@ func (o *bindOps) setOn(on bool) error {
 	if err != nil {
 		return err
 	}
-	if st.On != on {
-		return fmt.Errorf("router không chuyển Bind IP to MAC sang %v", map[bool]string{true: "ON", false: "OFF"}[on])
+	if st.Known && st.On != on { // builds without a state line cannot be checked here
+		return fmt.Errorf("router không chuyển Bind IP to MAC sang %v (đọc lại: %s)", map[bool]string{true: "ON", false: "OFF"}[on], rawSnippet(st.Raw))
 	}
 	return nil
 }
@@ -265,7 +290,8 @@ func (h *Hub) bindTx(o *bindOps, rs *RState, add, del []string) error {
 			return fmt.Errorf("IP %s đã có trong bảng Bind IP to MAC của router (gắn với %s): DrayPulse không sửa mục do bạn tạo", ip, e.MAC)
 		}
 	}
-	if !st.On && len(add) > 0 {
+	off := !st.Known || !st.On // unknown state: switch on explicitly
+	if off && len(add) > 0 {
 		var others []string
 		for _, e := range st.Entries {
 			if !e.ours() {
@@ -314,7 +340,7 @@ func (h *Hub) bindTx(o *bindOps, rs *RState, add, del []string) error {
 		}
 		removed = append(removed, ip)
 	}
-	if !st.On && len(add) > 0 {
+	if off && len(add) > 0 {
 		if err := o.setOn(true); err != nil {
 			undo()
 			return err
@@ -327,15 +353,15 @@ func (h *Hub) bindTx(o *bindOps, rs *RState, add, del []string) error {
 		return err
 	}
 	for _, ip := range add {
-		if e := after.find(ip); e == nil || !e.ours() || !after.On {
+		if e := after.find(ip); e == nil || !e.ours() || (after.Known && !after.On) {
 			undo()
-			return fmt.Errorf("router không lưu mục chặn cho %s (đọc lại không thấy IP này gắn với MAC chặn)", ip)
+			return fmt.Errorf("router không lưu mục chặn cho %s – đã hoàn tác. Lệnh “ip bindmac show” sau khi thêm trả về: %s", ip, rawSnippet(after.Raw))
 		}
 	}
 	for _, ip := range del {
 		if after.find(ip) != nil {
 			undo()
-			return fmt.Errorf("router vẫn còn mục chặn %s sau khi xoá", ip)
+			return fmt.Errorf("router vẫn còn mục chặn %s sau khi xoá (đọc lại: %s)", ip, rawSnippet(after.Raw))
 		}
 	}
 	if turnedOn {
@@ -347,7 +373,7 @@ func (h *Hub) bindTx(o *bindOps, rs *RState, add, del []string) error {
 	rs.mu.RLock()
 	wasOurs := rs.cfg.Opts.Block.TurnedOn
 	rs.mu.RUnlock()
-	if wasOurs && len(after.Entries) == 0 && after.On {
+	if wasOurs && len(after.Entries) == 0 && (after.On || !after.Known) {
 		if err := o.setOn(false); err == nil {
 			h.saveTurnedOn(rs, false)
 		}
@@ -744,6 +770,7 @@ type BlockStatus struct {
 	Missing []string `json:"missing"` // blocked here, not on the router
 	Extra   []string `json:"extra"`   // DrayPulse entries on the router not known here
 	Others  int      `json:"others"`  // entries created by someone else
+	Raw     string   `json:"raw"`     // the router's own output, for diagnosis
 }
 
 func (h *Hub) BlockState(ctx context.Context, routerID int64, live bool) (*BlockStatus, error) {
@@ -774,8 +801,11 @@ func (h *Hub) BlockState(ctx context.Context, routerID int64, live bool) (*Block
 	if err != nil {
 		return nil, err
 	}
-	on := st.On
-	out.On, out.Strict = &on, st.Strict
+	if st.Known {
+		on := st.On
+		out.On = &on
+	}
+	out.Strict = st.Strict
 	known := map[string]bool{}
 	for _, b := range blocks {
 		known[b.IP] = true
@@ -783,6 +813,7 @@ func (h *Hub) BlockState(ctx context.Context, routerID int64, live bool) (*Block
 			out.Missing = append(out.Missing, b.IP)
 		}
 	}
+	out.Raw = st.Raw
 	for _, e := range st.Entries {
 		switch {
 		case e.ours() && !known[e.IP]:

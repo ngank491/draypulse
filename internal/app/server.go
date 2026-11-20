@@ -84,6 +84,7 @@ func (s *Server) Handler() http.Handler {
 	admin("DELETE /api/admin/routers/{id}/blocks/{ip}", s.unblockClient)
 	admin("DELETE /api/admin/routers/{id}/devices/{mac}", s.unblockDevice)
 	user("GET /api/routers/{id}/syslog", s.syslogStatus)
+	admin("POST /api/admin/routers/{id}/cli", s.runCLI)
 	admin("POST /api/admin/routers/{id}/syslog-source", s.addSyslogSource)
 	admin("DELETE /api/admin/routers/{id}/syslog-source/{ip}", s.removeSyslogSource)
 	admin("POST /api/admin/routers/test", s.testRouter)
@@ -1483,4 +1484,42 @@ func (s *Server) removeSyslogSource(w http.ResponseWriter, r *http.Request, u *U
 		}
 		return out
 	})
+}
+
+// ---------- CLI diagnostics: run one read-only command, show raw output ----------
+
+// diagCommands are offered in the UI; only these can be run from it.
+var diagCommands = []string{"sys version", "wan status", "show status", "ip arp status", "srv dhcp status",
+	"vlan status", "show lan", "sys iface", "ip bindmac show", "mngt rmtcfg status", "ip dhcpc status"}
+
+func (s *Server) runCLI(w http.ResponseWriter, r *http.Request, u *User) {
+	var in struct {
+		Cmd string `json:"cmd"`
+	}
+	if !readJSON(w, r, &in) {
+		return
+	}
+	if !slicesContains(diagCommands, in.Cmd) {
+		errJSON(w, 400, "lệnh không nằm trong danh sách cho phép")
+		return
+	}
+	rs := s.hub.get(pathID(r, "id"))
+	if rs == nil {
+		errJSON(w, 404, "không tìm thấy router")
+		return
+	}
+	cli, done, err := s.hub.blockCLI(rs)
+	if err != nil {
+		errJSON(w, 400, err.Error())
+		return
+	}
+	defer done()
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	out, err := cli.RunWrite(ctx, in.Cmd) // RunWrite: also allows the read-only "ip bindmac show"
+	if err != nil {
+		errJSON(w, 502, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"cmd": in.Cmd, "output": out[in.Cmd]})
 }
