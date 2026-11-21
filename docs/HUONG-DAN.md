@@ -113,6 +113,8 @@ Router ở chi nhánh khác: nối về bằng VPN LAN-to-LAN (IPsec/WireGuard) 
 
 **Thiết bị LAN được ping từ đâu?** Mặc định từ máy DrayPulse (cần đi tới được mạng LAN đó). Nếu DrayPulse ở mạng khác và không có đường tới thiết bị, chọn **Ping thiết bị LAN = Từ router** (cần Telnet/SSH).
 
+> Mỗi lần ping qua router mất khoảng 5 giây và dùng chung phiên Telnet/SSH duy nhất với việc đọc ARP/DHCP và chặn client. Theo dõi nhiều thiết bị (trên khoảng 5) bằng **Từ router** làm phiên này bận liên tục; nếu máy DrayPulse đi tới được các thiết bị đó, hãy để **Từ máy DrayPulse**.
+
 ---
 
 ## 3. Theo dõi thiết bị và đặt tên client
@@ -402,6 +404,7 @@ Nếu tài khoản bị lỗi (hết credit, key sai, quá tải) và bạn bậ
 | Chặn báo "router không lưu mục chặn" | Router từ chối lệnh `ip bindmac add` (firmware khác cú pháp); DrayPulse đã hoàn tác | Báo lại kèm model/firmware |
 | Cảnh báo "Đã TẠM DỪNG tự động chặn" | Trong 1 giờ DrayPulse định tự chặn nhiều IP hơn giới hạn (thường do chặn nhầm thiết bị dùng chung hoặc DHCP cấp lại hàng loạt) | Xem tab Client → Client bị chặn, bỏ chặn mục sai (hoặc **Bỏ chặn tất cả**), rồi bấm **Tiếp tục tự động chặn**. Tăng giới hạn ở Cài đặt nếu cần |
 | Chặn báo "nằm trong danh sách Không bao giờ chặn" | MAC/IP (hoặc MAC đang dùng IP đó) thuộc danh sách bảo vệ | Bỏ khỏi danh sách ở Cài đặt → Chặn client an toàn nếu thật sự cần chặn |
+| Bấm “Chặn” hiện “Đang xử lý…” rất lâu rồi báo lỗi hết thời gian | Phiên Telnet/SSH của router bận liên tục, thường vì nhiều thiết bị được ping **Từ router** | Nâng cấp lên 0.6.3 (lệnh chặn được ưu tiên) và chuyển **Ping thiết bị LAN = Từ máy DrayPulse** nếu máy DrayPulse ping được các thiết bị đó |
 | Chặn nhầm nhiều máy cùng lúc | Chặn sai thiết bị, hoặc dữ liệu từ bản cũ (theo tên máy) | Tab Client → **Bỏ chặn tất cả** |
 | Client hiện "Ngừng" hàng loạt, sự kiện "DHCP … sắp hết / đã có lại địa chỉ trống" lặp lại; SSH vào router báo "No connection is available now" | Router hết phiên Telnet/SSH. Bản trước 0.6.1 giữ phiên quá lâu rồi mở lại dồn dập làm đầy các phiên (Vigor 3912S/2926 tự đóng phiên rảnh sau khoảng 16–20 giây) | Nâng cấp lên 0.6.1: DrayPulse đăng xuất phiên rảnh sau 10 giây, chờ router trả phiên rồi mới mở lại, và giữ nguyên dữ liệu cũ khi tạm thời không đọc được CLI. Tránh để nhiều công cụ cùng giữ phiên SSH vào router |
 | Không thấy dòng nào ở tab Syslog | Router chưa gửi, sai cổng, tường lửa server chặn UDP, hoặc router gửi từ IP khác IP đã khai báo | Xem khung chẩn đoán đầu tab Syslog: cổng đang nghe, các IP gửi chưa gán (bấm **Gán**) |
