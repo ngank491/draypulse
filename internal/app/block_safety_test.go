@@ -281,7 +281,7 @@ func TestReleaseOnIPReuse(t *testing.T) {
 	if _, err := h.BlockDevice(ctx, r.ID, A, "192.168.1.60", "", "", "", false, "admin"); err != nil {
 		t.Fatal(err)
 	}
-	arp := []Row{{"address": "192.168.1.60", "mac-address": A}}  // stale
+	arp := []Row{{"address": "192.168.1.60", "mac-address": A}}   // stale
 	lease := []Row{{"address": "192.168.1.60", "mac-address": M}} // the new owner
 	h.followBlocks(ctx, rs, arp, lease)
 	if got := bm.ips(); len(got) != 0 {
@@ -311,11 +311,11 @@ func TestParseDHCPSyslog(t *testing.T) {
 	}{
 		{"DHCP server: assigned 192.168.1.50 to 00-1e-c2-aa-bb-cc", "192.168.1.50", "00:1E:C2:AA:BB:CC", true},
 		{"[DHCP] ACK IP:192.168.20.7 MAC:7e:48:a0:68:b9:52 Host:Redmi-12", "192.168.20.7", "7E:48:A0:68:B9:52", true},
-		{"DHCP request from 7e:48:a0:68:b9:52", "", "", true},                                    // no IP: wake only
-		{"DHCP server 192.168.1.1 offers 192.168.1.9 to 7e:48:a0:68:b9:52", "", "", true},        // two IPs: ambiguous
-		{"DHCP lease 8.8.8.8 to 7e:48:a0:68:b9:52", "", "", true},                                // public IP is not a LAN lease
-		{"WAN1 DHCP client got 100.64.1.2", "", "", false},                                        // no lease keyword… "got" is not one
-		{"Admin login from 192.168.1.20 00:11:22:33:44:55", "", "", false},                        // not DHCP
+		{"DHCP request from 7e:48:a0:68:b9:52", "", "", true},                             // no IP: wake only
+		{"DHCP server 192.168.1.1 offers 192.168.1.9 to 7e:48:a0:68:b9:52", "", "", true}, // two IPs: ambiguous
+		{"DHCP lease 8.8.8.8 to 7e:48:a0:68:b9:52", "", "", true},                         // public IP is not a LAN lease
+		{"WAN1 DHCP client got 100.64.1.2", "", "", false},                                // no lease keyword… "got" is not one
+		{"Admin login from 192.168.1.20 00:11:22:33:44:55", "", "", false},                // not DHCP
 	}
 	for _, c := range cases {
 		ip, mac, ok := parseDHCPSyslog(c.line)
