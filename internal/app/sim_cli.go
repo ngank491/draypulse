@@ -6,6 +6,7 @@ import (
 	"net"
 	"strings"
 	"sync/atomic"
+	"time"
 )
 
 // simCLI is a tiny DrayOS-like Telnet server used by the demo router and the
@@ -17,7 +18,17 @@ type simCLI struct {
 	user, pass string
 	handler    func(cmd string) string
 	logins     atomic.Int32
+	// DrayOS session limits (zero = unlimited / never): at most MaxSessions
+	// at once, an idle session is dropped after IdleTimeout, and a slot is
+	// freed only ReleaseDelay after its session ended.
+	MaxSessions  int32
+	IdleTimeout  time.Duration
+	ReleaseDelay time.Duration
+	active       atomic.Int32
+	busy         atomic.Int32 // connections refused with the busy banner
 }
+
+const simBusyBanner = "\n\rNo connection is available now. Try again later!"
 
 func startSimCLI(ctx context.Context, name, user, pass string, handler func(string) string) (*simCLI, error) {
 	ln, err := net.Listen("tcp4", "127.0.0.1:0")
@@ -44,6 +55,22 @@ const simMore = "--- MORE ---   ['q': Quit, 'Enter': New Lines, 'Space Bar': Nex
 
 func (s *simCLI) serve(c net.Conn) {
 	defer c.Close()
+	if n := s.active.Add(1); s.MaxSessions > 0 && n > s.MaxSessions {
+		s.active.Add(-1)
+		s.busy.Add(1)
+		c.Write([]byte(simBusyBanner))
+		return
+	}
+	defer func() {
+		if s.ReleaseDelay > 0 {
+			time.AfterFunc(s.ReleaseDelay, func() { s.active.Add(-1) })
+			return
+		}
+		s.active.Add(-1)
+	}()
+	if s.IdleTimeout > 0 {
+		c = &idleConn{Conn: c, idle: s.IdleTimeout}
+	}
 	r := bufio.NewReader(c)
 	w := func(x string) { c.Write([]byte(x)) }
 	readLine := func() (string, bool) {
@@ -118,4 +145,15 @@ func (s *simCLI) serve(c net.Conn) {
 		}
 		w(s.name + "> ")
 	}
+}
+
+// idleConn drops the session when the client sends nothing for idle.
+type idleConn struct {
+	net.Conn
+	idle time.Duration
+}
+
+func (c *idleConn) Read(b []byte) (int, error) {
+	c.Conn.SetReadDeadline(time.Now().Add(c.idle))
+	return c.Conn.Read(b)
 }

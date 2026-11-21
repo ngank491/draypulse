@@ -116,6 +116,16 @@ func (d *draytekSource) Close() {
 
 var errNeedCLI = errors.New("cần bật Telnet/SSH để đọc mục này")
 
+// cliFetchErr: without a CLI the section is not supported; a CLI that fails
+// (router busy, timeout) is an error, so the poller keeps the previous rows
+// instead of replacing them with an empty table.
+func cliFetchErr(err error) error {
+	if errors.Is(err, errNeedCLI) {
+		return errNotSupported
+	}
+	return err
+}
+
 // slow-cycle CLI commands, read together in one session and cached briefly
 var drayCLICmds = []string{"sys version", "wan status", "ip arp status", "srv dhcp status", "vlan status", "show lan", "show session"}
 
@@ -178,7 +188,7 @@ func (d *draytekSource) Fetch(ctx context.Context, path string, _ []string) ([]R
 	case "/ip/dhcp-server/lease":
 		out, err := d.cliData(ctx)
 		if err != nil {
-			return nil, errNotSupported
+			return nil, cliFetchErr(err)
 		}
 		return parseDHCP(out["srv dhcp status"]), nil
 	case "/ip/route":
@@ -190,25 +200,25 @@ func (d *draytekSource) Fetch(ctx context.Context, path string, _ []string) ([]R
 	case "/draytek/wan":
 		rows, err := d.cliWANs(ctx)
 		if err != nil {
-			return nil, errNotSupported
+			return nil, cliFetchErr(err)
 		}
 		return rows, nil
 	case "/draytek/vlan":
 		out, err := d.cliData(ctx)
 		if err != nil {
-			return nil, errNotSupported
+			return nil, cliFetchErr(err)
 		}
 		return parseVlanStatus(out["vlan status"]), nil
 	case "/draytek/session":
 		out, err := d.cliData(ctx)
 		if err != nil {
-			return nil, errNotSupported
+			return nil, cliFetchErr(err)
 		}
 		return parseShowSession(out["show session"]), nil
 	case "/draytek/lan":
 		out, err := d.cliData(ctx)
 		if err != nil {
-			return nil, errNotSupported
+			return nil, cliFetchErr(err)
 		}
 		return parseShowLan(out["show lan"]), nil
 	case "/system/health":
@@ -461,7 +471,8 @@ func (d *draytekSource) addresses(ctx context.Context) ([]Row, error) {
 }
 
 func (d *draytekSource) arp(ctx context.Context) ([]Row, error) {
-	if out, err := d.cliData(ctx); err == nil {
+	out, cliErr := d.cliData(ctx)
+	if cliErr == nil {
 		rows := parseARP(out["ip arp status"])
 		var keep []Row
 		for _, r := range rows {
@@ -473,11 +484,11 @@ func (d *draytekSource) arp(ctx context.Context) ([]Row, error) {
 		return keep, nil
 	}
 	if d.snmp == nil {
-		return nil, errNotSupported
+		return nil, cliFetchErr(cliErr)
 	}
 	rows, err := d.snmp.arpTable(ctx)
 	if err != nil {
-		return nil, errNotSupported // most DrayOS builds have no ipNetToMediaTable
+		return nil, cliFetchErr(cliErr) // most DrayOS builds have no ipNetToMediaTable
 	}
 	for _, r := range rows {
 		r["interface"] = d.ifName(r["ifindex"])
@@ -490,7 +501,7 @@ func (d *draytekSource) arp(ctx context.Context) ([]Row, error) {
 func (d *draytekSource) bridgeHosts(ctx context.Context) ([]Row, error) {
 	out, err := d.cliData(ctx)
 	if err != nil {
-		return nil, errNotSupported
+		return nil, cliFetchErr(err)
 	}
 	var rows []Row
 	for _, r := range parseARP(out["ip arp status"]) {

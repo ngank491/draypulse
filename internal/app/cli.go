@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -108,6 +109,42 @@ func (cc *cliConn) learnPrompt() *regexp.Regexp {
 	return regexp.MustCompile(`(?m)^\s*` + regexp.QuoteMeta(name) + `>\s*$`)
 }
 
+// errCLIBusy: every Telnet/SSH slot of the router is taken. DrayOS then prints
+// "No connection is available now. Try again later!" instead of a login (or an
+// SSH version line) and hangs up.
+var errCLIBusy = errors.New("router đã hết phiên Telnet/SSH (“No connection is available now”) – phiên cũ chưa được router giải phóng, thử lại sau")
+
+var reCLIBusy = regexp.MustCompile(`(?i)no connection is available`)
+
+// peekConn replays bytes read ahead from a connection.
+type peekConn struct {
+	net.Conn
+	r *bufio.Reader
+}
+
+func (p peekConn) Read(b []byte) (int, error) { return p.r.Read(b) }
+
+// sshBusyCheck reads the first bytes of an SSH connection: a server with a
+// free slot starts with "SSH-", a full DrayOS prints its busy banner.
+func sshBusyCheck(conn net.Conn) (net.Conn, error) {
+	br := bufio.NewReader(conn)
+	head, err := br.Peek(4)
+	if err == nil && string(head) == "SSH-" {
+		return peekConn{conn, br}, nil
+	}
+	more, _ := br.Peek(br.Buffered())
+	if br.Buffered() < 80 {
+		more, _ = br.Peek(80) // the banner is short and followed by a hang-up
+	}
+	if reCLIBusy.Match(more) || reCLIBusy.Match(head) {
+		return nil, errCLIBusy
+	}
+	if err != nil {
+		return nil, fmt.Errorf("SSH: router không gửi lời chào SSH (%v)", err)
+	}
+	return peekConn{conn, br}, nil
+}
+
 func (c *cliClient) dial(ctx context.Context) (*cliConn, error) {
 	addr := net.JoinHostPort(c.cfg.Host, strconv.Itoa(c.cfg.Port))
 	d := net.Dialer{Timeout: 8 * time.Second}
@@ -116,6 +153,14 @@ func (c *cliClient) dial(ctx context.Context) (*cliConn, error) {
 		return nil, friendlyCLIErr(err)
 	}
 	conn.SetDeadline(time.Now().Add(30 * time.Second))
+	if c.cfg.Proto == "ssh" {
+		pc, err := sshBusyCheck(conn)
+		if err != nil {
+			conn.Close()
+			return nil, err
+		}
+		conn = pc
+	}
 	if c.cfg.Proto != "ssh" {
 		cc := &cliConn{raw: conn, rw: conn, closeFn: func() { conn.Close() }, telnet: true}
 		cc.startReader()
@@ -201,6 +246,27 @@ func (cc *cliConn) startReader() {
 }
 
 func (cc *cliConn) close() { cc.closeFn() }
+
+// shutdown logs out and waits (briefly) until the router hangs up. DrayOS
+// frees the CLI slot only when its side of the session ends; dropping the
+// connection without waiting leaves half-closed sessions that fill all slots.
+func (cc *cliConn) shutdown() {
+	cc.raw.SetDeadline(time.Now().Add(cliExitWait + time.Second))
+	cc.write("exit\r\n")
+	t := time.NewTimer(cliExitWait)
+	defer t.Stop()
+	for {
+		select {
+		case _, ok := <-cc.readCh:
+			if ok {
+				continue
+			}
+		case <-t.C:
+		}
+		cc.close()
+		return
+	}
+}
 
 func (cc *cliConn) write(s string) error {
 	_, err := cc.rw.Write([]byte(s))
@@ -349,6 +415,9 @@ func (cc *cliConn) login(ctx context.Context, user, pass string, proto string) e
 	for range 6 {
 		i, text, err := cc.expect(ctx, 10*time.Second, reLoginUser, reLoginPass, rePromptEnd)
 		if err != nil {
+			if reCLIBusy.MatchString(text) {
+				return errCLIBusy
+			}
 			return err
 		}
 		switch i {
@@ -388,7 +457,8 @@ func firstLine(s string) string {
 }
 
 // Run executes read-only commands and returns each output. The session is
-// kept open between polls (DrayOS logs every login) and re-opened on error.
+// kept open while it is in use (DrayOS logs every login), closed cleanly once
+// idle, and re-opened on error.
 func (c *cliClient) Run(ctx context.Context, cmds ...string) (map[string]string, error) {
 	for _, cmd := range cmds {
 		if !cliCommandAllowed(cmd) {
@@ -412,7 +482,7 @@ func (c *cliClient) run(ctx context.Context, cmds []string) (map[string]string, 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.cc != nil && time.Since(c.cc.lastUse) > cliIdle {
-		c.closeLocked()
+		c.closeLocked() // log out before the router drops the idle session itself
 	}
 	reused := c.cc != nil
 	out, err := c.runLocked(ctx, cmds)
@@ -426,17 +496,22 @@ func (c *cliClient) run(ctx context.Context, cmds []string) (map[string]string, 
 	return out, err
 }
 
-// cliIdle is how long an unused session is kept (DrayOS drops idle CLI users after a few minutes).
-const cliIdle = 100 * time.Second
+// cliIdle is how long an unused session is kept. Vigor 3912S/2926 drop an
+// idle SSH session after about 16–20 s and free its slot a moment later, so
+// DrayPulse logs out well before that instead of reusing a dead session.
+var cliIdle = 10 * time.Second
+
+// cliExitWait bounds the wait for the router to hang up after "exit".
+var cliExitWait = 2 * time.Second
+
+// cliBusyWait is the pause before trying again when all CLI slots are taken
+// (a session that just ended is freed by DrayOS within about a second).
+var cliBusyWait = 1500 * time.Millisecond
 
 func (c *cliClient) runLocked(ctx context.Context, cmds []string) (map[string]string, error) {
 	if c.cc == nil {
-		cc, err := c.dial(ctx)
+		cc, err := c.open(ctx)
 		if err != nil {
-			return nil, err
-		}
-		if err := cc.login(ctx, c.cfg.User, c.cfg.Pass, c.cfg.Proto); err != nil {
-			cc.close()
 			return nil, err
 		}
 		c.cc = cc
@@ -472,9 +547,31 @@ func (c *cliClient) Close() {
 
 func (c *cliClient) closeLocked() {
 	if c.cc != nil {
-		c.cc.write("exit\r\n")
-		c.cc.close()
+		c.cc.shutdown()
 		c.cc = nil
+	}
+}
+
+// open dials and logs in. When the router has no free slot, it waits a
+// little and tries again (twice), as the slot of a session that just ended
+// is released shortly after.
+func (c *cliClient) open(ctx context.Context) (*cliConn, error) {
+	for attempt := 0; ; attempt++ {
+		cc, err := c.dial(ctx)
+		if err == nil {
+			if err = cc.login(ctx, c.cfg.User, c.cfg.Pass, c.cfg.Proto); err == nil {
+				return cc, nil
+			}
+			cc.close()
+		}
+		if !errors.Is(err, errCLIBusy) || attempt >= 2 {
+			return nil, err
+		}
+		select {
+		case <-ctx.Done():
+			return nil, err
+		case <-time.After(cliBusyWait * time.Duration(attempt+1)):
+		}
 	}
 }
 
