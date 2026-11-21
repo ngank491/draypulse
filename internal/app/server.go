@@ -83,6 +83,10 @@ func (s *Server) Handler() http.Handler {
 	admin("POST /api/admin/routers/{id}/blocks", s.blockClient)
 	admin("DELETE /api/admin/routers/{id}/blocks/{ip}", s.unblockClient)
 	admin("DELETE /api/admin/routers/{id}/devices/{mac}", s.unblockDevice)
+	admin("POST /api/admin/routers/{id}/blocks/unblock-all", s.unblockAll)
+	admin("POST /api/admin/routers/{id}/blocks/resume", s.resumeAutoBlock)
+	admin("POST /api/admin/routers/{id}/suggestions/{mac}", s.acceptSuggestion)
+	admin("DELETE /api/admin/routers/{id}/suggestions/{mac}", s.dismissSuggestion)
 	user("GET /api/routers/{id}/syslog", s.syslogStatus)
 	user("GET /api/routers/{id}/flows", s.routerFlows)
 	admin("POST /api/admin/routers/{id}/cli", s.runCLI)
@@ -705,6 +709,7 @@ func (s *Server) applyRouter(r *Router, in routerInput) error {
 		// whether DrayPulse switched Bind IP to MAC on is router state, not a setting;
 		// extra syslog senders are managed from the Syslog tab
 		in.Opts.Block.TurnedOn = r.Opts.Block.TurnedOn
+		in.Opts.Block.AutoPaused, in.Opts.Block.AutoPausedAt = r.Opts.Block.AutoPaused, r.Opts.Block.AutoPausedAt
 		in.Opts.SyslogFrom = r.Opts.SyslogFrom
 		r.Opts = in.Opts
 	}
@@ -1385,6 +1390,45 @@ func (s *Server) unblockDevice(w http.ResponseWriter, r *http.Request, u *User) 
 	defer cancel()
 	if err := s.hub.UnblockDevice(ctx, pathID(r, "id"), r.PathValue("mac"), u.Username); err != nil {
 		errJSON(w, 502, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+
+// unblockAll removes every DrayPulse block of a router (the UI asks first).
+func (s *Server) unblockAll(w http.ResponseWriter, r *http.Request, u *User) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
+	defer cancel()
+	n, err := s.hub.UnblockAll(ctx, pathID(r, "id"), u.Username)
+	if err != nil {
+		errJSON(w, 502, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]int{"removed": n})
+}
+
+func (s *Server) resumeAutoBlock(w http.ResponseWriter, r *http.Request, u *User) {
+	if err := s.hub.ResumeAuto(pathID(r, "id"), u.Username); err != nil {
+		errJSON(w, 400, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+
+func (s *Server) acceptSuggestion(w http.ResponseWriter, r *http.Request, u *User) {
+	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
+	defer cancel()
+	d, err := s.hub.AcceptSuggestion(ctx, pathID(r, "id"), r.PathValue("mac"), u.Username)
+	if err != nil {
+		errJSON(w, 502, err.Error())
+		return
+	}
+	writeJSON(w, 200, d)
+}
+
+func (s *Server) dismissSuggestion(w http.ResponseWriter, r *http.Request, u *User) {
+	if err := s.hub.DismissSuggestion(pathID(r, "id"), r.PathValue("mac"), u.Username); err != nil {
+		errJSON(w, 404, err.Error())
 		return
 	}
 	writeJSON(w, 200, map[string]bool{"ok": true})

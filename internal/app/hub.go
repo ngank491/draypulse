@@ -119,6 +119,9 @@ type RState struct {
 	hasBlocks  atomic.Bool // devices are blocked: follow their IPs every 15 s
 	flows      []flowRec   // recent firewall connections from syslog (memory only)
 	lastFollow time.Time   // only touched by the poll loop
+	autoAdds   []int64     // times of automatic blocks in the last hour (guarded by blockMu)
+	followWake chan struct{}
+	dhcpHints  []dhcpHint // recent leases seen in syslog (guarded by mu)
 }
 
 type persisted struct {
@@ -142,7 +145,8 @@ type persisted struct {
 func newRState(r Router, mons []Monitor) *RState {
 	return &RState{id: r.ID, cfg: r, monitors: mons, Conn: *newProbe(), Sections: map[string][]Row{}, SectionAt: map[string]int64{},
 		Probes: map[int64]*ProbeState{}, WANs: map[string]*WanState{},
-		IfLinks: map[string]*ProbeState{}, WanIPs: map[string]string{}, PoolFull: map[string]bool{}, Clients: map[string]*Client{}, aliases: map[string]string{}}
+		IfLinks: map[string]*ProbeState{}, WanIPs: map[string]string{}, PoolFull: map[string]bool{}, Clients: map[string]*Client{}, aliases: map[string]string{},
+		followWake: make(chan struct{}, 1)}
 }
 
 func (rs *RState) restore(b []byte) {
@@ -537,12 +541,24 @@ func (h *Hub) runPull(ctx context.Context, rs *RState, src Source, intervalS int
 	var lastSlow, lastProbe time.Time
 	t := time.NewTicker(interval)
 	defer t.Stop()
+	// blocked devices are followed every 15 s even with a longer poll
+	// interval, and at once when syslog reports a DHCP lease
+	ft := time.NewTicker(15 * time.Second)
+	defer ft.Stop()
 	for {
 		h.pollOnce(ctx, rs, src, &lastSlow, &lastProbe)
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
+	wait:
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				break wait
+			case <-ft.C:
+				h.followTick(ctx, rs, src, false)
+			case <-rs.followWake:
+				h.followTick(ctx, rs, src, true)
+			}
 		}
 	}
 }
@@ -595,7 +611,7 @@ func (h *Hub) pollOnce(ctx context.Context, rs *RState, src Source, lastSlow, la
 			h.followBlocks(ctx, rs, arp, lease)
 		}
 	}
-	h.followTick(ctx, rs, src)
+	h.followTick(ctx, rs, src, false)
 	if time.Since(*lastProbe) >= 29*time.Second {
 		*lastProbe = time.Now()
 		h.runProbes(ctx, rs, src)
@@ -1141,10 +1157,12 @@ func (h *Hub) view(rs *RState, detail bool) RouterView {
 	var avail map[int64]float64
 	var blocks []Block
 	var devices []Device
+	var suggestions []Suggestion
 	if detail {
 		avail, _ = h.st.Availability(rs.id, nowMs()-86400000)
 		blocks, _ = h.st.ListBlocks(rs.id)
 		devices, _ = h.st.ListDevices(rs.id)
+		suggestions, _ = h.st.ListSuggestions(rs.id, false)
 	}
 	loc := h.settings.Loc()
 	rs.mu.RLock()
@@ -1222,7 +1240,8 @@ func (h *Hub) view(rs *RState, detail bool) RouterView {
 		v.Clients = rs.clientList()
 		v.VLANs, v.LANs = rs.vlanViews()
 		if c.Opts.Block.Enabled {
-			v.Blocking = &BlockInfo{Devices: devices, IPs: blocks}
+			v.Blocking = &BlockInfo{Devices: devices, IPs: blocks, Suggestions: suggestions,
+				AutoPaused: c.Opts.Block.AutoPaused, AutoPausedAt: c.Opts.Block.AutoPausedAt}
 		}
 		v.Ifaces = append([]Iface{}, rs.Ifaces...)
 		v.Sections, v.SectionAt = map[string][]Row{}, map[string]int64{}

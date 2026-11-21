@@ -304,6 +304,7 @@ func (h *Hub) observeSyslog(id int64, m syslogMsg, now int64, s *syslogServer) {
 		lines = lines[len(lines)-syslogKeep:]
 	}
 	rs.Sections["syslog"], rs.SectionAt["syslog"] = lines, now
+	rs.noteSyslogDHCP(m.Text, now)
 	if m.Facility == "firewall" || reFlowAction.MatchString(m.Text) {
 		if f, ok := parseFlow(m.Text, now); ok {
 			rs.addFlow(f)
