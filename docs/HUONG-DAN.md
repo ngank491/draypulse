@@ -158,10 +158,22 @@ Chặn một thiết bị khỏi mạng ngay từ DrayPulse, **không cần chu�
 
 **Chặn theo thiết bị (MAC) – mặc định, khuyên dùng:**
 
-- DrayPulse chặn mọi IP mà MAC đó đang dùng, rồi **kiểm tra bảng DHCP và ARP của router mỗi 15 giây**: router cấp IP mới nào cho thiết bị thì IP đó bị chặn ngay (ghi sự kiện "nhận IP mới … – đã chặn").
-- Khi một IP từng bị chặn được thiết bị **khác** dùng lại, DrayPulse tự nhả IP đó để không chặn nhầm máy vô tội.
+- DrayPulse chặn mọi IP mà MAC đó đang dùng, rồi **kiểm tra bảng DHCP và ARP của router mỗi 15 giây** (kể cả khi chu kỳ đọc router dài hơn): router cấp IP mới nào cho thiết bị thì IP đó bị chặn ngay (ghi sự kiện "nhận IP mới … – đã chặn").
+- Khi một IP từng bị chặn được thiết bị **khác** dùng lại – chỉ cần **một** nguồn (ARP, bảng DHCP hoặc syslog) thấy MAC khác chưa bị chặn trên IP đó – DrayPulse **nhả IP ngay** và không chặn lại IP đó chừng nào máy kia còn xuất hiện, để không chặn nhầm máy vô tội.
+- Nếu router gửi syslog về DrayPulse (Bước D3) và dòng log có thông tin cấp IP DHCP, DrayPulse kiểm tra lại ngay (sau ~3 giây) thay vì chờ 15 giây. Dòng log chỉ được dùng để **nhả** IP (khi nó nêu đúng một IP LAN và một MAC), không bao giờ để chặn thêm.
 - Chặn được cả thiết bị **chưa có mặt**: nhập MAC, khi nó xuất hiện sẽ bị chặn ngay.
-- Tuỳ chọn **"Chặn luôn khi thiết bị đổi MAC nhưng vẫn mang tên máy"**: điện thoại bật "địa chỉ Wi-Fi riêng tư" thường vẫn gửi cùng tên máy (HOST ID) khi xin DHCP. MAC mới mang tên đó sẽ bị tự chặn và **gửi cảnh báo Telegram/Zalo**. Lưu ý: máy khác trùng tên (ví dụ "iPhone") cũng bị chặn.
+- Tuỳ chọn **"Báo cho tôi khi thiết bị đổi MAC nhưng vẫn mang tên máy"**: điện thoại bật "địa chỉ Wi-Fi riêng tư" thường vẫn gửi cùng tên máy (HOST ID) khi xin DHCP. Khi **đúng một** MAC mới (chưa bị chặn) mang tên đó xuất hiện, DrayPulse **không tự chặn** mà ghi **gợi ý chặn** và gửi cảnh báo Telegram/Zalo. Ở tab **Client → Client bị chặn → Gợi ý chặn**, bấm **Chặn** để xác nhận hoặc **Bỏ qua** (MAC đã bỏ qua sẽ không bị gợi ý lại). Nếu nhiều máy cùng mang tên đó một lúc thì không gợi ý gì.
+- **Tên máy phổ biến không bao giờ được dùng để nhận diện** (iPhone, iPad, android-\*, Galaxy-\*, Redmi-\*, OPPO-\*, vivo-\*, realme-\*… và tên dưới 3 ký tự). Chặn thiết bị có tên như vậy chỉ chặn theo MAC; sự kiện ghi rõ "không theo dõi tên máy … vì tên này phổ biến". Danh sách sửa ở **Cài đặt → Chặn client an toàn**.
+
+> **Bài học từ v0.5.0:** trước đây tuỳ chọn theo tên máy tự chặn mọi MAC mới cùng tên. Một lần chặn máy tên "Redmi-12"/"iPhone" đã lan ra hàng trăm điện thoại vô tội. Từ bản này, theo tên máy chỉ còn là gợi ý cần người duyệt.
+
+**An toàn khi chặn (Cài đặt → Chặn client an toàn):**
+
+- **Không bao giờ chặn**: danh sách MAC và/hoặc IP (máy chủ, camera, máy quản trị, AP…). Chặn tay sẽ bị từ chối; DrayPulse không bao giờ tự chặn chúng, và nếu một mục đang bị chặn được thêm vào danh sách thì IP đó được **nhả** ở lần kiểm tra kế tiếp.
+- **Tối đa số lượt tự động chặn mỗi giờ** (mặc định 5, tính riêng từng router): mỗi IP DrayPulse tự chặn (thiết bị bị chặn nhận IP mới) là một lượt. Nếu lần kiểm tra sắp vượt giới hạn, DrayPulse **không chặn thêm IP nào**, **tạm dừng tự động chặn** cho router đó, ghi sự kiện cảnh báo và gửi Telegram/Zalo. Việc nhả IP vẫn tiếp tục. Kiểm tra danh sách rồi bấm **Tiếp tục tự động chặn** ở tab Client. Chặn tay không bị giới hạn.
+- **Tên máy phổ biến**: các mẫu tên (dùng `*` và `?`, không phân biệt hoa thường) không dùng để gợi ý chặn thiết bị đổi MAC.
+
+**Bỏ chặn tất cả:** tab **Client → Client bị chặn → Bỏ chặn tất cả** (chỉ quản trị viên, có hộp thoại xác nhận). DrayPulse xoá **mọi mục DrayPulse** trong bảng Bind IP to MAC của router (kể cả mục sót lại không có trong danh sách), quên toàn bộ thiết bị/IP bị chặn và gợi ý chặn. Mục do bạn tạo được giữ nguyên; chức năng Bind IP to MAC chỉ được **tắt** nếu chính DrayPulse đã bật nó và bảng đã trống. Dùng khi chặn nhầm hàng loạt – không cần xoá tay từng mục trên router.
 
 **Chỉ chặn IP:** tick "Chỉ chặn IP này" – dùng cho thiết bị đặt IP tĩnh mà bạn không biết MAC.
 
@@ -175,7 +187,9 @@ Chặn một thiết bị khỏi mạng ngay từ DrayPulse, **không cần chu�
 **Giới hạn cần biết:**
 
 - Thiết bị đổi sang **MAC hoàn toàn mới và đổi cả tên máy** thì với router là một thiết bị mới – không phần mềm nào nhận ra nó chỉ qua mạng. Bật **Cài đặt → Báo khi có thiết bị lạ lần đầu vào mạng** để được báo ngay và chặn tiếp. Cách triệt để duy nhất là **danh sách trắng**: chỉ thiết bị đã duyệt mới vào được mạng.
-- Trong khoảng tối đa ~15 giây sau khi nhận IP mới, thiết bị có thể vào mạng trước khi bị chặn lại.
+- Trong khoảng tối đa ~15 giây sau khi nhận IP mới (vài giây nếu có syslog DHCP), thiết bị có thể vào mạng trước khi bị chặn lại.
+- Khi ARP/DHCP cho thấy IP mới của thiết bị bị chặn **cũng** đang có máy khác dùng, DrayPulse ưu tiên không chặn nhầm: IP đó không bị chặn cho tới khi chỉ còn thiết bị bị chặn dùng nó.
+- Định dạng dòng syslog DHCP khác nhau theo firmware; nếu router không gửi thông tin cấp IP, DrayPulse vẫn kiểm tra mỗi 15 giây như bình thường.
 - Máy cùng subnet vẫn liên lạc trực tiếp với nhau qua switch (không đi qua router).
 
 ---
@@ -386,6 +400,9 @@ Nếu tài khoản bị lỗi (hết credit, key sai, quá tải) và bạn bậ
 | Tab VLAN trống | Chưa bật Telnet/SSH, hoặc firmware không có lệnh `vlan status` | Bật CLI; DrayOS 5 chưa được hỗ trợ |
 | Chặn báo "Bind IP to MAC đang TẮT nhưng bảng có … mục do bạn tạo" | Bảng có mục cũ của bạn, bật lên sẽ áp dụng chúng | Kiểm tra/xoá các mục đó ở LAN → Bind IP to MAC rồi chặn lại |
 | Chặn báo "router không lưu mục chặn" | Router từ chối lệnh `ip bindmac add` (firmware khác cú pháp); DrayPulse đã hoàn tác | Báo lại kèm model/firmware |
+| Cảnh báo "Đã TẠM DỪNG tự động chặn" | Trong 1 giờ DrayPulse định tự chặn nhiều IP hơn giới hạn (thường do chặn nhầm thiết bị dùng chung hoặc DHCP cấp lại hàng loạt) | Xem tab Client → Client bị chặn, bỏ chặn mục sai (hoặc **Bỏ chặn tất cả**), rồi bấm **Tiếp tục tự động chặn**. Tăng giới hạn ở Cài đặt nếu cần |
+| Chặn báo "nằm trong danh sách Không bao giờ chặn" | MAC/IP (hoặc MAC đang dùng IP đó) thuộc danh sách bảo vệ | Bỏ khỏi danh sách ở Cài đặt → Chặn client an toàn nếu thật sự cần chặn |
+| Chặn nhầm nhiều máy cùng lúc | Chặn sai thiết bị, hoặc dữ liệu từ bản cũ (theo tên máy) | Tab Client → **Bỏ chặn tất cả** |
 | Không thấy dòng nào ở tab Syslog | Router chưa gửi, sai cổng, tường lửa server chặn UDP, hoặc router gửi từ IP khác IP đã khai báo | Xem khung chẩn đoán đầu tab Syslog: cổng đang nghe, các IP gửi chưa gán (bấm **Gán**) |
 | WAN báo "Không thấy" | Tên WAN không đúng (phải là WAN1, WAN2…) | Router → Sửa → bấm **Kiểm tra kết nối** và chọn theo gợi ý |
 | Telegram/Zalo không nhận tin | Chưa lưu token, sai Chat ID, hoặc chưa nhắn bot trước | Xem lỗi đỏ cạnh tiêu đề kênh trong Cài đặt; nhắn bot rồi **Gửi tin thử** |

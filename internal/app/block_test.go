@@ -230,10 +230,10 @@ func TestBlockDeviceFollowsItsIPs(t *testing.T) {
 	rs := h.get(r.ID)
 	const A, B, C = "A4:C6:9A:00:00:23", "3C:52:82:11:22:33", "DA:11:22:33:44:55"
 	rs.mu.Lock()
-	rs.Sections["arp"] = []Row{{"address": "192.168.1.21", "mac-address": A, "host": "Galaxy-S24"}}
+	rs.Sections["arp"] = []Row{{"address": "192.168.1.21", "mac-address": A, "host": "Lan-Phone-07"}}
 	rs.mu.Unlock()
 
-	if _, err := h.BlockDevice(ctx, r.ID, A, "", "Điện thoại lạ", "Galaxy-S24", "", true, "admin"); err != nil {
+	if _, err := h.BlockDevice(ctx, r.ID, A, "", "Điện thoại lạ", "Lan-Phone-07", "", true, "admin"); err != nil {
 		t.Fatal(err)
 	}
 	ips := func() []string {
@@ -247,7 +247,7 @@ func TestBlockDeviceFollowsItsIPs(t *testing.T) {
 		t.Fatalf("initial block %v", got)
 	}
 	// DHCP hands the blocked phone a new address: it must be blocked too
-	h.followBlocks(ctx, rs, nil, []Row{{"address": "192.168.1.40", "mac-address": A, "host-name": "Galaxy-S24"}})
+	h.followBlocks(ctx, rs, nil, []Row{{"address": "192.168.1.40", "mac-address": A, "host-name": "Lan-Phone-07"}})
 	if got := ips(); len(got) != 2 || got[1] != "192.168.1.40" {
 		t.Fatalf("new IP not followed: %v", got)
 	}
@@ -261,11 +261,29 @@ func TestBlockDeviceFollowsItsIPs(t *testing.T) {
 	if got := ips(); len(got) != 1 || got[0] != "192.168.1.40" {
 		t.Fatalf("old IP not released: %v", got)
 	}
-	// the phone randomises its MAC but keeps its host name: block the new MAC
-	h.followBlocks(ctx, rs, nil, []Row{{"address": "192.168.1.41", "mac-address": C, "host-name": "galaxy-s24"}})
+	// the phone randomises its MAC but keeps its host name: only a suggestion…
+	n0 := len(bm.Log)
+	h.followBlocks(ctx, rs, nil, []Row{{"address": "192.168.1.41", "mac-address": C, "host-name": "lan-phone-07"}})
+	if devs, _ := st.ListDevices(r.ID); len(devs) != 1 || len(bm.Log) != n0 {
+		t.Fatalf("a host-name match must never block on its own: %+v %v", devs, bm.Log[n0:])
+	}
+	sug, _ := st.ListSuggestions(r.ID, false)
+	if len(sug) != 1 || sug[0].MAC != C || sug[0].RefMAC != A || sug[0].IP != "192.168.1.41" {
+		t.Fatalf("suggestion %+v", sug)
+	}
+	// …which the admin confirms
+	rs.mu.Lock()
+	rs.Sections["lease"] = []Row{{"address": "192.168.1.41", "mac-address": C, "host-name": "lan-phone-07"}}
+	rs.mu.Unlock()
+	if _, err := h.AcceptSuggestion(ctx, r.ID, C, "admin"); err != nil {
+		t.Fatal(err)
+	}
 	devs, _ := st.ListDevices(r.ID)
 	if len(devs) != 2 || devs[1].MAC != C || !strings.Contains(devs[1].Origin, A) || len(devs[1].IPs) != 1 || devs[1].IPs[0] != "192.168.1.41" {
-		t.Fatalf("host-name match: %+v", devs)
+		t.Fatalf("confirmed suggestion: %+v", devs)
+	}
+	if sug, _ := st.ListSuggestions(r.ID, true); len(sug) != 0 {
+		t.Fatalf("suggestion must be gone once blocked: %+v", sug)
 	}
 	msgs, _ := st.DueOutbox(nowMs()+1, 20)
 	_ = msgs // no chat configured; the event itself is checked below
@@ -274,7 +292,7 @@ func TestBlockDeviceFollowsItsIPs(t *testing.T) {
 	for _, e := range evs {
 		all += e.Msg + "\n"
 	}
-	for _, want := range []string{"nhận IP mới 192.168.1.40", "Nhả chặn IP 192.168.1.21", "xuất hiện với MAC mới " + C} {
+	for _, want := range []string{"nhận IP mới 192.168.1.40", "Nhả chặn IP 192.168.1.21", "MAC mới " + C, "KHÔNG tự chặn"} {
 		if !strings.Contains(all, want) {
 			t.Errorf("missing event %q in:\n%s", want, all)
 		}

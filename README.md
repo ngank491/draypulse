@@ -16,7 +16,7 @@ Telegram/Zalo và trợ lý AI, nhưng lớp đọc router được viết lại
 - **WAN đa đường**: link + Internet từng WAN, IP public, đổi IP, tự gợi ý WAN đang bật trên router.
 - **VPN**: bảng LAN-to-LAN / Remote Dial-in đang kết nối, cảnh báo VPN PPTP.
 - **VLAN**: bấm vào từng VLAN/subnet để xem client của nó; VID, cổng thành viên (kèm trạng thái link), subnet, client và mức dùng DHCP; cảnh báo khi VLAN bị đổi cấu hình hoặc DHCP sắp hết địa chỉ.
-- **Chặn client theo thiết bị**: nút Chặn trong tab Client chặn mọi IP của một MAC qua bảng Bind IP to MAC của router; DrayPulse kiểm tra DHCP/ARP mỗi 15 giây để chặn ngay IP mới mà thiết bị nhận, nhả IP cũ khi máy khác dùng lại, và (tuỳ chọn) tự chặn MAC mới mang cùng tên máy. Không cần chuẩn bị trên router, không đụng tới mục do bạn tạo.
+- **Chặn client theo thiết bị**: nút Chặn trong tab Client chặn mọi IP của một MAC qua bảng Bind IP to MAC của router; DrayPulse kiểm tra DHCP/ARP mỗi 15 giây để chặn ngay IP mới mà thiết bị nhận, nhả IP cũ ngay khi máy khác dùng lại, và (tuỳ chọn) gợi ý chặn MAC mới mang cùng tên máy để quản trị viên xác nhận. Có danh sách thiết bị không bao giờ chặn, giới hạn số lượt tự chặn mỗi giờ và nút Bỏ chặn tất cả. Không cần chuẩn bị trên router, không đụng tới mục do bạn tạo.
 - **Session NAT**: số session đang dùng/tối đa của router và từng WAN, cảnh báo khi bảng session sắp đầy.
 - **Phát hiện DHCP giả mạo**: dò định kỳ các DHCP server trả lời trong mạng, cảnh báo khi có modem/router lạ cắm vào LAN.
 - **Thiết bị đang truy cập gì**: thống kê từ Firewall log (syslog) theo từng máy – IP/cổng/dịch vụ đích, số lần bị chặn.

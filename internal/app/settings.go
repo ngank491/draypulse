@@ -4,10 +4,12 @@ import (
 	"errors"
 	"net"
 	"net/url"
+	"path"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 // Settings are global, admin-editable options stored in the kv table.
@@ -33,11 +35,21 @@ type Settings struct {
 	AutoAudit     bool         `json:"autoAudit"`   // weekly audit on Sunday morning
 	DHCPWatch     bool         `json:"dhcpWatch"`   // look for rogue DHCP servers every 10 minutes
 	DHCPAllowed   string       `json:"dhcpAllowed"` // extra legitimate DHCP servers (comma separated)
+
+	// client blocking safety
+	BlockProtected  string `json:"blockProtected"`  // MACs/IPs that may never be blocked
+	BlockHostIgnore string `json:"blockHostIgnore"` // host names (patterns) never used to recognise a device
+	BlockAutoMax    int    `json:"blockAutoMax"`    // automatic blocks per router per hour before auto-blocking pauses
 }
+
+// defaultHostIgnore lists the factory host names shared by many devices:
+// matching on them would treat every such phone as the same device.
+const defaultHostIgnore = "iphone, iphone-?, ipad, ipad-?, macbook, macbook-air, macbook-pro, android, android-*, galaxy-*, redmi-*, redmi, " +
+	"oppo-*, vivo-*, realme-*, xiaomi-*, poco-*, huawei-*, honor-*, nokia-*, samsung, localhost, unknown, espressif, esp_*, esp-*"
 
 func defaultSettings() Settings {
 	return Settings{SummaryOn: true, SummaryAt: "08:00", RepeatMin: 30, Timezone: "Asia/Ho_Chi_Minh", RetentionDays: 30,
-		AIAnonymize: true, AIFallback: true}
+		AIAnonymize: true, AIFallback: true, BlockHostIgnore: defaultHostIgnore, BlockAutoMax: 5}
 }
 
 type SettingsStore struct {
@@ -325,6 +337,10 @@ type SettingsInput struct {
 	AutoAudit     bool    `json:"autoAudit"`
 	DHCPWatch     bool    `json:"dhcpWatch"`
 	DHCPAllowed   string  `json:"dhcpAllowed"`
+	// nil = keep the stored value (older forms do not send these)
+	BlockProtected  *string `json:"blockProtected"`
+	BlockHostIgnore *string `json:"blockHostIgnore"`
+	BlockAutoMax    *int    `json:"blockAutoMax"`
 }
 
 func (s *SettingsStore) Update(in SettingsInput) error {
@@ -336,6 +352,24 @@ func (s *SettingsStore) Update(in SettingsInput) error {
 		allowed = append(allowed, x)
 	}
 	in.DHCPAllowed = strings.Join(allowed, ", ")
+	var protected, ignore string
+	if in.BlockProtected != nil {
+		p, err := normProtected(*in.BlockProtected)
+		if err != nil {
+			return err
+		}
+		protected = p
+	}
+	if in.BlockHostIgnore != nil {
+		p, err := normHostPatterns(*in.BlockHostIgnore)
+		if err != nil {
+			return err
+		}
+		ignore = p
+	}
+	if in.BlockAutoMax != nil && (*in.BlockAutoMax < 1 || *in.BlockAutoMax > 100) {
+		return errors.New("giới hạn tự động chặn phải từ 1 đến 100 thiết bị/giờ")
+	}
 	in.AdminChat = strings.TrimSpace(in.AdminChat)
 	in.ZaloAdmin = strings.TrimSpace(in.ZaloAdmin)
 	if in.ZaloAdmin != "" && !reZaloChat.MatchString(in.ZaloAdmin) {
@@ -382,6 +416,15 @@ func (s *SettingsStore) Update(in SettingsInput) error {
 	}
 	next.ZaloAdmin, next.NotifyNew = in.ZaloAdmin, in.NotifyNew
 	next.DHCPWatch, next.DHCPAllowed = in.DHCPWatch, in.DHCPAllowed
+	if in.BlockProtected != nil {
+		next.BlockProtected = protected
+	}
+	if in.BlockHostIgnore != nil {
+		next.BlockHostIgnore = ignore
+	}
+	if in.BlockAutoMax != nil {
+		next.BlockAutoMax = *in.BlockAutoMax
+	}
 	next.AIFallback, next.AIConsent, next.AIAnonymize, next.AutoAudit = in.AIFallback, in.AIConsent, in.AIAnonymize, in.AutoAudit
 	next.AdminChat, next.SummaryOn, next.SummaryAt = in.AdminChat, in.SummaryOn, in.SummaryAt
 	next.RepeatMin, next.Timezone, next.RetentionDays, next.PushBase = in.RepeatMin, in.Timezone, in.RetentionDays, in.PushBase
@@ -396,6 +439,90 @@ func (s *SettingsStore) Update(in SettingsInput) error {
 func oneOf(v int, opts ...int) bool {
 	for _, o := range opts {
 		if v == o {
+			return true
+		}
+	}
+	return false
+}
+
+func splitList(s string) []string {
+	return strings.FieldsFunc(s, func(r rune) bool { return r == ',' || r == ';' || unicode.IsSpace(r) })
+}
+
+// normProtected validates the protected list: MAC addresses (any common
+// notation) and IPv4 addresses. MACs are stored as AA:BB:CC:DD:EE:FF.
+func normProtected(s string) (string, error) {
+	var out []string
+	for _, x := range splitList(s) {
+		if m := normMAC(x); m != "" {
+			if !slicesContains(out, m) {
+				out = append(out, m)
+			}
+			continue
+		}
+		if ip := net.ParseIP(x); ip != nil && ip.To4() != nil {
+			if !slicesContains(out, ip.To4().String()) {
+				out = append(out, ip.To4().String())
+			}
+			continue
+		}
+		return "", errors.New("danh sách thiết bị không bao giờ chặn chỉ gồm địa chỉ MAC hoặc IPv4: “" + x + "” không hợp lệ")
+	}
+	if len(out) > 500 {
+		return "", errors.New("danh sách thiết bị không bao giờ chặn tối đa 500 mục")
+	}
+	return strings.Join(out, ", "), nil
+}
+
+// normHostPatterns validates host-name patterns (* and ? wildcards).
+func normHostPatterns(s string) (string, error) {
+	var out []string
+	for _, x := range splitList(strings.ToLower(s)) {
+		if _, err := path.Match(x, ""); err != nil || len(x) > 64 {
+			return "", errors.New("mẫu tên máy không hợp lệ: “" + x + "”")
+		}
+		if !slicesContains(out, x) {
+			out = append(out, x)
+		}
+	}
+	return strings.Join(out, ", "), nil
+}
+
+// blockSafety is the parsed form of the blocking safety settings.
+type blockSafety struct {
+	macs, ips map[string]bool
+	ignore    []string
+	autoMax   int
+}
+
+func (s *SettingsStore) blockSafety() blockSafety {
+	b := blockSafety{macs: map[string]bool{}, ips: map[string]bool{}, autoMax: 5, ignore: splitList(defaultHostIgnore)}
+	if s == nil {
+		return b
+	}
+	cur := s.Get()
+	for _, x := range splitList(cur.BlockProtected) {
+		if m := normMAC(x); m != "" {
+			b.macs[m] = true
+		} else if net.ParseIP(x) != nil {
+			b.ips[x] = true
+		}
+	}
+	b.ignore = splitList(strings.ToLower(cur.BlockHostIgnore))
+	if cur.BlockAutoMax > 0 {
+		b.autoMax = cur.BlockAutoMax
+	}
+	return b
+}
+
+// genericHost: a host name too common (or too short) to identify a device.
+func (b blockSafety) genericHost(host string) bool {
+	h := strings.ToLower(strings.TrimSpace(host))
+	if len([]rune(h)) < 3 {
+		return true
+	}
+	for _, p := range b.ignore {
+		if ok, _ := path.Match(p, h); ok {
 			return true
 		}
 	}

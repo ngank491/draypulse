@@ -747,8 +747,8 @@ function blockForm(routerId, c) {
   const host = c.host || '';
   const byHost = h('input', { type: 'checkbox', checked: !!host && !!c.randomMac });
   const ipOnly = h('input', { type: 'checkbox' });
-  const hostRow = host ? h('div', null, check(`Chặn luôn khi thiết bị đổi MAC nhưng vẫn mang tên máy “${host}”`, byHost),
-    h('div', { class: 'hint' }, 'Hữu ích với điện thoại bật “địa chỉ Wi-Fi riêng tư”. Cảnh báo: máy khác trùng tên (ví dụ “iPhone”) cũng sẽ bị chặn.')) : null;
+  const hostRow = host ? h('div', null, check(`Báo cho tôi khi thiết bị đổi MAC nhưng vẫn mang tên máy “${host}”`, byHost),
+    h('div', { class: 'hint' }, 'Hữu ích với điện thoại bật “địa chỉ Wi-Fi riêng tư”. DrayPulse KHÔNG tự chặn MAC mới: nó gửi cảnh báo và hiện gợi ý ở tab Client để bạn bấm “Chặn” hoặc “Bỏ qua”. Tên máy phổ biến (iPhone, Redmi-*, Galaxy-*… – xem Cài đặt → Chặn client an toàn) không bao giờ được dùng để nhận diện.')) : null;
   const sync = () => { if (hostRow) hostRow.classList.toggle('hidden', ipOnly.checked || !mac.value.trim()); };
   [mac, ipOnly].forEach(x => x.addEventListener('input', sync)); ipOnly.addEventListener('change', sync);
   modal('Chặn ' + (c.name || c.ip || c.mac || 'thiết bị'), h('div', { class: 'stack' },
@@ -777,6 +777,30 @@ async function unblock(routerId, b, btn) {
   await busy(btn, async () => {
     await api('DELETE', dev ? `/api/admin/routers/${routerId}/devices/${encodeURIComponent(b.mac)}` : `/api/admin/routers/${routerId}/blocks/${encodeURIComponent(b.ip)}`);
     toast('Đã bỏ chặn', 'ok'); refresh();
+  });
+}
+
+function unblockAllForm(routerId, bl) {
+  const nDev = (bl.devices || []).length, nIP = (bl.ips || []).length;
+  const ok = h('input', { type: 'checkbox' });
+  modal('Bỏ chặn tất cả', h('div', { class: 'stack' },
+    h('p', null, `DrayPulse sẽ xoá mọi mục chặn của DrayPulse (ghi chú “DrayPulse”) trong bảng LAN → Bind IP to MAC của router và quên ${nDev} thiết bị, ${nIP} IP đang bị chặn cùng các gợi ý chặn.`),
+    h('p', { class: 'hint' }, 'Mục do bạn tự tạo trong Bind IP to MAC được giữ nguyên. Chức năng Bind IP to MAC chỉ được TẮT nếu chính DrayPulse đã bật nó và bảng không còn mục nào.'),
+    check('Tôi hiểu: mọi thiết bị đang bị DrayPulse chặn trên router này sẽ vào mạng lại được', ok)),
+    [{ t: 'Huỷ', fn: x => x() }, { t: 'Bỏ chặn tất cả', cls: 'danger', submit: true, fn: async close => {
+      if (!ok.checked) return toast('Hãy đánh dấu ô xác nhận trước', 'bad');
+      try {
+        const r = await api('POST', `/api/admin/routers/${routerId}/blocks/unblock-all`);
+        close(); toast(`Đã bỏ chặn tất cả (${r.removed} mục trên router)`, 'ok'); refresh();
+      } catch (e) { toast(e.message, 'bad'); }
+    } }]);
+}
+
+async function suggestionAction(routerId, x, accept, btn) {
+  if (accept && !confirm(`Chặn MAC ${x.mac}${x.ip ? ' (IP ' + x.ip + ')' : ''} – mang tên máy “${x.host}” giống thiết bị bị chặn ${x.refMac}?`)) return;
+  await busy(btn, async () => {
+    await api(accept ? 'POST' : 'DELETE', `/api/admin/routers/${routerId}/suggestions/${encodeURIComponent(x.mac)}`);
+    toast(accept ? 'Đã chặn ' + x.mac : 'Đã bỏ qua gợi ý', 'ok'); refresh();
   });
 }
 
@@ -825,12 +849,23 @@ function tabClients(id) {
         { t: 'Thiết bị', v: b => b.name || b.host || b.mac || b.ip, r: b => h('div', null, h('b', null, b.name || b.host || (b.ips ? '–' : 'Chỉ IP')),
           b.ips ? h('div', { class: 'mono small muted' }, b.mac) : null, b.origin ? h('div', { class: 'small muted' }, 'tự chặn: ' + b.origin) : null) },
         { t: 'IP đang chặn', v: b => (b.ips || [b.ip]).join(' '), r: b => { const l = b.ips || [b.ip]; return l.length ? h('div', { class: 'row wrap' }, l.map(x => h('span', { class: 'chip bad mono' }, x))) : h('span', { class: 'muted small' }, 'chờ thiết bị xuất hiện'); } },
-        { t: 'Theo dõi', v: b => b.ips ? (b.matchHost ? 2 : 1) : 0, r: b => b.ips ? (b.matchHost ? `MAC + tên máy “${b.host}”` : 'MAC') : 'chỉ IP' },
+        { t: 'Theo dõi', v: b => b.ips ? (b.matchHost ? 2 : 1) : 0, r: b => b.ips ? (b.matchHost ? `MAC + gợi ý theo tên máy “${b.host}”` : 'MAC') : 'chỉ IP' },
         { t: 'Chặn lúc', v: b => b.at, r: b => h('span', { class: 'small' }, fmtTime(b.at) + ' · ' + b.byUser) },
         { t: 'Ghi chú', v: b => b.note },
         { t: '', r: b => me.role === 'admin' ? h('button', { class: 'sm', onclick: e => unblock(id, b, e.target) }, 'Bỏ chặn') : null },
       ], list, { empty: 'Chưa chặn thiết bị nào.' });
-      fill(bnote, 'Chặn qua bảng LAN → Bind IP to MAC của router (mỗi IP bị chặn gắn với một MAC không tồn tại, ghi chú “DrayPulse”). Với thiết bị chặn theo MAC, DrayPulse kiểm tra DHCP/ARP mỗi 15 giây và chặn ngay IP mới của thiết bị.');
+      const sug = bl.suggestions || [];
+      fill(bnote,
+        bl.autoPaused ? h('div', { class: 'err-line' }, `🛑 Tự động chặn đang TẠM DỪNG từ ${fmtTime(bl.autoPausedAt)}: DrayPulse định chặn nhiều thiết bị hơn giới hạn mỗi giờ. IP mới của thiết bị bị chặn sẽ không bị chặn cho tới khi bạn kiểm tra và bấm “Tiếp tục tự động chặn”. `,
+          me.role === 'admin' ? h('button', { class: 'sm', onclick: e => busy(e.target, async () => { await api('POST', `/api/admin/routers/${id}/blocks/resume`); toast('Đã tiếp tục tự động chặn', 'ok'); refresh(); }) }, 'Tiếp tục tự động chặn') : null) : null,
+        sug.length ? h('div', { class: 'stack' }, h('b', null, `❓ Gợi ý chặn (${sug.length}) – MAC mới mang tên máy của thiết bị bị chặn, chờ bạn xác nhận`),
+          h('div', { class: 'tw' }, h('table', null, h('thead', null, h('tr', null, ['MAC mới', 'IP', 'Tên máy', 'Giống thiết bị', 'Thấy lúc', ''].map(x => h('th', null, x)))),
+            h('tbody', null, sug.map(x => h('tr', null, h('td', { class: 'mono' }, x.mac), h('td', { class: 'mono' }, x.ip || '–'), h('td', null, x.host),
+              h('td', null, (x.name ? x.name + ' · ' : ''), h('span', { class: 'mono small' }, x.refMac)), h('td', { class: 'small' }, fmtTime(x.at)),
+              h('td', null, me.role === 'admin' ? h('div', { class: 'row' },
+                h('button', { class: 'sm danger', onclick: e => suggestionAction(id, x, true, e.target) }, 'Chặn'),
+                h('button', { class: 'sm', onclick: e => suggestionAction(id, x, false, e.target) }, 'Bỏ qua')) : null))))))) : null,
+        h('p', { class: 'hint' }, 'Chặn qua bảng LAN → Bind IP to MAC của router (mỗi IP bị chặn gắn với một MAC không tồn tại, ghi chú “DrayPulse”). Với thiết bị chặn theo MAC, DrayPulse kiểm tra DHCP/ARP mỗi 15 giây (ngay lập tức khi syslog báo cấp IP) và chặn IP mới của thiết bị; IP cũ được nhả ngay khi thiết bị khác dùng nó. Không bao giờ tự chặn theo tên máy, và tự dừng khi số lượt tự chặn vượt giới hạn mỗi giờ (Cài đặt → Chặn client an toàn).'));
     }
   };
   return {
@@ -840,6 +875,7 @@ function tabClients(id) {
       if (p.state.sort == null) { p.state.sort = 0; p.state.desc = true; }
       const live = me.role === 'admin' ? h('div', { class: 'row' },
         h('button', { class: 'sm danger', onclick: () => blockForm(id, {}) }, '+ Chặn MAC/IP'),
+        h('button', { class: 'sm', title: 'Xoá mọi mục chặn của DrayPulse trên router này', onclick: () => view && view.blocking && unblockAllForm(id, view.blocking) }, 'Bỏ chặn tất cả'),
         h('button', { class: 'sm', onclick: e => busy(e.target, async () => {
           const st = await api('GET', `/api/routers/${id}/blocks?live=1`);
           const issues = [];
@@ -1719,6 +1755,15 @@ function settingsPage() {
           h('div', { class: 'row' }, h('button', { type: 'button', onclick: e => busy(e.target, async () => { const r = await api('POST', '/api/admin/dhcp-scan'); drawScan(r.scan); }) }, 'Dò ngay')),
           dhcpOut,
           h('p', { class: 'hint' }, 'DrayPulse gửi một gói DHCPDISCOVER trên mỗi cổng mạng của máy chạy nó và ghi lại mọi DHCP server trả lời (không nhận IP). Server không phải router đang giám sát – thường là modem/router Wi-Fi cắm nhầm vào LAN – sẽ bị cảnh báo qua Telegram/Zalo. Chỉ thấy được các mạng/VLAN mà máy DrayPulse cắm vào; cần chạy bằng dịch vụ từ install.sh (quyền dùng cổng 68).')));
+      const bkProtected = h('textarea', { rows: 3, class: 'mono', placeholder: 'ví dụ AA:BB:CC:DD:EE:FF, 192.168.1.10 (máy chủ, camera, máy của quản trị…)' }, st.blockProtected || '');
+      const bkIgnore = h('textarea', { rows: 3, class: 'mono' }, st.blockHostIgnore || '');
+      const bkMax = h('input', { type: 'number', min: 1, max: 100, value: st.blockAutoMax || 5 });
+      const blockPanel = h('div', { class: 'panel' }, h('div', { class: 'panel-h' }, h('h2', null, 'Chặn client an toàn')),
+        h('div', { class: 'panel-b form' },
+          field('Không bao giờ chặn (MAC hoặc IP, cách nhau dấu phẩy / xuống dòng)', bkProtected, 'full'),
+          field('Tên máy phổ biến – không dùng để nhận diện thiết bị (dùng * và ?)', bkIgnore, 'full'),
+          field('Tối đa số lượt tự động chặn mỗi giờ cho một router', bkMax),
+          h('p', { class: 'hint full' }, 'Thiết bị/IP trong danh sách “Không bao giờ chặn” bị từ chối khi chặn tay và không bao giờ bị tự chặn; nếu đang bị chặn sẽ được nhả ở lần kiểm tra kế tiếp. Khi số IP DrayPulse tự chặn (thiết bị bị chặn nhận IP mới) vượt giới hạn trong 1 giờ, tự động chặn của router đó tạm dừng và bạn nhận cảnh báo. Tên máy phổ biến không bao giờ được dùng để gợi ý chặn thiết bị đổi MAC.')));
       const repeat = h('select', null, [[0, 'Không nhắc lại'], [15, '15 phút'], [30, '30 phút'], [60, '1 giờ'], [120, '2 giờ']].map(([v, t]) => h('option', { value: v, selected: st.repeatMin === v }, t)));
       const tz = h('input', { value: st.timezone });
       const keep = h('input', { type: 'number', min: 1, max: 400, value: st.retentionDays });
@@ -1729,7 +1774,8 @@ function settingsPage() {
         const body = { adminChat: inputs.telegram.chat.value, zaloAdmin: inputs.zalo.chat.value, summaryOn: sumOn.checked, summaryAt: sumAt.value, notifyNew: notifyNew.checked,
           repeatMin: +repeat.value, timezone: tz.value, retentionDays: +keep.value, pushBase: base.value,
           aiFallback: aiFallback.checked, aiConsent: aiConsent.checked, aiAnonymize: aiAnon.checked, autoAudit: autoAudit.checked,
-          dhcpWatch: dhcpWatch.checked, dhcpAllowed: dhcpAllowed.value };
+          dhcpWatch: dhcpWatch.checked, dhcpAllowed: dhcpAllowed.value,
+          blockProtected: bkProtected.value, blockHostIgnore: bkIgnore.value, blockAutoMax: +bkMax.value };
         for (const c of CH) {
           const i = inputs[c.k];
           if (i.remove.checked) body[c.tokenKey] = ''; else if (i.token.value) body[c.tokenKey] = i.token.value;
@@ -1747,6 +1793,7 @@ function settingsPage() {
             h('div', { class: 'full' }, check('Báo khi có thiết bị lạ lần đầu vào mạng', notifyNew)),
             h('p', { class: 'hint full' }, 'Cảnh báo gửi tới Chat ID quản trị của mọi kênh đã cấu hình, và tới Chat ID riêng của từng router (nếu có). Gõ /status (Telegram) hoặc “status” (Zalo) cho bot để xem tình trạng bất cứ lúc nào.'))),
         dhcpPanel,
+        blockPanel,
         h('div', { class: 'panel' }, h('div', { class: 'panel-h' }, h('h2', null, 'Hệ thống')),
           h('div', { class: 'panel-b form' },
             field('Múi giờ', tz), field('Số ngày lưu lịch sử', keep),

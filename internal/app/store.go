@@ -184,6 +184,21 @@ INSERT OR IGNORE INTO blocked_devices(router_id,mac,name,note,by_user,at)
   SELECT router_id, mac, name, note, by_user, at FROM ip_blocks WHERE mac != '';
 `
 
+// schemaV8: a new MAC carrying a blocked device's host name is no longer
+// blocked automatically; it becomes a suggestion the admin confirms.
+const schemaV8 = `
+CREATE TABLE block_suggestions(
+  router_id INTEGER NOT NULL REFERENCES routers(id) ON DELETE CASCADE,
+  mac TEXT NOT NULL,
+  ip TEXT NOT NULL DEFAULT '',
+  host TEXT NOT NULL DEFAULT '',
+  ref_mac TEXT NOT NULL DEFAULT '',
+  name TEXT NOT NULL DEFAULT '',
+  at INTEGER NOT NULL,
+  dismissed INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(router_id, mac)) WITHOUT ROWID;
+`
+
 type Store struct{ db *sql.DB }
 
 func OpenStore(path string) (*Store, error) {
@@ -214,7 +229,7 @@ func (s *Store) migrate() error {
 	if err := s.db.QueryRow("PRAGMA user_version").Scan(&v); err != nil {
 		return err
 	}
-	migrations := []string{schemaV1, schemaV2, schemaV3, schemaV4, schemaV5, schemaV6, schemaV7}
+	migrations := []string{schemaV1, schemaV2, schemaV3, schemaV4, schemaV5, schemaV6, schemaV7, schemaV8}
 	if v > len(migrations) {
 		return fmt.Errorf("database được tạo bởi phiên bản mới hơn (schema %d)", v)
 	}
@@ -1186,6 +1201,89 @@ func (s *Store) DeleteDevice(routerID int64, mac string) error {
 	}
 	if _, err := tx.Exec("DELETE FROM blocked_devices WHERE router_id=? AND mac=?", routerID, mac); err != nil {
 		return err
+	}
+	return tx.Commit()
+}
+
+// Suggestion: a MAC seen with the host name of a blocked device (MatchHost).
+// It is blocked only when an admin confirms; dismissed ones are kept so the
+// same MAC is not suggested again.
+type Suggestion struct {
+	MAC       string `json:"mac"`
+	IP        string `json:"ip"`
+	Host      string `json:"host"`
+	RefMAC    string `json:"refMac"` // the blocked device whose host name it carries
+	Name      string `json:"name"`
+	At        int64  `json:"at"`
+	Dismissed bool   `json:"dismissed"`
+}
+
+// ListSuggestions returns the pending (or, with all, every) suggestion.
+func (s *Store) ListSuggestions(routerID int64, all bool) ([]Suggestion, error) {
+	q := "SELECT mac,ip,host,ref_mac,name,at,dismissed FROM block_suggestions WHERE router_id=?"
+	if !all {
+		q += " AND dismissed=0"
+	}
+	rows, err := s.db.Query(q+" ORDER BY at", routerID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Suggestion{}
+	for rows.Next() {
+		var x Suggestion
+		if err := rows.Scan(&x.MAC, &x.IP, &x.Host, &x.RefMAC, &x.Name, &x.At, &x.Dismissed); err != nil {
+			return nil, err
+		}
+		out = append(out, x)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) AddSuggestion(routerID int64, x Suggestion) error {
+	_, err := s.db.Exec("INSERT OR IGNORE INTO block_suggestions(router_id,mac,ip,host,ref_mac,name,at,dismissed) VALUES(?,?,?,?,?,?,?,?)",
+		routerID, x.MAC, x.IP, x.Host, x.RefMAC, x.Name, x.At, x.Dismissed)
+	return err
+}
+
+func (s *Store) DismissSuggestion(routerID int64, mac string) error {
+	res, err := s.db.Exec("UPDATE block_suggestions SET dismissed=1 WHERE router_id=? AND mac=?", routerID, mac)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) DeleteSuggestion(routerID int64, mac string) error {
+	_, err := s.db.Exec("DELETE FROM block_suggestions WHERE router_id=? AND mac=?", routerID, mac)
+	return err
+}
+
+// DeleteSuggestionsFor forgets the suggestions raised for a blocked device
+// (ref "" = every suggestion of the router).
+func (s *Store) DeleteSuggestionsFor(routerID int64, ref string) error {
+	if ref == "" {
+		_, err := s.db.Exec("DELETE FROM block_suggestions WHERE router_id=?", routerID)
+		return err
+	}
+	_, err := s.db.Exec("DELETE FROM block_suggestions WHERE router_id=? AND ref_mac=?", routerID, ref)
+	return err
+}
+
+// DeleteAllBlocks removes every blocked device and IP of a router.
+func (s *Store) DeleteAllBlocks(routerID int64) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, q := range []string{"DELETE FROM ip_blocks WHERE router_id=?", "DELETE FROM blocked_devices WHERE router_id=?", "DELETE FROM block_suggestions WHERE router_id=?"} {
+		if _, err := tx.Exec(q, routerID); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }
