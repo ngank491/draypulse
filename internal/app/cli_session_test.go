@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -156,5 +157,49 @@ func TestFetchCLIErrorIsNotUnsupported(t *testing.T) {
 	noCLI := newDraytekSource("127.0.0.1", DrayOpts{SNMPVersion: "off"}, SNMPSecrets{}, "", "")
 	if _, err := noCLI.Fetch(ctx, "/ip/dhcp-server/lease", nil); !errors.Is(err, errNotSupported) {
 		t.Fatalf("without CLI: want errNotSupported, got %v", err)
+	}
+}
+
+// A router pinging many devices keeps the CLI busy all the time: a blocking
+// transaction must get the session after the current command, not after the
+// whole queue.
+func TestUrgentLockJumpsQueue(t *testing.T) {
+	fastCLITimers(t, time.Minute, 50*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	sim, err := startSimCLI(ctx, "Vigor3912S", "admin", "pw", func(cmd string) string {
+		time.Sleep(100 * time.Millisecond) // a slow command, like "ip ping"
+		return "ok"
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := simClient(sim)
+	defer c.Close()
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for range 6 { // queued pings
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				c.Run(ctx, "ip ping 192.168.1.10 AUTO")
+			}
+		}()
+	}
+	time.Sleep(300 * time.Millisecond)
+	t0 := time.Now()
+	c.lockUrgent()
+	waited := time.Since(t0)
+	c.mu.Unlock()
+	close(stop)
+	wg.Wait()
+	if waited > 350*time.Millisecond { // one command (+ slack), not six
+		t.Fatalf("blocking transaction waited %v behind routine commands", waited)
 	}
 }

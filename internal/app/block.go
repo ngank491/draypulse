@@ -599,7 +599,7 @@ func (h *Hub) bindSession(ctx context.Context, rs *RState) (*bindOps, func(), er
 	if err != nil {
 		return nil, nil, err
 	}
-	cli.mu.Lock()
+	cli.lockUrgent() // ahead of the poller's queued reads and pings
 	return &bindOps{cli: cli, ctx: ctx}, func() { cli.mu.Unlock(); done() }, nil
 }
 

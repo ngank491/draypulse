@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -75,6 +76,35 @@ type cliClient struct {
 	cfg CLIConfig
 	mu  sync.Mutex // one session at a time per router; DrayOS allows few CLI users
 	cc  *cliConn
+	// urgent counts blocking transactions waiting for the session: routine
+	// reads and pings step aside for them (a router pinging many devices
+	// keeps the session busy all the time).
+	urgent atomic.Int32
+}
+
+// lockUrgent takes the session ahead of routine commands.
+func (c *cliClient) lockUrgent() {
+	c.urgent.Add(1)
+	c.mu.Lock()
+	c.urgent.Add(-1)
+}
+
+// lockRoutine takes the session unless a blocking transaction is waiting.
+func (c *cliClient) lockRoutine(ctx context.Context) error {
+	for {
+		if c.urgent.Load() == 0 {
+			c.mu.Lock()
+			if c.urgent.Load() == 0 {
+				return nil
+			}
+			c.mu.Unlock() // a transaction arrived meanwhile: let it go first
+		}
+		select {
+		case <-ctx.Done():
+			return errors.New("CLI router không phản hồi (timeout)")
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
 }
 
 func newCLIClient(cfg CLIConfig) *cliClient {
@@ -479,7 +509,9 @@ func (c *cliClient) RunWrite(ctx context.Context, cmds ...string) (map[string]st
 }
 
 func (c *cliClient) run(ctx context.Context, cmds []string) (map[string]string, error) {
-	c.mu.Lock()
+	if err := c.lockRoutine(ctx); err != nil {
+		return nil, err
+	}
 	defer c.mu.Unlock()
 	return c.runHeld(ctx, cmds)
 }
