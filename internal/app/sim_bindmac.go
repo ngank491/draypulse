@@ -19,7 +19,9 @@ type simBindMAC struct {
 	EntriesOnly bool
 	// Silent: "show" prints nothing at all.
 	Silent bool
-	Log    []string
+	// OneLine: entry and comment on one line (Vigor 3912S 4.4.3.2).
+	OneLine bool
+	Log     []string
 }
 
 var reSimBind = regexp.MustCompile(`^ip bindmac (show|on|off|add (\S+) (\S+) (.*)|del (\S+))$`)
@@ -42,7 +44,11 @@ func (b *simBindMAC) handle(cmd string) (string, bool) {
 				map[bool]string{true: "ON", false: "OFF"}[b.on], map[bool]string{true: "ON", false: "OFF"}[b.strict])
 		}
 		for _, e := range b.entries {
-			fmt.Fprintf(&s, "IP : %s bind MAC : %s HOST ID :              \nComment : %s\n", e.IP, strings.ToLower(strings.ReplaceAll(e.MAC, ":", "-")), e.Comment)
+			sep := "              \n"
+			if b.OneLine {
+				sep = " "
+			}
+			fmt.Fprintf(&s, "IP : %s bind MAC : %s HOST ID :%sComment : %s\n", e.IP, strings.ToLower(strings.ReplaceAll(e.MAC, ":", "-")), sep, e.Comment)
 		}
 		return s.String(), true
 	case m[1] == "on" || m[1] == "off":

@@ -54,8 +54,10 @@ func (s bindState) find(ip string) *bindEntry {
 	return nil
 }
 
+// ours: DrayPulse's entries carry the blocking MAC (no real device uses it)
+// and, when the firmware shows it, the comment "DrayPulse".
 func (e bindEntry) ours() bool {
-	return e.MAC == blockMAC && strings.EqualFold(e.Comment, blockComment)
+	return e.MAC == blockMAC && (e.Comment == "" || strings.EqualFold(e.Comment, blockComment))
 }
 
 var (
@@ -63,6 +65,7 @@ var (
 	reBindStr   = regexp.MustCompile(`(?i)bind mac function is STRICT (ON|OFF)`)
 	reBindEntry = regexp.MustCompile(`(?i)IP\s*:\s*(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s+bind MAC\s*:\s*([0-9a-f]{2}(?:[-:][0-9a-f]{2}){5})`)
 	reBindCmt   = regexp.MustCompile(`(?i)^\s*Comment\s*:\s*(\S*)`)
+	reBindCmtIn = regexp.MustCompile(`(?i)\bComment\s*:\s*(\S*)`)
 )
 
 // parseBindMAC reads "ip bindmac show":
@@ -81,8 +84,15 @@ func parseBindMAC(s string) bindState {
 		st.Strict = strings.EqualFold(m[1], "ON")
 	}
 	for _, line := range strings.Split(s, "\n") {
-		if m := reBindEntry.FindStringSubmatch(line); m != nil {
-			st.Entries = append(st.Entries, bindEntry{IP: m[1], MAC: dashMAC(m[2])})
+		// Vigor 3912S (4.4.3.2) prints everything on one line:
+		//   IP : 192.168.31.246 bind MAC : 02-dd-00-00-00-01 HOST ID : Comment : DrayPulse
+		// the user guide shows "Comment : …" on the next line. Accept both.
+		if loc := reBindEntry.FindStringSubmatchIndex(line); loc != nil {
+			e := bindEntry{IP: line[loc[2]:loc[3]], MAC: dashMAC(line[loc[4]:loc[5]])}
+			if m := reBindCmtIn.FindStringSubmatch(line[loc[1]:]); m != nil {
+				e.Comment = m[1]
+			}
+			st.Entries = append(st.Entries, e)
 			continue
 		}
 		if m := reBindCmt.FindStringSubmatch(line); m != nil && len(st.Entries) > 0 {

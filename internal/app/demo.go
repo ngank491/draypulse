@@ -215,6 +215,10 @@ func (d *demoRouter) cliReply(cmd string) string {
 			}
 		}
 		return b.String()
+	case cmd == "show session":
+		cur := 21000 + rand.IntN(4000)
+		return fmt.Sprintf("%% Maximum Session Number: 60000\n%% Maximum Session Usage: 33120\n%% Current Session Usage: %d\n%% Current Session Used(include waiting for free): %d\n%% WAN1 Current Session Usage: %d\n%% WAN2 Current Session Usage: %d\n%% WAN3 Current Session Usage: 0\n",
+			cur, cur+180, cur*7/10, cur*3/10)
 	case cmd == "vlan status":
 		return "VLAN is Enable :\n" + strings.Repeat("-", 64) + "\n" +
 			"VLAN Enable VID Pri  p1 p2 p3 p4 p5 p6 s1 s2 s3 s4 subnet\n" + strings.Repeat("-", 64) + "\n" +
@@ -281,6 +285,7 @@ func (h *Hub) demoSource(r *Router) (Source, error) {
 			return nil, err
 		}
 		h.demos[r.ID] = dr
+		go h.demoFlows(r.ID)
 	}
 	src := newDraytekSource("127.0.0.1", DrayOpts{SNMPVersion: "2c", SNMPPort: dr.snmp.Port(), CLI: "telnet", CLIPort: dr.cli.Port(), PingFrom: "local"},
 		SNMPSecrets{Community: "public"}, "admin", "demo")
@@ -320,4 +325,49 @@ func seedDemo(st *Store) error {
 	add("Camera cổng", "10.10.30.11", "camera", cam)
 	add("Camera kho", "10.10.30.250", "camera", cam)
 	return err
+}
+
+// demoFlows feeds the demo router with firewall-log connections, as a real
+// router would send by syslog, so "what is this device accessing" has data.
+func (h *Hub) demoFlows(routerID int64) {
+	type dest struct {
+		ip    string
+		port  int
+		proto string
+	}
+	byClient := map[string][]dest{
+		"192.168.1.20":  {{"142.250.66.78", 443, "TCP"}, {"157.240.13.35", 443, "TCP"}, {"8.8.8.8", 53, "UDP"}, {"20.190.160.1", 443, "TCP"}},
+		"192.168.1.21":  {{"52.112.0.10", 3478, "UDP"}, {"142.250.66.78", 443, "TCP"}, {"203.113.131.1", 3389, "TCP"}},
+		"192.168.20.22": {{"17.57.144.10", 5223, "TCP"}, {"157.240.13.35", 443, "TCP"}, {"31.13.75.1", 443, "TCP"}},
+		"192.168.20.23": {{"74.125.200.188", 5228, "TCP"}, {"103.53.170.10", 1935, "TCP"}, {"8.8.4.4", 53, "UDP"}},
+		"10.10.30.11":   {{"47.88.65.10", 6800, "UDP"}, {"120.25.1.2", 443, "TCP"}},
+	}
+	ips := make([]string, 0, len(byClient))
+	for ip := range byClient {
+		ips = append(ips, ip)
+	}
+	t := time.NewTicker(3 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-h.ctx.Done():
+			return
+		case <-t.C:
+		}
+		rs := h.get(routerID)
+		if rs == nil {
+			return
+		}
+		rs.mu.Lock()
+		for range 6 {
+			src := ips[rand.IntN(len(ips))]
+			d := byClient[src][rand.IntN(len(byClient[src]))]
+			act := "pass"
+			if d.port == 3389 || d.port == 6800 {
+				act = "block"
+			}
+			rs.addFlow(flowRec{At: nowMs(), Src: src, Dst: d.ip, DPort: d.port, Proto: d.proto, Action: act})
+		}
+		rs.mu.Unlock()
+	}
 }

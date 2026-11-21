@@ -117,6 +117,7 @@ type RState struct {
 	src        Source      // the running reader (CLI session reused for blocking)
 	blockMu    sync.Mutex  // one block/unblock at a time per router
 	hasBlocks  atomic.Bool // devices are blocked: follow their IPs every 15 s
+	flows      []flowRec   // recent firewall connections from syslog (memory only)
 	lastFollow time.Time   // only touched by the poll loop
 }
 
@@ -280,6 +281,7 @@ type Hub struct {
 	settings *SettingsStore
 	notify   *Notifier
 	demo     bool
+	dhcp     dhcpWatch
 	demoMu   sync.Mutex
 	demos    map[int64]*demoRouter
 	syslog   *syslogServer
@@ -786,6 +788,9 @@ func (h *Hub) observeSection(rs *RState, name string, rows []Row, now int64) {
 	}
 	if name == "lease" || name == "lan" {
 		h.poolEvents(rs, &eff, now)
+	}
+	if name == "session" {
+		h.sessionEvents(rs, &eff, rows, now)
 	}
 	h.finish(rs, &eff, now)
 	cfg := rs.cfg

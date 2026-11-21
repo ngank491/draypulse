@@ -84,7 +84,10 @@ func (s *Server) Handler() http.Handler {
 	admin("DELETE /api/admin/routers/{id}/blocks/{ip}", s.unblockClient)
 	admin("DELETE /api/admin/routers/{id}/devices/{mac}", s.unblockDevice)
 	user("GET /api/routers/{id}/syslog", s.syslogStatus)
+	user("GET /api/routers/{id}/flows", s.routerFlows)
 	admin("POST /api/admin/routers/{id}/cli", s.runCLI)
+	admin("GET /api/admin/dhcp-scan", s.dhcpScanLast)
+	admin("POST /api/admin/dhcp-scan", s.dhcpScanNow)
 	admin("POST /api/admin/routers/{id}/syslog-source", s.addSyslogSource)
 	admin("DELETE /api/admin/routers/{id}/syslog-source/{ip}", s.removeSyslogSource)
 	admin("POST /api/admin/routers/test", s.testRouter)
@@ -1490,7 +1493,8 @@ func (s *Server) removeSyslogSource(w http.ResponseWriter, r *http.Request, u *U
 
 // diagCommands are offered in the UI; only these can be run from it.
 var diagCommands = []string{"sys version", "wan status", "show status", "ip arp status", "srv dhcp status",
-	"vlan status", "show lan", "sys iface", "ip bindmac show", "mngt rmtcfg status", "ip dhcpc status"}
+	"vlan status", "show lan", "sys iface", "ip bindmac show", "mngt rmtcfg status", "ip dhcpc status",
+	"show session", "ip session status", "ip session show", "ip dataflowmonitor status"}
 
 func (s *Server) runCLI(w http.ResponseWriter, r *http.Request, u *User) {
 	var in struct {
@@ -1522,4 +1526,35 @@ func (s *Server) runCLI(w http.ResponseWriter, r *http.Request, u *User) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"cmd": in.Cmd, "output": out[in.Cmd]})
+}
+
+// ---------- rogue DHCP scan ----------
+
+func (s *Server) dhcpScanLast(w http.ResponseWriter, r *http.Request, u *User) {
+	writeJSON(w, 200, map[string]any{"scan": s.hub.dhcp.Last()})
+}
+
+func (s *Server) dhcpScanNow(w http.ResponseWriter, r *http.Request, u *User) {
+	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
+	defer cancel()
+	writeJSON(w, 200, map[string]any{"scan": s.hub.ScanDHCP(ctx)})
+}
+
+func (s *Server) routerFlows(w http.ResponseWriter, r *http.Request, u *User) {
+	id := pathID(r, "id")
+	if !u.CanSee(id) {
+		errJSON(w, 404, "không tìm thấy")
+		return
+	}
+	rs := s.hub.get(id)
+	if rs == nil {
+		errJSON(w, 404, "không tìm thấy router")
+		return
+	}
+	src := r.URL.Query().Get("src")
+	if src != "" && net.ParseIP(src) == nil {
+		errJSON(w, 400, "IP không hợp lệ")
+		return
+	}
+	writeJSON(w, 200, rs.FlowStats(src))
 }

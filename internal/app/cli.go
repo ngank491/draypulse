@@ -34,6 +34,7 @@ var cliAllowed = map[string]bool{
 	"sys version": true, "sys iface": true, "show status": true, "show lan": true, "show statistic": true,
 	"wan status": true, "ip arp status": true, "ip dhcpc status": true, "ip route status": true,
 	"srv dhcp status": true, "mngt rmtcfg status": true, "sys syslog status": true, "vlan status": true,
+	"show session": true, "ip session status": true, "ip session show": true, "ip dataflowmonitor status": true,
 }
 
 var reCLIPing = regexp.MustCompile(`^ip ping \d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3} (AUTO|WAN\d{1,2})$`)

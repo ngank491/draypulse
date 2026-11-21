@@ -117,7 +117,7 @@ func (d *draytekSource) Close() {
 var errNeedCLI = errors.New("cần bật Telnet/SSH để đọc mục này")
 
 // slow-cycle CLI commands, read together in one session and cached briefly
-var drayCLICmds = []string{"sys version", "wan status", "ip arp status", "srv dhcp status", "vlan status", "show lan"}
+var drayCLICmds = []string{"sys version", "wan status", "ip arp status", "srv dhcp status", "vlan status", "show lan", "show session"}
 
 func (d *draytekSource) cliData(ctx context.Context) (map[string]string, error) {
 	if d.cli == nil {
@@ -199,6 +199,12 @@ func (d *draytekSource) Fetch(ctx context.Context, path string, _ []string) ([]R
 			return nil, errNotSupported
 		}
 		return parseVlanStatus(out["vlan status"]), nil
+	case "/draytek/session":
+		out, err := d.cliData(ctx)
+		if err != nil {
+			return nil, errNotSupported
+		}
+		return parseShowSession(out["show session"]), nil
 	case "/draytek/lan":
 		out, err := d.cliData(ctx)
 		if err != nil {

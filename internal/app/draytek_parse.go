@@ -379,3 +379,38 @@ func parseShowLan(s string) []Row {
 	}
 	return out
 }
+
+var reSessLine = regexp.MustCompile(`(?m)^\s*%?\s*(.+?)\s*:\s*(\d+)\s*$`)
+
+// parseShowSession reads "show session":
+//
+//	% Maximum Session Number: 60000
+//	% Maximum Session Usage: 0
+//	% Current Session Usage: 0
+//	% Current Session Used(include waiting for free): 6
+//	% WAN1 Current Session Usage: 0
+//
+// It returns one "total" row (max, current, used, peak) and one row per WAN.
+func parseShowSession(s string) []Row {
+	total := Row{"name": "total"}
+	var wans []Row
+	for _, m := range reSessLine.FindAllStringSubmatch(s, -1) {
+		k, v := strings.ToLower(m[1]), m[2]
+		switch {
+		case strings.HasPrefix(k, "maximum session number"):
+			total["max"] = v
+		case strings.HasPrefix(k, "maximum session usage"):
+			total["peak"] = v
+		case strings.HasPrefix(k, "current session used"):
+			total["used"] = v
+		case strings.HasPrefix(k, "current session usage"):
+			total["current"] = v
+		case strings.HasPrefix(k, "wan") && strings.Contains(k, "current session usage"):
+			wans = append(wans, Row{"name": normWAN(strings.Fields(m[1])[0]), "current": v})
+		}
+	}
+	if total["max"] == "" && total["current"] == "" {
+		return nil
+	}
+	return append([]Row{total}, wans...)
+}

@@ -52,6 +52,16 @@ func TestParseBindMAC(t *testing.T) {
 	if !st.Known || st.On || st.Strict || len(st.Entries) != 1 || st.Entries[0].IP != "192.168.1.46" || st.Entries[0].MAC != "00:50:7F:22:33:55" || st.Entries[0].Comment != "just" {
 		t.Fatalf("%+v", st)
 	}
+	// Vigor 3912S 4.4.3.2: comment on the same line as the entry (real output)
+	one := parseBindMAC("ip bind mac function is turned ON\nip bind mac function is STRICT OFF\nShow all IP Bind MAC entries.\nIP : 192.168.31.246 bind MAC : 02-dd-00-00-00-01 HOST ID : Comment : DrayPulse\n")
+	if !one.Known || !one.On || len(one.Entries) != 1 || one.Entries[0].Comment != "DrayPulse" || !one.Entries[0].ours() {
+		t.Fatalf("same-line comment: %+v", one)
+	}
+	// a host id between, and an entry without any comment
+	two := parseBindMAC("IP : 192.168.31.10 bind MAC : 00-50-7f-22-33-55 HOST ID : nas Comment : kho\nIP : 192.168.31.11 bind MAC : 02-dd-00-00-00-01 HOST ID :\n")
+	if len(two.Entries) != 2 || two.Entries[0].Comment != "kho" || two.Entries[0].ours() || !two.Entries[1].ours() {
+		t.Fatalf("variants: %+v", two)
+	}
 	if parseBindMAC("% Unknown command").Known {
 		t.Fatal("unknown output must not look like a state")
 	}
@@ -370,5 +380,25 @@ func TestBindShowUnknownOutput(t *testing.T) {
 	}
 	if !reBindHeader.MatchString("Show all IP Bind MAC entries.\n") || reBindHeader.MatchString("% Unknown command") {
 		t.Fatal("header detection")
+	}
+}
+
+// The exact Vigor 3912S output that made 0.4.1 undo a correct block.
+func TestBlockVigor3912SOneLineFormat(t *testing.T) {
+	bm := &simBindMAC{OneLine: true}
+	h, r, _ := blockHarness(t, bm)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if _, err := h.BlockDevice(ctx, r.ID, "6A:FD:1E:76:34:40", "192.168.1.246", "A23-cua-the", "A23-cua-the", "", true, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	if !bm.on || len(bm.entries) != 1 {
+		t.Fatalf("%+v", bm)
+	}
+	if err := h.UnblockDevice(ctx, r.ID, "6A:FD:1E:76:34:40", "admin"); err != nil {
+		t.Fatal(err)
+	}
+	if bm.on || len(bm.entries) != 0 {
+		t.Fatal("cleanup")
 	}
 }

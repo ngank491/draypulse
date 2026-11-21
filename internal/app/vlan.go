@@ -257,3 +257,30 @@ func (h *Hub) poolEvents(rs *RState, eff *effects, now int64) {
 		}
 	}
 }
+
+// sessionEvents warns when the router's NAT session table is ≥ 85 % full
+// (a common cause of "Internet is slow / pages do not open" on DrayTek)
+// and clears below 70 %.
+func (h *Hub) sessionEvents(rs *RState, eff *effects, rows []Row, now int64) {
+	if len(rows) == 0 || rows[0]["name"] != "total" {
+		return
+	}
+	mx, _ := strconv.Atoi(rows[0]["max"])
+	cur, err := strconv.Atoi(firstNonEmpty(rows[0]["current"], rows[0]["used"]))
+	if mx <= 0 || err != nil {
+		return
+	}
+	if rs.PoolFull == nil {
+		rs.PoolFull = map[string]bool{}
+	}
+	pct := cur * 100 / mx
+	switch {
+	case pct >= 85 && !rs.PoolFull["#sessions"]:
+		rs.PoolFull["#sessions"], rs.dirty = true, true
+		eff.add(now, "warning", "🧮", fmt.Sprintf("Bảng session NAT của router sắp đầy: %d/%d (%d%%) – mạng có thể chậm, không mở được trang web", cur, mx, pct), true)
+	case pct < 70 && rs.PoolFull["#sessions"]:
+		delete(rs.PoolFull, "#sessions")
+		rs.dirty = true
+		eff.add(now, "info", "🧮", fmt.Sprintf("Session NAT đã giảm: %d/%d (%d%%)", cur, mx, pct), false)
+	}
+}

@@ -1,0 +1,7 @@
+% Maximum Session Number: 60000
+% Maximum Session Usage: 41250
+% Current Session Usage: 38810
+% Current Session Used(include waiting for free): 39102
+% WAN1 Current Session Usage: 30120
+% WAN2 Current Session Usage: 8690
+% WAN3 Current Session Usage: 0

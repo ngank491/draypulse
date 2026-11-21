@@ -449,6 +449,9 @@ function tabOverview(id) {
         tile('Model', r['board-name'] || '–', true),
         tile('Ngày build firmware', r.build || '–', true),
         tile('VPN đang kết nối', v.sections.ppp_active ? String(vpn) : '–', true),
+        (() => { const se = (v.sections.session || [])[0]; if (!se || !+se.max) return null;
+          const cur = +(se.current || se.used || 0), pc = Math.round(cur * 100 / +se.max);
+          return tile('Session NAT', h('span', { class: pc >= 85 ? 'bad-text' : null }, `${cur.toLocaleString('vi')} / ${(+se.max).toLocaleString('vi')} (${pc}%)`), true); })(),
         health.map(x => tile(x.name, x.value + (x.type === 'C' ? ' °C' : x.type === 'V' ? ' V' : ''), true)),
         tile('Thiết bị theo dõi', v.monitorsTotal ? `${v.monitorsTotal - v.monitorsDown}/${v.monitorsTotal} hoạt động` : 'chưa có', true));
       const names = v.ifaces.filter(i => !i.disabled).map(i => i.name);
@@ -491,6 +494,7 @@ function tabWan(id) {
       fill(note, v.wans.some(w => !w.configured) ?
         ['WAN mờ là gợi ý tự phát hiện, chưa được kiểm tra Internet. ', me.role === 'admin' ? h('a', { href: `#/admin/routers?edit=${id}` }, 'Chọn WAN cần theo dõi →') : 'Liên hệ quản trị để bật theo dõi.'] :
         `Internet được kiểm tra bằng ping ${v.wanTarget} qua từng WAN mỗi 30 giây (lệnh “ip ping” trên router khi có Telnet/SSH; nếu không, ping từ máy DrayPulse); báo mất sau 2 lần liên tiếp thất bại.`);
+      const sessOf = n => { const r = (v.sections.session || []).find(x => x.name === n); return r ? +r.current : null; };
       ws.draw([
         { t: 'WAN', v: x => x.name, r: x => h('div', null, h('b', null, x.name), x.label && x.label !== x.name ? h('div', { class: 'muted small' }, x.label) : null) },
         { t: 'Trạng thái', v: x => x.status, r: x => x.enabled === 'false' ? badge('disabled', 'Tắt') : badge(x.status === 'up' ? 'up' : 'down', x.state || x.status) },
@@ -498,6 +502,7 @@ function tabWan(id) {
         { t: 'IP', v: x => ipKey(x.address || ''), r: x => h('span', { class: 'mono' }, x.address || '–') },
         { t: 'Gateway', v: x => x.gateway, r: x => h('span', { class: 'mono' }, x.gateway || '–') },
         { t: 'DNS', v: x => x.dns, r: x => h('span', { class: 'mono small' }, x.dns || '') },
+        { t: 'Session', num: true, v: x => sessOf(x.name), r: x => sessOf(x.name) == null ? '–' : sessOf(x.name).toLocaleString('vi') },
         { t: 'Đã kết nối', num: true, v: x => +x.uptime || 0, r: x => +x.uptime ? fmtDur(+x.uptime) : '–' },
       ], v.sections.wan_status || [], { empty: 'Cần bật Telnet/SSH để đọc trạng thái WAN chi tiết.', rowClass: x => x.enabled === 'false' ? 'off' : null });
     },
@@ -957,6 +962,41 @@ function tabPpp(id) {
 // --- Syslog tab: lines the router pushed to DrayPulse, plus diagnostics
 function tabSyslog(id) {
   let a, diag, view, status = null, lastStatus = 0, fac = ui.syslogFac || '';
+  let fsrc, fdst, flowSel = ui.flowSel && ui.flowSel.router === id ? ui.flowSel.ip : '', lastFlows = 0, flows = null, fnote;
+  const nameOf = ip => { const c = view && view.clients.find(x => x.ip === ip); return c ? (c.name || c.vendor || '') : ''; };
+  const loadFlows = async () => {
+    lastFlows = Date.now();
+    try { flows = await api('GET', `/api/routers/${id}/flows` + (flowSel ? '?src=' + encodeURIComponent(flowSel) : '')); } catch { flows = null; }
+    drawFlows();
+  };
+  const drawFlows = () => {
+    if (!fsrc) return;
+    const f = flows || { total: 0, sources: [], dests: [] };
+    fsrc.draw([
+      { t: 'Thiết bị (IP nguồn)', v: x => ipKey(x.ip), r: x => h('div', null, h('b', { class: 'mono' }, x.ip), nameOf(x.ip) ? h('div', { class: 'small muted' }, nameOf(x.ip)) : null) },
+      { t: 'Kết nối', num: true, v: x => x.flows },
+      { t: 'Số đích khác nhau', num: true, v: x => x.dests },
+      { t: 'Bị chặn', num: true, v: x => x.blocked, r: x => x.blocked ? h('span', { class: 'bad-text' }, String(x.blocked)) : '0' },
+      { t: 'Lần cuối', v: x => x.last, r: x => h('span', { class: 'small' }, fmtTime(x.last)) },
+    ], f.sources, { empty: 'Chưa có dòng Firewall log nào (xem hướng dẫn bật bên dưới).',
+      onRow: x => { flowSel = flowSel === x.ip ? '' : x.ip; ui.flowSel = { router: id, ip: flowSel }; loadFlows(); }, selected: x => x.ip === flowSel });
+    fdst.el.classList.toggle('hidden', !flowSel);
+    if (flowSel) {
+      fill(fdst.titleEl, `${flowSel}${nameOf(flowSel) ? ' (' + nameOf(flowSel) + ')' : ''} đang truy cập`);
+      fdst.draw([
+        { t: 'Đích', v: x => ipKey(x.dst), r: x => h('span', { class: 'mono' }, x.dst) },
+        { t: 'Cổng', num: true, v: x => x.port, r: x => x.port ? String(x.port) : '–' },
+        { t: 'Dịch vụ', v: x => x.service, r: x => x.service || '–' },
+        { t: 'Giao thức', v: x => x.proto },
+        { t: 'Số lần', num: true, v: x => x.count },
+        { t: 'Bị chặn', num: true, v: x => x.blocked, r: x => x.blocked ? h('span', { class: 'bad-text' }, String(x.blocked)) : '0' },
+        { t: 'Lần cuối', v: x => x.last, r: x => h('span', { class: 'small' }, fmtTime(x.last)) },
+      ], f.dests, { empty: 'Không có kết nối nào của thiết bị này trong log gần đây.' });
+    }
+    fill(fnote, f.total ? `Thống kê từ ${f.total} kết nối gần nhất trong Firewall log (từ ${fmtTime(f.since)}; giữ tối đa 20.000 dòng, mất khi DrayPulse khởi động lại). Bấm vào một thiết bị để xem nó truy cập IP/cổng nào.` :
+      ['Để thấy thiết bị đang truy cập gì, router cần gửi Firewall log: ', h('b', null, 'Firewall → General Setup / Filter Setup'), ' – bật Syslog cho rule cần theo dõi (ví dụ Default Data Filter, hướng LAN → WAN, Pass Immediately, Syslog: Enable); ',
+        h('b', null, 'System Maintenance → SysLog / Mail Alert'), ' – tick Firewall Log. Lưu ý: log rất nhiều dòng, chỉ nên bật cho nhóm IP cần theo dõi (dùng IP Object làm Source IP của rule).']);
+  };
   const FAC = { vpn: 'VPN', wan: 'WAN', user: 'Truy cập', call: 'Kết nối', system: 'Hệ thống', firewall: 'Firewall', other: 'Khác' };
   const facSel = h('select', { class: 'inline', onchange: e => { fac = ui.syslogFac = e.target.value; render(); } },
     [['', 'Mọi loại'], ...Object.entries(FAC)].map(([k, t]) => h('option', { value: k, selected: k === fac }, t)));
@@ -1009,12 +1049,17 @@ function tabSyslog(id) {
     mount(el) {
       a = tablePanel('Syslog gần đây (300 dòng mới nhất)', 'syslog-' + id, facSel);
       diag = h('div');
-      el.append(h('div', { class: 'stack' }, diag, a.el));
-      loadStatus();
+      fsrc = tablePanel('Thiết bị đang truy cập gì (từ Firewall log)', 'flows-' + id);
+      fdst = tablePanel('Đích truy cập', 'flowdst-' + id);
+      fdst.titleEl = fdst.el.querySelector('.panel-h h2');
+      fnote = h('p', { class: 'hint' });
+      el.append(h('div', { class: 'stack' }, diag, fsrc.el, fdst.el, fnote, a.el));
+      loadStatus(); loadFlows();
     },
     update(v) {
       view = v; render();
       if (Date.now() - lastStatus > 15000) loadStatus();
+      if (Date.now() - lastFlows > 10000) loadFlows();
     },
   };
 }
@@ -1469,7 +1514,7 @@ function routerForm(r, view, sys) {
   const v3Box = h('div', { class: 'form full' }, field('User SNMPv3', v3user), field('Xác thực', authProto), field('Mật khẩu xác thực', authPass), field('Mã hoá', privProto), field('Mật khẩu mã hoá', privPass));
   const snmpBox = h('div', { class: 'form full' }, field('Phiên bản SNMP', snmpVer), field('Cổng SNMP', snmpPort), v2Box, v3Box,
     h('p', { class: 'hint full' }, 'SNMP cho CPU, RAM, uptime, model/firmware, lưu lượng từng cổng/WAN và danh sách VPN đang kết nối.'));
-  const diagSel = h('select', { class: 'inline' }, ['sys version', 'wan status', 'show status', 'ip arp status', 'srv dhcp status', 'vlan status', 'show lan', 'sys iface', 'ip bindmac show', 'mngt rmtcfg status', 'ip dhcpc status'].map(c => h('option', { value: c }, c)));
+  const diagSel = h('select', { class: 'inline' }, ['sys version', 'wan status', 'show status', 'ip arp status', 'srv dhcp status', 'vlan status', 'show lan', 'sys iface', 'ip bindmac show', 'mngt rmtcfg status', 'ip dhcpc status', 'show session', 'ip session status', 'ip session show', 'ip dataflowmonitor status'].map(c => h('option', { value: c }, c)));
   const diagOut = h('pre', { class: 'small hidden' });
   const diagBox = isNew ? null : h('div', { class: 'full stack' }, h('div', { class: 'row' }, h('span', { class: 'small' }, 'Thử lệnh xem trên router:'), diagSel,
     h('button', { type: 'button', class: 'sm', onclick: e => busy(e.target, async () => {
@@ -1656,6 +1701,24 @@ function settingsPage() {
       const sumOn = h('input', { type: 'checkbox', checked: st.summaryOn });
       const sumAt = h('input', { type: 'time', value: st.summaryAt });
       const notifyNew = h('input', { type: 'checkbox', checked: st.notifyNew });
+      const dhcpWatch = h('input', { type: 'checkbox', checked: !!st.dhcpWatch });
+      const dhcpAllowed = h('input', { value: st.dhcpAllowed || '', class: 'mono', placeholder: 'ví dụ 192.168.1.2 (AP/switch có DHCP hợp lệ)' });
+      const dhcpOut = h('div');
+      const drawScan = sc => fill(dhcpOut, !sc ? h('p', { class: 'hint' }, 'Chưa dò lần nào kể từ khi DrayPulse khởi động.') : h('div', { class: 'stack' },
+        h('div', { class: 'small' }, 'Lần dò gần nhất: ' + fmtTime(sc.at)),
+        sc.seen.length ? h('div', { class: 'tw' }, h('table', null, h('thead', null, h('tr', null, ['DHCP server', 'Cấp IP', 'Gateway', 'Qua cổng', 'Đánh giá'].map(x => h('th', null, x)))),
+          h('tbody', null, sc.seen.map(x => h('tr', { class: x.allowed ? null : 'bad' }, h('td', { class: 'mono' }, x.server), h('td', { class: 'mono' }, x.offered), h('td', { class: 'mono' }, x.gateway || '–'), h('td', null, x.iface),
+            h('td', null, x.allowed ? badge('up', 'Hợp lệ' + (x.owner ? ' · ' + x.owner : '')) : badge('down', 'DHCP lạ')))))))
+          : h('p', { class: 'hint' }, 'Không có DHCP server nào trả lời trên các cổng mạng của máy DrayPulse.'),
+        (sc.errors || []).map(e => h('div', { class: 'err-line' }, e))));
+      api('GET', '/api/admin/dhcp-scan').then(r => drawScan(r.scan)).catch(() => { });
+      const dhcpPanel = h('div', { class: 'panel' }, h('div', { class: 'panel-h' }, h('h2', null, 'Phát hiện DHCP giả mạo')),
+        h('div', { class: 'panel-b stack' },
+          check('Dò DHCP server lạ mỗi 10 phút và cảnh báo', dhcpWatch),
+          field('DHCP server hợp lệ khác (ngoài các router đang giám sát)', dhcpAllowed),
+          h('div', { class: 'row' }, h('button', { type: 'button', onclick: e => busy(e.target, async () => { const r = await api('POST', '/api/admin/dhcp-scan'); drawScan(r.scan); }) }, 'Dò ngay')),
+          dhcpOut,
+          h('p', { class: 'hint' }, 'DrayPulse gửi một gói DHCPDISCOVER trên mỗi cổng mạng của máy chạy nó và ghi lại mọi DHCP server trả lời (không nhận IP). Server không phải router đang giám sát – thường là modem/router Wi-Fi cắm nhầm vào LAN – sẽ bị cảnh báo qua Telegram/Zalo. Chỉ thấy được các mạng/VLAN mà máy DrayPulse cắm vào; cần chạy bằng dịch vụ từ install.sh (quyền dùng cổng 68).')));
       const repeat = h('select', null, [[0, 'Không nhắc lại'], [15, '15 phút'], [30, '30 phút'], [60, '1 giờ'], [120, '2 giờ']].map(([v, t]) => h('option', { value: v, selected: st.repeatMin === v }, t)));
       const tz = h('input', { value: st.timezone });
       const keep = h('input', { type: 'number', min: 1, max: 400, value: st.retentionDays });
@@ -1665,7 +1728,8 @@ function settingsPage() {
       const form = h('form', { class: 'stack', onsubmit: e => { e.preventDefault(); busy(save, async () => {
         const body = { adminChat: inputs.telegram.chat.value, zaloAdmin: inputs.zalo.chat.value, summaryOn: sumOn.checked, summaryAt: sumAt.value, notifyNew: notifyNew.checked,
           repeatMin: +repeat.value, timezone: tz.value, retentionDays: +keep.value, pushBase: base.value,
-          aiFallback: aiFallback.checked, aiConsent: aiConsent.checked, aiAnonymize: aiAnon.checked, autoAudit: autoAudit.checked };
+          aiFallback: aiFallback.checked, aiConsent: aiConsent.checked, aiAnonymize: aiAnon.checked, autoAudit: autoAudit.checked,
+          dhcpWatch: dhcpWatch.checked, dhcpAllowed: dhcpAllowed.value };
         for (const c of CH) {
           const i = inputs[c.k];
           if (i.remove.checked) body[c.tokenKey] = ''; else if (i.token.value) body[c.tokenKey] = i.token.value;
@@ -1682,6 +1746,7 @@ function settingsPage() {
             field('Nhắc lại khi WAN/router vẫn lỗi', repeat),
             h('div', { class: 'full' }, check('Báo khi có thiết bị lạ lần đầu vào mạng', notifyNew)),
             h('p', { class: 'hint full' }, 'Cảnh báo gửi tới Chat ID quản trị của mọi kênh đã cấu hình, và tới Chat ID riêng của từng router (nếu có). Gõ /status (Telegram) hoặc “status” (Zalo) cho bot để xem tình trạng bất cứ lúc nào.'))),
+        dhcpPanel,
         h('div', { class: 'panel' }, h('div', { class: 'panel-h' }, h('h2', null, 'Hệ thống')),
           h('div', { class: 'panel-b form' },
             field('Múi giờ', tz), field('Số ngày lưu lịch sử', keep),

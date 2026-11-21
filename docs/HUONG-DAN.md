@@ -180,6 +180,37 @@ Chặn một thiết bị khỏi mạng ngay từ DrayPulse, **không cần chu�
 
 ---
 
+### Session NAT của router
+
+DrayPulse đọc `show session` mỗi phút: tổng session đang dùng / tối đa (ô **Session NAT** ở trang Tổng quan) và số session theo từng WAN (tab WAN). Khi bảng session đầy từ **85%** trở lên, DrayPulse gửi cảnh báo – đây là nguyên nhân hay gặp khiến mạng chậm, trang web không mở được (thường do camera P2P, phần mềm torrent, máy nhiễm virus). Hết cảnh báo khi xuống dưới 70%.
+
+Session/băng thông **theo từng IP** (trang *Diagnostics → Data Flow Monitor* trên router) chưa có lệnh Telnet/SSH trong tài liệu DrayTek nên DrayPulse chưa đọc được. Bạn có thể thử các lệnh `ip session status`, `ip session show`, `ip dataflowmonitor status` trong công cụ **Thử lệnh xem trên router** và gửi kết quả để bổ sung.
+
+### Phát hiện DHCP giả mạo
+
+**Cài đặt → Phát hiện DHCP giả mạo**: tick "Dò DHCP server lạ mỗi 10 phút". DrayPulse gửi một gói DHCPDISCOVER trên mỗi cổng mạng của máy chạy nó và ghi lại mọi DHCP server trả lời (không nhận IP). Server không phải router đang giám sát – thường là modem hoặc router Wi-Fi gia đình cắm nhầm vào LAN, làm máy trạm nhận sai IP/gateway và "mất mạng" ngẫu nhiên – bị cảnh báo qua Telegram/Zalo (tối đa 6 giờ/lần cho mỗi server). Có nút **Dò ngay** và bảng kết quả lần dò gần nhất.
+
+- Chỉ thấy các mạng/VLAN mà máy DrayPulse cắm vào (với VLAN khác, cần máy DrayPulse có cổng/sub-interface trong VLAN đó).
+- Cần chạy bằng dịch vụ từ `install.sh` (quyền dùng cổng 68). Chỉ hỗ trợ khi DrayPulse chạy trên Linux.
+- DHCP server hợp lệ khác (ví dụ một AP chạy DHCP cho mạng khách) điền vào ô "DHCP server hợp lệ khác".
+
+### Thiết bị đang truy cập gì (Firewall log)
+
+Tab **Syslog** → bảng **"Thiết bị đang truy cập gì"**: DrayPulse đọc các dòng Firewall log router gửi về, thống kê theo từng IP trong LAN (số kết nối, số đích, số lần bị chặn). Bấm một thiết bị để xem nó truy cập IP/cổng nào (kèm tên dịch vụ phổ biến: HTTPS, DNS, Remote Desktop, STUN gọi video, Apple/Google push…).
+
+Bật trên router:
+
+1. *Firewall → Filter Setup* (hoặc *General Setup → Default Rule*): bật **Syslog** cho rule cần theo dõi, ví dụ một rule hướng LAN/DMZ/RT/VPN → WAN, Source IP là IP Object chứa các máy cần theo dõi, Filter **Pass Immediately**, Syslog **Enable**.
+2. *System Maintenance → SysLog / Mail Alert*: tick **Firewall Log**, Server IP = máy DrayPulse.
+
+Firewall log rất nhiều dòng: chỉ nên bật cho nhóm IP cần theo dõi. DrayPulse giữ 20.000 kết nối gần nhất cho mỗi router trong bộ nhớ (mất khi khởi động lại).
+
+### Thử lệnh xem trên router
+
+*Router → Sửa → Telnet/SSH → Thử lệnh xem trên router*: chạy một lệnh **chỉ xem** trong danh sách (sys version, wan status, ip arp status, srv dhcp status, vlan status, show lan, show session, ip bindmac show, ip session status…) và xem nguyên văn output. Dùng khi một chức năng báo lỗi đọc dữ liệu: gửi output này để biết firmware của bạn in khác tài liệu thế nào.
+
+---
+
 ## 4. Nhận cảnh báo qua Telegram
 
 ### Bước T1. Tạo bot
@@ -257,6 +288,8 @@ Có thể bật **cả Telegram và Zalo** cùng lúc: mỗi cảnh báo đượ
 | Firmware DrayOS đổi phiên bản | ✔ | ✔ |
 | VLAN bật/tắt hoặc đổi VID/cổng/subnet | ✔ | ✔ |
 | DHCP một subnet dùng ≥ 90% địa chỉ | ✔ | ✔ |
+| Bảng session NAT của router ≥ 85% | ✔ | ✔ |
+| Phát hiện DHCP server lạ trong mạng | ✔ | ✔ |
 | Chặn / bỏ chặn IP client (kèm người thực hiện) | ✔ | – |
 | VPN kết nối / ngắt, WAN lên/xuống, đăng nhập quản trị (từ syslog) | ✔ | – |
 | Thiết bị lạ lần đầu vào mạng | ✔ | tuỳ chọn trong Cài đặt |

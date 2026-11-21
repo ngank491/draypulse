@@ -403,3 +403,42 @@ func TestParseVlanAndLan(t *testing.T) {
 		t.Fatalf("%+v %+v", l[2], l[3])
 	}
 }
+
+func TestParseShowSession(t *testing.T) {
+	r := parseShowSession(fixture(t, "show_session.txt"))
+	if len(r) != 4 || r[0]["max"] != "60000" || r[0]["current"] != "38810" || r[0]["used"] != "39102" || r[0]["peak"] != "41250" ||
+		r[1]["name"] != "WAN1" || r[1]["current"] != "30120" || r[3]["current"] != "0" {
+		t.Fatalf("%+v", r)
+	}
+	if parseShowSession("% Unknown command") != nil {
+		t.Fatal("garbage must give nothing")
+	}
+}
+
+func TestParseFlow(t *testing.T) {
+	f, ok := parseFlow("[FILTER][Block][LAN/RT/VPN->WAN, 30:00:19   ][@S:R=2:2, 192.168.188.10:53072->176.34.105.234:8443][TCP][HLen=20, TLen=52, Flag=S, Seq=1, Ack=0, Win=64240]", 5)
+	if !ok || f.Src != "192.168.188.10" || f.Dst != "176.34.105.234" || f.DPort != 8443 || f.Proto != "TCP" || f.Action != "block" {
+		t.Fatalf("%+v", f)
+	}
+	f, ok = parseFlow("[FILTER][Pass][LAN/RT/VPN->WAN, 0:00:59 ][@S:R=2:1, 192.168.1.20->8.8.8.8][ICMP][HLen=20, TLen=60]", 6)
+	if !ok || f.DPort != 0 || f.Proto != "ICMP" || f.Action != "pass" {
+		t.Fatalf("%+v", f)
+	}
+	if _, ok := parseFlow("WAN 1 is down", 7); ok {
+		t.Fatal("not a flow")
+	}
+	rs := &RState{}
+	for i := range 30 {
+		rs.addFlow(flowRec{At: int64(i), Src: "192.168.1.20", Dst: "142.250.1.1", DPort: 443, Proto: "TCP", Action: "pass"})
+	}
+	rs.addFlow(flowRec{At: 99, Src: "192.168.1.20", Dst: "1.2.3.4", DPort: 3389, Proto: "TCP", Action: "block"})
+	rs.addFlow(flowRec{At: 100, Src: "192.168.1.21", Dst: "8.8.8.8", DPort: 53, Proto: "UDP", Action: "pass"})
+	sum := rs.FlowStats("")
+	if sum.Total != 32 || len(sum.Sources) != 2 || sum.Sources[0].IP != "192.168.1.20" || sum.Sources[0].Dests != 2 || sum.Sources[0].Blocked != 1 {
+		t.Fatalf("%+v", sum.Sources)
+	}
+	one := rs.FlowStats("192.168.1.20")
+	if len(one.Dests) != 2 || one.Dests[0].Service != "HTTPS" || one.Dests[0].Count != 30 || one.Dests[1].Service != "Remote Desktop" || one.Dests[1].Blocked != 1 {
+		t.Fatalf("%+v", one.Dests)
+	}
+}

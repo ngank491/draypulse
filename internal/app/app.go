@@ -243,6 +243,7 @@ func Run(ctx context.Context, cfg *Config) error {
 	if err := hub.Start(runCtx); err != nil {
 		return err
 	}
+	go hub.runDHCPWatch(runCtx)
 	if cfg.Syslog != "" && cfg.Syslog != "off" {
 		if err := hub.StartSyslog(runCtx, cfg.Syslog); err != nil {
 			log.Printf("syslog: %v (bỏ qua)", err)

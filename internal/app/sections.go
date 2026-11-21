@@ -54,6 +54,7 @@ var sections = []section{
 	{"wan_status", "/draytek/wan", wanStatusProps},
 	{"vlan", "/draytek/vlan", vlanProps},
 	{"lan", "/draytek/lan", lanProps},
+	{"session", "/draytek/session", []string{"name", "max", "current", "used", "peak"}},
 	{"health", "/system/health", []string{"name", "value", "type"}},
 	{"identity", "/system/identity", []string{"name"}},
 }

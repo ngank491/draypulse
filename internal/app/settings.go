@@ -2,6 +2,7 @@ package app
 
 import (
 	"errors"
+	"net"
 	"net/url"
 	"regexp"
 	"strings"
@@ -30,6 +31,8 @@ type Settings struct {
 	AIConsent     bool         `json:"aiConsent"`   // admin agreed to send (redacted) router config to Anthropic
 	AIAnonymize   bool         `json:"aiAnonymize"` // replace public IPs/MACs with placeholders
 	AutoAudit     bool         `json:"autoAudit"`   // weekly audit on Sunday morning
+	DHCPWatch     bool         `json:"dhcpWatch"`   // look for rogue DHCP servers every 10 minutes
+	DHCPAllowed   string       `json:"dhcpAllowed"` // extra legitimate DHCP servers (comma separated)
 }
 
 func defaultSettings() Settings {
@@ -320,9 +323,19 @@ type SettingsInput struct {
 	AIConsent     bool    `json:"aiConsent"`
 	AIAnonymize   bool    `json:"aiAnonymize"`
 	AutoAudit     bool    `json:"autoAudit"`
+	DHCPWatch     bool    `json:"dhcpWatch"`
+	DHCPAllowed   string  `json:"dhcpAllowed"`
 }
 
 func (s *SettingsStore) Update(in SettingsInput) error {
+	var allowed []string
+	for _, x := range strings.FieldsFunc(in.DHCPAllowed, func(r rune) bool { return r == ',' || r == ' ' || r == '\n' }) {
+		if net.ParseIP(x) == nil || net.ParseIP(x).To4() == nil {
+			return errors.New("danh sách DHCP server hợp lệ chỉ gồm địa chỉ IPv4, cách nhau dấu phẩy")
+		}
+		allowed = append(allowed, x)
+	}
+	in.DHCPAllowed = strings.Join(allowed, ", ")
 	in.AdminChat = strings.TrimSpace(in.AdminChat)
 	in.ZaloAdmin = strings.TrimSpace(in.ZaloAdmin)
 	if in.ZaloAdmin != "" && !reZaloChat.MatchString(in.ZaloAdmin) {
@@ -368,6 +381,7 @@ func (s *SettingsStore) Update(in SettingsInput) error {
 		next.ZaloToken = s.box.Seal(t)
 	}
 	next.ZaloAdmin, next.NotifyNew = in.ZaloAdmin, in.NotifyNew
+	next.DHCPWatch, next.DHCPAllowed = in.DHCPWatch, in.DHCPAllowed
 	next.AIFallback, next.AIConsent, next.AIAnonymize, next.AutoAudit = in.AIFallback, in.AIConsent, in.AIAnonymize, in.AutoAudit
 	next.AdminChat, next.SummaryOn, next.SummaryAt = in.AdminChat, in.SummaryOn, in.SummaryAt
 	next.RepeatMin, next.Timezone, next.RetentionDays, next.PushBase = in.RepeatMin, in.Timezone, in.RetentionDays, in.PushBase
