@@ -481,6 +481,12 @@ func (c *cliClient) RunWrite(ctx context.Context, cmds ...string) (map[string]st
 func (c *cliClient) run(ctx context.Context, cmds []string) (map[string]string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.runHeld(ctx, cmds)
+}
+
+// runHeld is run for a caller that already holds c.mu (a blocking
+// transaction keeps the session for all of its commands).
+func (c *cliClient) runHeld(ctx context.Context, cmds []string) (map[string]string, error) {
 	if c.cc != nil && time.Since(c.cc.lastUse) > cliIdle {
 		c.closeLocked() // log out before the router drops the idle session itself
 	}

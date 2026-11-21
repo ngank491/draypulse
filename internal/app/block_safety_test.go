@@ -429,3 +429,35 @@ func TestUnblockAll(t *testing.T) {
 		}
 	}
 }
+
+// A blocking transaction keeps the router's CLI session for all of its
+// commands: the poller's reads and pings wait instead of interleaving.
+func TestBindSessionHoldsCLI(t *testing.T) {
+	bm := &simBindMAC{}
+	h, r, _ := blockHarness(t, bm)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	o, done, err := h.bindSession(ctx, h.get(r.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	finished := make(chan struct{})
+	go func() { o.cli.Run(ctx, "sys version"); close(finished) }()
+	if _, err := o.show(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-finished:
+		t.Fatal("another command ran in the middle of the transaction")
+	case <-time.After(200 * time.Millisecond):
+	}
+	if _, err := o.show(); err != nil {
+		t.Fatal(err)
+	}
+	done()
+	select {
+	case <-finished:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the waiting command must run once the transaction ends")
+	}
+}

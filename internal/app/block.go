@@ -144,13 +144,19 @@ func asDraytek(s Source) *draytekSource {
 	return nil
 }
 
+// bindOps runs one blocking transaction. It holds the router's CLI session
+// for the whole transaction (see bindSession), so its commands are not queued
+// behind the poller's reads and pings one by one.
 type bindOps struct {
 	cli *cliClient
 	ctx context.Context
 }
 
 func (o *bindOps) run(cmd string) (string, error) {
-	out, err := o.cli.RunWrite(o.ctx, cmd)
+	if !cliWriteCommandAllowed(cmd) {
+		return "", fmt.Errorf("lệnh CLI không được phép: %q", cmd)
+	}
+	out, err := o.cli.runHeld(o.ctx, []string{cmd})
 	if err != nil {
 		return "", err
 	}
@@ -586,12 +592,15 @@ func (h *Hub) blockDevice(ctx context.Context, routerID int64, mac, ip, name, ho
 	return &d, nil
 }
 
+// bindSession takes the router's CLI session for one transaction; the
+// returned func releases it. Nothing else may use the CLI client before then.
 func (h *Hub) bindSession(ctx context.Context, rs *RState) (*bindOps, func(), error) {
 	cli, done, err := h.blockCLI(rs)
 	if err != nil {
 		return nil, nil, err
 	}
-	return &bindOps{cli: cli, ctx: ctx}, done, nil
+	cli.mu.Lock()
+	return &bindOps{cli: cli, ctx: ctx}, func() { cli.mu.Unlock(); done() }, nil
 }
 
 // BlockClient blocks a single IP without tying it to a device.

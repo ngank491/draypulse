@@ -158,7 +158,22 @@ function modal(title, content, actions) {
   const close = () => { bg.remove(); ui.modal = false; };
   const foot = h('div', { class: 'modal-foot' });
   for (const a of actions || []) foot.append(h('button', { class: a.cls || '', type: a.submit ? 'submit' : 'button', onclick: a.submit ? null : () => a.fn(close) }, a.t));
-  const form = h('form', { class: 'panel modal', onsubmit: e => { e.preventDefault(); const a = (actions || []).find(x => x.submit); if (a) a.fn(close); } },
+  // the main action may wait on the router for a while: show it and ignore repeated clicks
+  let running = false;
+  const submit = async a => {
+    if (running) return;
+    running = true;
+    const btn = foot.querySelector('button[type=submit]'), label = btn && btn.textContent;
+    const others = [...foot.querySelectorAll('button')];
+    others.forEach(b => b.disabled = true);
+    if (btn) btn.textContent = 'Đang xử lý…';
+    try { await a.fn(close); } finally {
+      running = false;
+      others.forEach(b => b.disabled = false);
+      if (btn) btn.textContent = label;
+    }
+  };
+  const form = h('form', { class: 'panel modal', onsubmit: e => { e.preventDefault(); const a = (actions || []).find(x => x.submit); if (a) submit(a); } },
     h('div', { class: 'panel-h' }, h('h2', { class: 'grow' }, title), h('button', { type: 'button', class: 'link', onclick: close, 'aria-label': 'Đóng' }, '✕')),
     h('div', { class: 'panel-b' }, content), foot);
   bg.addEventListener('mousedown', e => { if (e.target === bg) close(); });
