@@ -116,6 +116,9 @@ func TestCLILogsOutWhenIdle(t *testing.T) {
 // command is retried on a new session once the slot is free.
 func TestCLIRouterDroppedSession(t *testing.T) {
 	fastCLITimers(t, time.Minute, 150*time.Millisecond)
+	old := cliSettle
+	cliSettle = 20 * time.Millisecond // shorter than the simulated idle drop
+	t.Cleanup(func() { cliSettle = old })
 	sim := echoSim(t)
 	sim.MaxSessions, sim.IdleTimeout, sim.ReleaseDelay = 1, 150*time.Millisecond, 350*time.Millisecond
 	c := simClient(sim)
@@ -202,4 +205,68 @@ func TestUrgentLockJumpsQueue(t *testing.T) {
 	if waited > 350*time.Millisecond { // one command (+ slack), not six
 		t.Fatalf("blocking transaction waited %v behind routine commands", waited)
 	}
+}
+
+// DrayOS prints a second prompt after an SSH login. Read as the answer to the
+// first command, it shifted every later answer by one (WAN pings empty, the
+// ARP table read as DHCP leases).
+func TestCLINoShiftAfterExtraPrompt(t *testing.T) {
+	for _, settle := range []time.Duration{cliSettle, time.Millisecond} { // the drain, then the echo guard alone
+		t.Run(settle.String(), func(t *testing.T) {
+			old := cliSettle
+			cliSettle = settle
+			t.Cleanup(func() { cliSettle = old })
+			fastCLITimers(t, time.Minute, 50*time.Millisecond)
+			sim := echoSim(t)
+			sim.ExtraPrompt = true
+			c := simClient(sim)
+			defer c.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			out, err := c.Run(ctx, "ip ping 8.8.8.8 WAN1", "sys version", "ip arp status")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, cmd := range []string{"ip ping 8.8.8.8 WAN1", "sys version", "ip arp status"} {
+				if out[cmd] != "ok "+cmd {
+					t.Fatalf("%q got %q (answers shifted)", cmd, out[cmd])
+				}
+			}
+			o2, err := c.Run(ctx, "srv dhcp status")
+			if err != nil || o2["srv dhcp status"] != "ok srv dhcp status" {
+				t.Fatalf("next call: %q %v", o2, err)
+			}
+		})
+	}
+}
+
+// Audit and "Kiểm tra kết nối" borrow the poller's session: Vigor routers
+// accept one Telnet/SSH session only.
+func TestSharedCLI(t *testing.T) {
+	bm := &simBindMAC{}
+	h, r, _ := blockHarness(t, bm)
+	rs := h.get(r.ID)
+	running := newDraytekSource("127.0.0.1", r.Opts, SNMPSecrets{}, "admin", "pw")
+	defer running.Close()
+	rs.mu.Lock()
+	rs.src = running
+	rs.mu.Unlock()
+	defer func() { rs.mu.Lock(); rs.src = nil; rs.mu.Unlock() }()
+
+	same := newDraytekSource("127.0.0.1", r.Opts, SNMPSecrets{}, "admin", "pw")
+	own := same.cli
+	restore := h.sharedCLI(r.ID, same)
+	if same.cli != running.cli {
+		t.Fatal("same router and login: the running session must be lent")
+	}
+	restore()
+	if same.cli != own {
+		t.Fatal("restore must give the own client back")
+	}
+	other := newDraytekSource("127.0.0.1", r.Opts, SNMPSecrets{}, "admin", "new-password")
+	restore = h.sharedCLI(r.ID, other)
+	if other.cli == running.cli {
+		t.Fatal("a changed login must not use the running session")
+	}
+	restore()
 }

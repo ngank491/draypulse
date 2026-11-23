@@ -22,11 +22,20 @@ type simBindMAC struct {
 	// OneLine: entry and comment on one line (Vigor 3912S 4.4.3.2).
 	OneLine bool
 	Log     []string
+	ArpDel  []string // IPs whose ARP entry DrayPulse dropped
 }
+
+var reSimArpDel = regexp.MustCompile(`^ip arp del (\S+) LAN$`)
 
 var reSimBind = regexp.MustCompile(`^ip bindmac (show|on|off|add (\S+) (\S+) (.*)|del (\S+))$`)
 
 func (b *simBindMAC) handle(cmd string) (string, bool) {
+	if a := reSimArpDel.FindStringSubmatch(cmd); a != nil {
+		b.mu.Lock()
+		b.ArpDel = append(b.ArpDel, a[1])
+		b.mu.Unlock()
+		return "", true
+	}
 	m := reSimBind.FindStringSubmatch(cmd)
 	if m == nil {
 		return "", false

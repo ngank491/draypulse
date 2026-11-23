@@ -48,13 +48,16 @@ func cliCommandAllowed(cmd string) bool {
 
 // cliWriteAllowed are the only configuration changes DrayPulse can make, used
 // by client blocking: adding/removing its own Bind IP to MAC entries (always
-// the fixed blocking MAC and the comment "DrayPulse") and switching the
-// function on/off. "del all" and strict mode are not possible.
+// the fixed blocking MAC and the comment "DrayPulse"), switching the function
+// on/off, and dropping the ARP entry of a released IP (the router keeps it
+// pointing at the blocking MAC, which cuts off the next device on that IP).
+// "del all", strict mode and ARP flushes are not possible.
 var cliWriteAllowed = []*regexp.Regexp{
 	regexp.MustCompile(`^ip bindmac show$`),
 	regexp.MustCompile(`^ip bindmac (on|off)$`),
 	regexp.MustCompile(`^ip bindmac add \d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3} 02:dd:00:00:00:01 DrayPulse$`),
 	regexp.MustCompile(`^ip bindmac del \d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$`),
+	regexp.MustCompile(`^ip arp del \d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3} LAN$`),
 }
 
 func cliWriteCommandAllowed(cmd string) bool {
@@ -130,6 +133,45 @@ type cliConn struct {
 	errCh   chan error
 	telnet  bool
 	matched string // text matched by the last expect
+	echo    bool   // the router echoes commands: an answer must contain its command
+}
+
+// drain discards output that arrives until the router has been quiet for
+// quiet (at most max). DrayOS prints a second prompt after an SSH login; read
+// as the answer to the first command, it shifted every later answer by one
+// command (the first got nothing, ARP read as DHCP, pings read as empty).
+func (cc *cliConn) drain(quiet, max time.Duration) {
+	end := time.NewTimer(max)
+	defer end.Stop()
+	for {
+		q := time.NewTimer(quiet)
+		select {
+		case b, ok := <-cc.readCh:
+			q.Stop()
+			if !ok {
+				return
+			}
+			if cc.telnet {
+				cc.telnetFilter(b) // still answer option negotiation
+			}
+		case <-q.C:
+			return
+		case <-end.C:
+			q.Stop()
+			return
+		}
+	}
+}
+
+// echoed: the command line appears in the text before the prompt.
+func echoed(text, cmd string) bool {
+	c := strings.TrimSpace(cmd)
+	for _, l := range strings.SplitN(strings.TrimLeft(text, "\n "), "\n", 3) {
+		if strings.Contains(l, c) {
+			return true
+		}
+	}
+	return false
 }
 
 // learnPrompt turns the prompt seen after login ("Vigor2927> ") into an exact
@@ -438,6 +480,7 @@ func (cc *cliConn) login(ctx context.Context, user, pass string, proto string) e
 		_, _, err := cc.expect(ctx, 10*time.Second, rePromptEnd)
 		if err == nil {
 			cc.prompt = cc.learnPrompt()
+			cc.drain(cliSettle, 2*time.Second) // the prompt answering our "\r\n"
 		}
 		return err
 	}
@@ -471,6 +514,7 @@ func (cc *cliConn) login(ctx context.Context, user, pass string, proto string) e
 				return errors.New("Telnet: đăng nhập bị từ chối: " + firstLine(text))
 			}
 			cc.prompt = cc.learnPrompt()
+			cc.drain(cliSettle, 2*time.Second)
 			return nil
 		}
 	}
@@ -562,11 +606,12 @@ func (c *cliClient) runLocked(ctx context.Context, cmds []string) (map[string]st
 			wait = 25 * time.Second
 		}
 		cc.raw.SetDeadline(time.Now().Add(wait + 5*time.Second))
+		cc.drain(20*time.Millisecond, 500*time.Millisecond) // nothing may be pending before a command
 		cc.buf.Reset()
 		if err := cc.write(cmd + "\r\n"); err != nil {
 			return out, err
 		}
-		_, text, err := cc.expect(ctx, wait, cc.prompt)
+		text, err := cc.answer(ctx, wait, cmd)
 		if err != nil {
 			return out, err
 		}
@@ -575,6 +620,50 @@ func (c *cliClient) runLocked(ctx context.Context, cmds []string) (map[string]st
 	cc.lastUse = time.Now()
 	return out, nil
 }
+
+// cliSettle is how long the router must stay quiet after login.
+var cliSettle = 300 * time.Millisecond
+
+// answer reads up to the prompt. Once the router is known to echo commands,
+// a prompt seen before the echo is stale and skipped.
+func (cc *cliConn) answer(ctx context.Context, wait time.Duration, cmd string) (string, error) {
+	deadline := time.Now().Add(wait)
+	var text string
+	for {
+		left := time.Until(deadline)
+		if left <= 0 {
+			return text, errors.New("CLI router không phản hồi (timeout)")
+		}
+		_, t, err := cc.expect(ctx, left, cc.prompt)
+		if err != nil {
+			return t, err
+		}
+		text += t
+		if echoed(text, cmd) {
+			cc.echo = true
+			return text, nil
+		}
+		if !cc.echo {
+			if strings.TrimSpace(text) != "" {
+				return text, nil // router without echo: take the answer as it is
+			}
+			// an empty answer before any echo was seen may be a stray prompt:
+			// give the real answer a moment to arrive
+			_, more, err := cc.expect(ctx, min(cliStrayWait, time.Until(deadline)), cc.prompt)
+			if err != nil {
+				return text, nil // nothing more: the answer really was empty
+			}
+			if echoed(more, cmd) {
+				cc.echo = true
+			}
+			return more, nil
+		}
+		text = "" // a stray prompt and stale output: keep reading for this command
+	}
+}
+
+// cliStrayWait bounds the wait for a real answer after an empty one.
+var cliStrayWait = 1500 * time.Millisecond
 
 // Close ends the kept session, if any.
 func (c *cliClient) Close() {

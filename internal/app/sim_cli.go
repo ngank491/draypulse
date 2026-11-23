@@ -26,6 +26,9 @@ type simCLI struct {
 	ReleaseDelay time.Duration
 	active       atomic.Int32
 	busy         atomic.Int32 // connections refused with the busy banner
+	// ExtraPrompt prints a second prompt shortly after login, as DrayOS
+	// does after an SSH login.
+	ExtraPrompt bool
 }
 
 const simBusyBanner = "\n\rNo connection is available now. Try again later!"
@@ -114,6 +117,10 @@ func (s *simCLI) serve(c net.Conn) {
 	}
 	s.logins.Add(1)
 	w("\r\n\r\nType ? for command help\r\n\r\n" + s.name + "> ")
+	if s.ExtraPrompt {
+		time.Sleep(30 * time.Millisecond)
+		w("\r\n" + s.name + "> ")
+	}
 	for {
 		cmd, ok := readLine()
 		if !ok {

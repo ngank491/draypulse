@@ -68,7 +68,7 @@ func TestGenericHostNames(t *testing.T) {
 
 func TestSettingsBlockSafetyUpdate(t *testing.T) {
 	h, _, _ := newClientHub(t)
-	if g := h.settings.Get(); g.BlockAutoMax != 5 || !strings.Contains(g.BlockHostIgnore, "redmi-*") {
+	if g := h.settings.Get(); g.BlockAutoMax != 10 || !strings.Contains(g.BlockHostIgnore, "redmi-*") {
 		t.Fatalf("defaults %+v", g)
 	}
 	base := SettingsInput{SummaryAt: "08:00", RepeatMin: 30, Timezone: "Asia/Ho_Chi_Minh", RetentionDays: 30}
@@ -169,57 +169,221 @@ func TestHostNameOnlySuggests(t *testing.T) {
 	}
 }
 
-func TestAutoBlockLimit(t *testing.T) {
+// The hourly limit counts the new IPs of one device (Bind IP to MAC makes a
+// blocked device hop between IPs). A device over the limit is not followed
+// for the hour; other devices are, and nothing pauses router-wide.
+func TestAutoBlockLimitPerDevice(t *testing.T) {
 	bm := &simBindMAC{}
 	h, r, st := blockHarness(t, bm)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	rs := h.get(r.ID)
 	setBlockSafety(h, "", "", 2)
-	const A = "3C:52:82:00:00:0A"
-	if _, err := h.BlockDevice(ctx, r.ID, A, "", "Laptop lạ", "", "", false, "admin"); err != nil {
-		t.Fatal(err)
+	const A, B = "3C:52:82:00:00:0A", "3C:52:82:00:00:0B"
+	for _, m := range []string{A, B} {
+		if _, err := h.BlockDevice(ctx, r.ID, m, "", "", "", "", false, "admin"); err != nil {
+			t.Fatal(err)
+		}
 	}
 	two := []Row{{"address": "192.168.1.50", "mac-address": A}, {"address": "192.168.1.51", "mac-address": A}}
 	h.followBlocks(ctx, rs, two, nil)
 	if got := bm.ips(); len(got) != 2 {
 		t.Fatalf("within the limit: %v", got)
 	}
-	// a third automatic block within the hour exceeds the limit of 2
-	three := append(two, Row{"address": "192.168.1.52", "mac-address": A})
-	h.followBlocks(ctx, rs, three, nil)
-	if got := bm.ips(); len(got) != 2 {
-		t.Fatalf("over the limit nothing may be added: %v", got)
+	// a third IP for A within the hour is over the limit; B is still followed
+	more := append(two, Row{"address": "192.168.1.52", "mac-address": A}, Row{"address": "192.168.1.60", "mac-address": B})
+	h.followBlocks(ctx, rs, more, nil)
+	got := bm.ips()
+	if len(got) != 3 || slicesContains(got, "192.168.1.52") || !slicesContains(got, "192.168.1.60") {
+		t.Fatalf("A over its limit, B followed: %v", got)
 	}
-	if r2, _ := st.GetRouter(r.ID); !r2.Opts.Block.AutoPaused || r2.Opts.Block.AutoPausedAt == 0 {
-		t.Fatal("the pause must be stored")
+	if r2, _ := st.GetRouter(r.ID); r2.Opts.Block.AutoPaused {
+		t.Fatal("no router-wide pause any more")
 	}
-	if !strings.Contains(eventText(t, st), "TẠM DỪNG tự động chặn") {
-		t.Fatal("warning event missing")
+	if c := strings.Count(eventText(t, st), "đã đổi IP 2 lần"); c != 1 {
+		t.Fatalf("one warning per device and hour, got %d", c)
 	}
-	// paused: still nothing, and no repeated warning
-	h.followBlocks(ctx, rs, three, nil)
-	if got := bm.ips(); len(got) != 2 || strings.Count(eventText(t, st), "TẠM DỪNG") != 1 {
-		t.Fatalf("paused: %v", got)
-	}
-	// releases still happen while paused
-	h.followBlocks(ctx, rs, []Row{{"address": "192.168.1.50", "mac-address": "11:22:33:44:55:66"}, {"address": "192.168.1.51", "mac-address": A}}, nil)
-	if got := bm.ips(); len(got) != 1 || got[0] != "192.168.1.51" {
-		t.Fatalf("release while paused: %v", got)
+	h.followBlocks(ctx, rs, more, nil) // no repeated warning
+	if c := strings.Count(eventText(t, st), "đã đổi IP 2 lần"); c != 1 {
+		t.Fatalf("repeated warning: %d", c)
 	}
 	// manual blocks are not limited
 	if _, err := h.BlockClient(ctx, r.ID, "192.168.1.90", "", "", "", "admin"); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.ResumeAuto(r.ID, "admin"); err != nil {
+	if err := h.ResumeAuto(r.ID, "admin"); err != nil { // the admin can reset the counters
 		t.Fatal(err)
 	}
-	if r2, _ := st.GetRouter(r.ID); r2.Opts.Block.AutoPaused {
-		t.Fatal("resume must be stored")
+	h.followBlocks(ctx, rs, more, nil)
+	if got := bm.ips(); !slicesContains(got, "192.168.1.52") {
+		t.Fatalf("after reset: %v", got)
 	}
-	h.followBlocks(ctx, rs, []Row{{"address": "192.168.1.51", "mac-address": A}, {"address": "192.168.1.52", "mac-address": A}}, nil)
-	if got := bm.ips(); len(got) != 3 {
-		t.Fatalf("after resume: %v", got)
+}
+
+// The pause of 0.6.0–0.6.3 is lifted on the first follow after an upgrade.
+func TestLegacyPauseLifted(t *testing.T) {
+	bm := &simBindMAC{}
+	h, r, st := blockHarness(t, bm)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	rs := h.get(r.ID)
+	if _, err := h.BlockDevice(ctx, r.ID, "3C:52:82:00:00:0C", "", "", "", "", false, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	h.saveBlockCfg(rs, func(b *BlockCfg) { b.AutoPaused, b.AutoPausedAt = true, 1 })
+	h.followBlocks(ctx, rs, []Row{{"address": "192.168.1.70", "mac-address": "3C:52:82:00:00:0C"}}, nil)
+	if r2, _ := st.GetRouter(r.ID); r2.Opts.Block.AutoPaused {
+		t.Fatal("legacy pause must be lifted")
+	}
+	if got := bm.ips(); len(got) != 1 || got[0] != "192.168.1.70" {
+		t.Fatalf("device followed again: %v", got)
+	}
+}
+
+// A blocked device that got another IP: the old IP is released (with its
+// ARP entry), so one device holds one entry instead of one per hop.
+func TestReleaseOldIPWhenDeviceMoves(t *testing.T) {
+	bm := &simBindMAC{}
+	h, r, st := blockHarness(t, bm)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	rs := h.get(r.ID)
+	const A = "3C:52:82:00:00:0D"
+	if _, err := h.BlockDevice(ctx, r.ID, A, "192.168.1.80", "Phone", "", "", false, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	h.followBlocks(ctx, rs, nil, []Row{{"address": "192.168.1.81", "mac-address": A}})
+	if got := bm.ips(); len(got) != 1 || got[0] != "192.168.1.81" {
+		t.Fatalf("old IP must be released, new one blocked: %v", got)
+	}
+	if !slicesContains(bm.ArpDel, "192.168.1.80") {
+		t.Fatalf("ARP entry of the released IP must be cleared: %v", bm.ArpDel)
+	}
+	if l, _ := st.ListBlocks(r.ID); len(l) != 1 || l[0].IP != "192.168.1.81" {
+		t.Fatalf("store: %+v", l)
+	}
+	if !strings.Contains(eventText(t, st), "Phone đã chuyển sang IP 192.168.1.81") {
+		t.Fatalf("events:\n%s", eventText(t, st))
+	}
+}
+
+// A failing block must not undo a release done in the same follow: the
+// innocent device on the released IP would be cut off again.
+func TestFailedBlockKeepsRelease(t *testing.T) {
+	bm := &simBindMAC{}
+	h, r, st := blockHarness(t, bm)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	rs := h.get(r.ID)
+	const A, M = "3C:52:82:00:00:0E", "F0:2F:74:00:00:0E"
+	if _, err := h.BlockDevice(ctx, r.ID, A, "192.168.1.90", "", "", "", false, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	bm.mu.Lock()
+	bm.IgnoreAdd = true // the router stops storing new entries
+	bm.mu.Unlock()
+	h.followBlocks(ctx, rs, []Row{{"address": "192.168.1.90", "mac-address": M}, {"address": "192.168.1.91", "mac-address": A}}, nil)
+	if got := bm.ips(); len(got) != 0 {
+		t.Fatalf("the release must stay done: %v", got)
+	}
+	for range 3 {
+		h.followBlocks(ctx, rs, []Row{{"address": "192.168.1.91", "mac-address": A}}, nil)
+	}
+	if c := strings.Count(eventText(t, st), "Không cập nhật được danh sách chặn"); c != 1 {
+		t.Fatalf("a repeated failure must be reported once, got %d", c)
+	}
+}
+
+// Comparison with the router: entries the router dropped are added again
+// while still used, released otherwise; stray DrayPulse entries and ARP
+// lines pointing at the blocking MAC are removed.
+func TestReconcileBlocks(t *testing.T) {
+	bm := &simBindMAC{}
+	h, r, st := blockHarness(t, bm)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	rs := h.get(r.ID)
+	const A, B = "3C:52:82:00:00:1A", "3C:52:82:00:00:1B"
+	if _, err := h.BlockDevice(ctx, r.ID, A, "192.168.1.100", "", "", "", false, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.BlockDevice(ctx, r.ID, B, "192.168.1.101", "", "", "", false, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.BlockClient(ctx, r.ID, "192.168.1.102", "", "", "", "admin"); err != nil {
+		t.Fatal(err)
+	}
+	// the router loses everything, and holds an entry DrayPulse does not know
+	bm.mu.Lock()
+	bm.entries = []bindEntry{{IP: "192.168.1.103", MAC: blockMAC, Comment: "DrayPulse"}}
+	bm.mu.Unlock()
+	arp := []Row{
+		{"address": "192.168.1.100", "mac-address": A},        // A still there
+		{"address": "192.168.1.104", "mac-address": blockMAC}, // stale ARP line
+	} // B is gone from 192.168.1.101
+	h.reconcileBlocks(ctx, rs, arp, nil)
+	got := bm.ips()
+	if len(got) != 2 || !slicesContains(got, "192.168.1.100") || !slicesContains(got, "192.168.1.102") {
+		t.Fatalf("re-added A's and the manual IP; removed the stray entry: %v", got)
+	}
+	if l, _ := st.ListBlocks(r.ID); len(l) != 2 {
+		t.Fatalf("B's old IP must be released in the store: %+v", l)
+	}
+	for _, ip := range []string{"192.168.1.101", "192.168.1.103", "192.168.1.104"} {
+		if !slicesContains(bm.ArpDel, ip) {
+			t.Errorf("ARP of %s must be cleared: %v", ip, bm.ArpDel)
+		}
+	}
+	rs.mu.RLock()
+	dr := rs.drift
+	rs.mu.RUnlock()
+	if dr == nil || len(dr.Missing) != 3 || len(dr.Readded) != 2 || len(dr.Released) != 1 || len(dr.Extra) != 1 || len(dr.Stale) != 1 {
+		t.Fatalf("drift %+v", dr)
+	}
+	if !strings.Contains(eventText(t, st), "3 mục chặn đã mất khỏi router") {
+		t.Fatalf("events:\n%s", eventText(t, st))
+	}
+	// in sync: nothing to do, no event
+	n, before := len(bm.Log), strings.Count(eventText(t, st), "Đối chiếu với router")
+	h.reconcileBlocks(ctx, rs, []Row{{"address": "192.168.1.100", "mac-address": A}}, nil)
+	if after := strings.Count(eventText(t, st), "Đối chiếu với router"); after != before || len(bm.Log) != n {
+		t.Fatalf("in sync must stay quiet: %v", bm.Log[n:])
+	}
+}
+
+// Switching blocking off keeps leftovers visible and removable.
+func TestUnblockWhenBlockingDisabled(t *testing.T) {
+	bm := &simBindMAC{}
+	h, r, st := blockHarness(t, bm)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	rs := h.get(r.ID)
+	if _, err := h.BlockDevice(ctx, r.ID, "3C:52:82:00:00:2A", "192.168.1.110", "", "", "", false, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.BlockClient(ctx, r.ID, "192.168.1.111", "", "", "", "admin"); err != nil {
+		t.Fatal(err)
+	}
+	r2, _ := st.GetRouter(r.ID)
+	r2.Opts.Block.Enabled = false
+	st.SaveRouter(r2)
+	rs.mu.Lock()
+	rs.cfg.Opts.Block.Enabled = false
+	rs.mu.Unlock()
+	if v := h.view(rs, true); v.Blocking == nil || v.Blocking.Enabled || len(v.Blocking.IPs) != 2 {
+		t.Fatalf("leftovers must stay visible: %+v", v.Blocking)
+	}
+	if _, err := h.BlockClient(ctx, r.ID, "192.168.1.112", "", "", "", "admin"); err == nil {
+		t.Fatal("new blocks need blocking enabled")
+	}
+	if err := h.UnblockClient(ctx, r.ID, "192.168.1.111", "admin"); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.UnblockDevice(ctx, r.ID, "3C:52:82:00:00:2A", "admin"); err != nil {
+		t.Fatal(err)
+	}
+	if got := bm.ips(); len(got) != 0 || !slicesContains(bm.ArpDel, "192.168.1.110") {
+		t.Fatalf("router %v arp %v", got, bm.ArpDel)
 	}
 }
 

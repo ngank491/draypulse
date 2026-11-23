@@ -134,6 +134,27 @@ func (h *Hub) blockCLI(rs *RState) (*cliClient, func(), error) {
 	return d.cli, d.Close, nil
 }
 
+// sharedCLI lends the running poller's CLI client to d when both log in to
+// the same router the same way: DrayOS allows a single Telnet/SSH session,
+// so a second one (audit, "Kiểm tra kết nối") would be refused or would
+// push the poller out. The returned func gives d its own client back.
+func (h *Hub) sharedCLI(routerID int64, d *draytekSource) func() {
+	rs := h.get(routerID)
+	if rs == nil || d == nil || d.cli == nil {
+		return func() {}
+	}
+	rs.mu.RLock()
+	src := rs.src
+	rs.mu.RUnlock()
+	run := asDraytek(src)
+	if run == nil || run.cli == nil || run.cli == d.cli || run.cli.cfg != d.cli.cfg {
+		return func() {}
+	}
+	own := d.cli
+	d.cli = run.cli
+	return func() { d.cli = own }
+}
+
 func asDraytek(s Source) *draytekSource {
 	switch t := s.(type) {
 	case *draytekSource:
@@ -161,13 +182,28 @@ func (o *bindOps) run(cmd string) (string, error) {
 		return "", err
 	}
 	text := out[cmd]
-	low := strings.ToLower(text)
+	if strings.HasSuffix(cmd, " show") {
+		return text, nil // a listing: admin comments may contain "error", "fail"…
+	}
+	// a refused change answers on its first lines
+	lines := strings.SplitN(strings.TrimSpace(text), "\n", 3)
+	if len(lines) > 2 {
+		lines = lines[:2]
+	}
+	head := strings.ToLower(strings.Join(lines, "\n"))
 	for _, bad := range []string{"unknown command", "command not found", "invalid", "error", "fail"} {
-		if strings.Contains(low, bad) {
+		if strings.Contains(head, bad) {
 			return text, fmt.Errorf("router từ chối lệnh %q: %s", cmd, firstLine(text))
 		}
 	}
 	return text, nil
+}
+
+// clearARP drops the router's ARP entry of a released IP. DrayOS keeps it
+// pointing at the blocking MAC, so the next device on that IP (or the
+// unblocked one) gets no traffic. A failure is not fatal: the entry ages out.
+func (o *bindOps) clearARP(ip string) {
+	o.run("ip arp del " + ip + " LAN")
 }
 
 // rawSnippet quotes router output for error messages (diagnosing formats).
@@ -276,6 +312,19 @@ func (h *Hub) blockPrep(routerID int64) (*RState, Router, error) {
 	return rs, cfg, nil
 }
 
+// unblockPrep is blockPrep without the "blocking enabled" check: entries
+// left on the router must stay removable after blocking was switched off.
+func (h *Hub) unblockPrep(routerID int64) (*RState, Router, error) {
+	rs := h.get(routerID)
+	if rs == nil {
+		return nil, Router{}, ErrNotFound
+	}
+	rs.mu.RLock()
+	cfg := rs.cfg
+	rs.mu.RUnlock()
+	return rs, cfg, nil
+}
+
 func (h *Hub) saveTurnedOn(rs *RState, v bool) error {
 	return h.saveBlockCfg(rs, func(b *BlockCfg) { b.TurnedOn = v })
 }
@@ -332,8 +381,13 @@ func (h *Hub) bindTx(o *bindOps, rs *RState, add, del []string) error {
 	var added, removed []string
 	turnedOn := false
 	undo := func() {
+		// the transaction's own deadline may be what failed: undo on a fresh one
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		o.ctx = ctx
 		for _, ip := range added {
 			o.run("ip bindmac del " + ip)
+			o.clearARP(ip)
 		}
 		for _, ip := range removed {
 			o.run(fmt.Sprintf("ip bindmac add %s %s %s", ip, strings.ToLower(blockMAC), blockComment))
@@ -346,15 +400,16 @@ func (h *Hub) bindTx(o *bindOps, rs *RState, add, del []string) error {
 		if st.find(ip) != nil {
 			continue // already blocked by DrayPulse
 		}
+		added = append(added, ip) // before sending: an add whose answer is lost is undone too
 		if _, err := o.run(fmt.Sprintf("ip bindmac add %s %s %s", ip, strings.ToLower(blockMAC), blockComment)); err != nil {
 			undo()
 			return err
 		}
-		added = append(added, ip)
 	}
 	for _, ip := range del {
 		e := st.find(ip)
 		if e == nil {
+			o.clearARP(ip) // the router dropped the entry but may keep its ARP line
 			continue
 		}
 		if !e.ours() {
@@ -366,6 +421,7 @@ func (h *Hub) bindTx(o *bindOps, rs *RState, add, del []string) error {
 			return err
 		}
 		removed = append(removed, ip)
+		o.clearARP(ip)
 	}
 	if off && len(add) > 0 {
 		if err := o.setOn(true); err != nil {
@@ -658,7 +714,7 @@ func blockLabel(b Block) string {
 
 // UnblockClient removes a manual IP-only block.
 func (h *Hub) UnblockClient(ctx context.Context, routerID int64, ip, by string) error {
-	rs, cfg, err := h.blockPrep(routerID)
+	rs, cfg, err := h.unblockPrep(routerID)
 	if err != nil {
 		return err
 	}
@@ -700,7 +756,7 @@ func (h *Hub) UnblockClient(ctx context.Context, routerID int64, ip, by string) 
 // UnblockDevice removes a device block and every IP blocked for it.
 func (h *Hub) UnblockDevice(ctx context.Context, routerID int64, mac, by string) error {
 	mac = normMAC(mac)
-	rs, cfg, err := h.blockPrep(routerID)
+	rs, cfg, err := h.unblockPrep(routerID)
 	if err != nil {
 		return err
 	}
@@ -744,17 +800,20 @@ func (h *Hub) UnblockDevice(ctx context.Context, routerID int64, mac, by string)
 // followBlocks keeps device blocks up to date with what the router sees:
 //   - a blocked MAC that got another IP (new DHCP lease) → block that IP,
 //     unless another, unblocked device is also seen on it,
-//   - an IP blocked for a device but now seen with another, unblocked MAC
-//     (ARP, DHCP or a syslog lease) → release it at once,
+//   - an IP blocked for a device that has moved to another IP, or that is
+//     now seen with another, unblocked MAC (ARP, DHCP or a syslog lease) →
+//     release it, together with its ARP entry,
 //   - protected MACs/IPs (Settings) → never blocked, released if blocked,
 //   - with MatchHost, a new MAC carrying the device's (uncommon) DHCP host
 //     name → only a suggestion and an alert; an admin confirms the block.
 //
-// Automatic blocks are capped per router and hour: above the limit
-// auto-blocking pauses until an admin resumes it.
+// Bind IP to MAC is a DHCP reservation on DrayOS: a blocked device is given
+// another IP and DrayPulse follows it. A device that changes IP more than
+// the hourly limit is not followed further for that hour.
 //
-// It runs after every client read, every 15 s while devices are blocked and
-// right after syslog reports a DHCP lease.
+// Releases and new blocks are separate transactions, so a failing block
+// never undoes a release. It runs after every client read, every 15 s while
+// devices are blocked and right after syslog reports a DHCP lease.
 func (h *Hub) followBlocks(ctx context.Context, rs *RState, arp, lease []Row) {
 	if !rs.hasBlocks.Load() || !rs.blockMu.TryLock() {
 		return
@@ -766,26 +825,34 @@ func (h *Hub) followBlocks(ctx context.Context, rs *RState, arp, lease []Row) {
 	if !cfg.Opts.Block.Enabled {
 		return
 	}
+	now := nowMs()
+	var eff effects
+	if cfg.Opts.Block.AutoPaused { // router-wide pause of 0.6.0–0.6.3: replaced by a per-device limit
+		if err := h.saveBlockCfg(rs, func(b *BlockCfg) { b.AutoPaused, b.AutoPausedAt = false, 0 }); err == nil {
+			eff.add(now, "info", "▶️", "Tự động chặn chạy lại: giới hạn nay tính riêng cho từng thiết bị (số lần đổi IP mỗi giờ)", false)
+		}
+	}
 	devs, err := h.st.ListDevices(cfg.ID)
 	if err != nil {
 		return
 	}
 	blocks, _ := h.st.ListBlocks(cfg.ID)
 	if len(devs) == 0 && len(blocks) == 0 {
+		h.apply(cfg, eff)
 		return
 	}
 	owner := map[string]string{} // blocked IP → device MAC ("" = manual)
 	for _, b := range blocks {
 		owner[b.IP] = b.MAC
 	}
-	now := nowMs()
 	sf := h.settings.blockSafety()
 	ob := observe(arp, lease, rs.recentHints(now)...)
 	blocked := map[string]bool{}
+	names := map[string]string{}
 	for _, d := range devs {
 		blocked[d.MAC] = !sf.macs[d.MAC] // a protected device counts as not blocked
+		names[d.MAC] = firstNonEmpty(d.Name, d.Host, d.MAC)
 	}
-	var eff effects
 	// 1. same host name, new MAC: suggest, never block on our own
 	h.suggestByHost(cfg.ID, devs, ob, blocked, sf, now, &eff)
 	// 2. IPs to add / release
@@ -818,6 +885,8 @@ func (h *Hub) followBlocks(ctx context.Context, rs *RState, arp, lease []Row) {
 		default:
 			if m := ob.unblockedOn(ip, blocked); m != "" {
 				why = "thiết bị khác (" + m + ") đang dùng IP này"
+			} else if cur := ob.macIPs[o]; len(cur) > 0 && !slicesContains(cur, ip) && !slicesContains(ob.ipMACs[ip], o) {
+				why = names[o] + " đã chuyển sang IP " + strings.Join(cur, ", ") // keep one entry per device, not one per hop
 			}
 		}
 		if why != "" {
@@ -826,25 +895,27 @@ func (h *Hub) followBlocks(ctx context.Context, rs *RState, arp, lease []Row) {
 	}
 	sort.Strings(add)
 	sort.Strings(del)
-	// 3. safety limit for automatic blocks
+	// 3. per-device limit: a device hopping between IPs too often is not followed for the hour
 	if len(add) > 0 {
-		recent := rs.autoRecent(now)
-		switch {
-		case cfg.Opts.Block.AutoPaused:
-			add = nil
-		case recent+len(add) > sf.autoMax:
-			if err := h.saveBlockCfg(rs, func(b *BlockCfg) { b.AutoPaused, b.AutoPausedAt = true, now }); err != nil {
-				log.Printf("tạm dừng tự động chặn: %v", err)
+		var keep []string
+		pending := map[string]int{}
+		for _, ip := range add {
+			mac := addFor[ip]
+			if rs.autoCount(mac, now)+pending[mac] >= sf.autoMax {
+				if rs.limitNoted[mac] < now-3600_000 {
+					rs.limitNoted[mac] = now
+					eff.add(now, "warning", "🛑", fmt.Sprintf("Thiết bị bị chặn %s đã đổi IP %d lần trong 1 giờ – tạm không chặn thêm IP mới (%s) cho thiết bị này, tự chạy lại sau 1 giờ. Kiểm tra thiết bị hoặc tăng giới hạn trong Cài đặt → Chặn client an toàn",
+						names[mac], sf.autoMax, ip), true)
+				}
+				continue
 			}
-			eff.add(now, "warning", "🛑", fmt.Sprintf("Đã TẠM DỪNG tự động chặn: DrayPulse định chặn thêm %d IP (%s), vượt giới hạn %d lượt/giờ (đã có %d lượt trong 1 giờ qua). Không IP nào bị chặn thêm. Kiểm tra tab Client rồi bấm “Tiếp tục tự động chặn”",
-				len(add), strings.Join(add, ", "), sf.autoMax, recent), true)
-			add = nil
+			pending[mac]++
+			keep = append(keep, ip)
 		}
+		add = keep
 	}
 	if len(add) == 0 && len(del) == 0 {
-		if len(eff.alerts) > 0 {
-			h.apply(cfg, eff)
-		}
+		h.apply(cfg, eff)
 		return
 	}
 	cctx, cancel := context.WithTimeout(ctx, 60*time.Second)
@@ -856,27 +927,46 @@ func (h *Hub) followBlocks(ctx context.Context, rs *RState, arp, lease []Row) {
 		return
 	}
 	defer done()
-	if err := h.bindTx(o, rs, add, del); err != nil {
-		eff.add(now, "warning", "⚠️", "Không cập nhật được danh sách chặn trên router: "+err.Error(), true)
-		h.apply(cfg, eff)
-		return
+	if len(del) > 0 {
+		if err := h.bindTx(o, rs, nil, del); err != nil {
+			h.noteBlockErr(rs, &eff, now, err)
+		} else {
+			for _, ip := range del {
+				h.st.DeleteBlock(cfg.ID, ip)
+				eff.add(now, "info", "↩️", fmt.Sprintf("Nhả chặn IP %s: %s", ip, delWhy[ip]), false)
+			}
+		}
 	}
-	rs.autoRecord(now, len(add))
-	names := map[string]string{}
-	for _, d := range devs {
-		names[d.MAC] = firstNonEmpty(d.Name, d.Host, d.MAC)
-	}
-	for _, ip := range add {
-		mac := addFor[ip]
-		h.st.AddBlock(cfg.ID, Block{IP: ip, MAC: mac, Name: names[mac], ByUser: "DrayPulse", At: now})
-		eff.add(now, "warning", "⛔", fmt.Sprintf("Thiết bị bị chặn %s nhận IP mới %s – đã chặn IP này", names[mac], ip), false)
-	}
-	for _, ip := range del {
-		h.st.DeleteBlock(cfg.ID, ip)
-		eff.add(now, "info", "↩️", fmt.Sprintf("Nhả chặn IP %s: %s", ip, delWhy[ip]), false)
+	if len(add) > 0 {
+		if err := h.bindTx(o, rs, add, nil); err != nil {
+			h.noteBlockErr(rs, &eff, now, err)
+		} else {
+			for _, ip := range add {
+				mac := addFor[ip]
+				rs.autoRecord(mac, now)
+				h.st.AddBlock(cfg.ID, Block{IP: ip, MAC: mac, Name: names[mac], ByUser: "DrayPulse", At: now})
+				eff.add(now, "warning", "⛔", fmt.Sprintf("Thiết bị bị chặn %s nhận IP mới %s – đã chặn IP này", names[mac], ip), false)
+			}
+		}
 	}
 	h.refreshHasBlocks(rs, cfg.ID)
 	h.apply(cfg, eff)
+}
+
+// noteBlockErr records a failed router update: an event at most every
+// 10 minutes for the same error, a notification at most once an hour
+// (followBlocks retries every 15 s). Caller holds blockMu.
+func (h *Hub) noteBlockErr(rs *RState, eff *effects, now int64, err error) {
+	msg := "Không cập nhật được danh sách chặn trên router: " + err.Error()
+	if msg == rs.blockErrMsg && now-rs.blockErrAt < 600_000 {
+		return
+	}
+	notify := now-rs.blockErrNotified >= 3600_000
+	rs.blockErrMsg, rs.blockErrAt = msg, now
+	if notify {
+		rs.blockErrNotified = now
+	}
+	eff.add(now, "warning", "⚠️", msg, notify)
 }
 
 // BlockInfo is the blocking summary shown with a router.
@@ -884,7 +974,9 @@ type BlockInfo struct {
 	Devices      []Device     `json:"devices"`
 	IPs          []Block      `json:"ips"`         // every blocked IP (device-owned and manual)
 	Suggestions  []Suggestion `json:"suggestions"` // same host name, new MAC: waiting for an admin
-	AutoPaused   bool         `json:"autoPaused"`  // safety limit hit: automatic blocking stopped
+	Enabled      bool         `json:"enabled"`     // blocking allowed: off still shows cleanup for leftovers
+	Drift        *BlockDrift  `json:"drift,omitempty"`
+	AutoPaused   bool         `json:"autoPaused"` // safety limit hit: automatic blocking stopped
 	AutoPausedAt int64        `json:"autoPausedAt"`
 }
 
@@ -979,5 +1071,10 @@ func (h *Hub) followTick(ctx context.Context, rs *RState, src Source, force bool
 	if err != nil {
 		return
 	}
-	h.followBlocks(ctx, rs, parseARP(out["ip arp status"]), parseDHCP(out["srv dhcp status"]))
+	arp, lease := parseARP(out["ip arp status"]), parseDHCP(out["srv dhcp status"])
+	h.followBlocks(ctx, rs, arp, lease)
+	if time.Since(rs.lastReconcile) >= reconcileEvery {
+		rs.lastReconcile = time.Now()
+		h.reconcileBlocks(ctx, rs, arp, lease)
+	}
 }

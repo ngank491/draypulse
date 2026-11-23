@@ -170,7 +170,7 @@ func TestBlockUndoWhenRouterIgnoresAdd(t *testing.T) {
 }
 
 func TestBlockWriteAllowlist(t *testing.T) {
-	for _, ok := range []string{"ip bindmac show", "ip bindmac on", "ip bindmac off", "ip bindmac add 192.168.1.21 02:dd:00:00:00:01 DrayPulse", "ip bindmac del 192.168.1.21"} {
+	for _, ok := range []string{"ip bindmac show", "ip bindmac on", "ip bindmac off", "ip bindmac add 192.168.1.21 02:dd:00:00:00:01 DrayPulse", "ip bindmac del 192.168.1.21", "ip arp del 192.168.1.21 LAN"} {
 		if !cliWriteCommandAllowed(ok) {
 			t.Error("should allow", ok)
 		}
@@ -179,7 +179,7 @@ func TestBlockWriteAllowlist(t *testing.T) {
 		}
 	}
 	for _, bad := range []string{"ip bindmac del all", "ip bindmac strict_on", "ip bindmac add 192.168.1.21 aa:bb:cc:dd:ee:ff DrayPulse",
-		"ip bindmac add 192.168.1.21 02:dd:00:00:00:01 other", "ip bindmac subnet clear", "ip bindmac on; sys reboot", "sys reboot"} {
+		"ip bindmac add 192.168.1.21 02:dd:00:00:00:01 other", "ip bindmac subnet clear", "ip bindmac on; sys reboot", "sys reboot", "ip arp flush", "ip arp del 192.168.1.21 WAN", "ip arp del all LAN", "ip arp add 192.168.1.21 02:dd:00:00:00:01 LAN"} {
 		if cliWriteCommandAllowed(bad) {
 			t.Error("should block", bad)
 		}
@@ -246,20 +246,21 @@ func TestBlockDeviceFollowsItsIPs(t *testing.T) {
 	if got := ips(); len(got) != 1 || got[0] != "192.168.1.21" || !bm.on {
 		t.Fatalf("initial block %v", got)
 	}
-	// DHCP hands the blocked phone a new address: it must be blocked too
+	// DHCP hands the blocked phone a new address: it is blocked, and the old
+	// one (which the phone left) is released with its ARP entry
 	h.followBlocks(ctx, rs, nil, []Row{{"address": "192.168.1.40", "mac-address": A, "host-name": "Lan-Phone-07"}})
-	if got := ips(); len(got) != 2 || got[1] != "192.168.1.40" {
-		t.Fatalf("new IP not followed: %v", got)
+	if got := ips(); len(got) != 1 || got[0] != "192.168.1.40" || !slicesContains(bm.ArpDel, "192.168.1.21") {
+		t.Fatalf("new IP not followed or old one kept: %v arp %v", got, bm.ArpDel)
 	}
 	// the router may show the blocking MAC for a blocked IP: never treat that as another device
 	h.followBlocks(ctx, rs, []Row{{"address": "192.168.1.40", "mac-address": blockMAC}}, nil)
-	if len(ips()) != 2 {
+	if len(ips()) != 1 {
 		t.Fatal("blocking MAC in ARP must be ignored")
 	}
-	// the old address now belongs to an innocent device: release it
+	// an innocent device on the old address: nothing left to release
 	h.followBlocks(ctx, rs, []Row{{"address": "192.168.1.21", "mac-address": B}}, nil)
 	if got := ips(); len(got) != 1 || got[0] != "192.168.1.40" {
-		t.Fatalf("old IP not released: %v", got)
+		t.Fatalf("old IP: %v", got)
 	}
 	// the phone randomises its MAC but keeps its host name: only a suggestion…
 	n0 := len(bm.Log)

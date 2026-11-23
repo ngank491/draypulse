@@ -161,6 +161,7 @@ Chặn một thiết bị khỏi mạng ngay từ DrayPulse, **không cần chu�
 **Chặn theo thiết bị (MAC) – mặc định, khuyên dùng:**
 
 - DrayPulse chặn mọi IP mà MAC đó đang dùng, rồi **kiểm tra bảng DHCP và ARP của router mỗi 15 giây** (kể cả khi chu kỳ đọc router dài hơn): router cấp IP mới nào cho thiết bị thì IP đó bị chặn ngay (ghi sự kiện "nhận IP mới … – đã chặn").
+- **Thiết bị bị chặn thường được cấp IP khác.** Theo tài liệu DrayTek, Bind IP to MAC thực chất là *đặt trước IP trong DHCP*: IP bị gắn với MAC giả nên router cấp cho thiết bị một IP khác. DrayPulse chặn IP mới và **nhả IP cũ** (kèm xoá dòng ARP của IP đó trên router bằng `ip arp del <IP> LAN`), nên mỗi thiết bị chỉ giữ một mục chặn. Giữa hai lần đổi IP thiết bị có thể vào mạng vài giây.
 - Khi một IP từng bị chặn được thiết bị **khác** dùng lại – chỉ cần **một** nguồn (ARP, bảng DHCP hoặc syslog) thấy MAC khác chưa bị chặn trên IP đó – DrayPulse **nhả IP ngay** và không chặn lại IP đó chừng nào máy kia còn xuất hiện, để không chặn nhầm máy vô tội.
 - Nếu router gửi syslog về DrayPulse (Bước D3) và dòng log có thông tin cấp IP DHCP, DrayPulse kiểm tra lại ngay (sau ~3 giây) thay vì chờ 15 giây. Dòng log chỉ được dùng để **nhả** IP (khi nó nêu đúng một IP LAN và một MAC), không bao giờ để chặn thêm.
 - Chặn được cả thiết bị **chưa có mặt**: nhập MAC, khi nó xuất hiện sẽ bị chặn ngay.
@@ -172,7 +173,7 @@ Chặn một thiết bị khỏi mạng ngay từ DrayPulse, **không cần chu�
 **An toàn khi chặn (Cài đặt → Chặn client an toàn):**
 
 - **Không bao giờ chặn**: danh sách MAC và/hoặc IP (máy chủ, camera, máy quản trị, AP…). Chặn tay sẽ bị từ chối; DrayPulse không bao giờ tự chặn chúng, và nếu một mục đang bị chặn được thêm vào danh sách thì IP đó được **nhả** ở lần kiểm tra kế tiếp.
-- **Tối đa số lượt tự động chặn mỗi giờ** (mặc định 5, tính riêng từng router): mỗi IP DrayPulse tự chặn (thiết bị bị chặn nhận IP mới) là một lượt. Nếu lần kiểm tra sắp vượt giới hạn, DrayPulse **không chặn thêm IP nào**, **tạm dừng tự động chặn** cho router đó, ghi sự kiện cảnh báo và gửi Telegram/Zalo. Việc nhả IP vẫn tiếp tục. Kiểm tra danh sách rồi bấm **Tiếp tục tự động chặn** ở tab Client. Chặn tay không bị giới hạn.
+- **Tối đa số IP mới tự chặn cho một thiết bị trong 1 giờ** (mặc định 10): mỗi lần thiết bị bị chặn nhận IP mới và bị chặn tiếp là một lượt của **riêng thiết bị đó**. Vượt giới hạn thì DrayPulse tạm không đuổi theo thiết bị đó (tự chạy lại sau 1 giờ), ghi một cảnh báo; các thiết bị khác vẫn được theo dõi, việc nhả IP vẫn tiếp tục. Chặn tay không bị giới hạn. (Từ 0.6.4 không còn tạm dừng cả router như các bản 0.6.0–0.6.3.)
 - **Tên máy phổ biến**: các mẫu tên (dùng `*` và `?`, không phân biệt hoa thường) không dùng để gợi ý chặn thiết bị đổi MAC.
 
 **Bỏ chặn tất cả:** tab **Client → Client bị chặn → Bỏ chặn tất cả** (chỉ quản trị viên, có hộp thoại xác nhận). DrayPulse xoá **mọi mục DrayPulse** trong bảng Bind IP to MAC của router (kể cả mục sót lại không có trong danh sách), quên toàn bộ thiết bị/IP bị chặn và gợi ý chặn. Mục do bạn tạo được giữ nguyên; chức năng Bind IP to MAC chỉ được **tắt** nếu chính DrayPulse đã bật nó và bảng đã trống. Dùng khi chặn nhầm hàng loạt – không cần xoá tay từng mục trên router.
@@ -185,6 +186,9 @@ Chặn một thiết bị khỏi mạng ngay từ DrayPulse, **không cần chu�
 - DrayPulse **không sửa hay xoá mục do bạn tạo**. Nếu chức năng đang tắt mà bảng đã có mục của bạn, DrayPulse từ chối bật và báo rõ IP nào.
 - Không chặn được: IP của router, gateway, máy chạy DrayPulse, IP ngoài mạng LAN.
 - Mỗi thay đổi được đọc lại; nếu router không lưu, DrayPulse hoàn tác. Nút **Đối chiếu với router** so danh sách với bảng trên router.
+- **Tự đối chiếu mỗi 5 phút:** Vigor 3912S từng tự xoá mục chặn mà không ai xoá. DrayPulse đọc lại bảng chặn và ARP của router: mục bị mất được **thêm lại** nếu thiết bị vẫn dùng IP đó (hoặc là mục chặn IP tay), **nhả** nếu thiết bị đã rời IP đó; mục DrayPulse lạ và dòng ARP còn trỏ về MAC chặn được xoá. Kết quả hiện ở khung "Client bị chặn" và trong Sự kiện.
+- Tắt **Cho phép DrayPulse chặn IP client** không xoá các mục đang chặn trên router: khung "Client bị chặn" vẫn hiện để bạn **Bỏ chặn** hoặc **Bỏ chặn tất cả**.
+- DrayPulse từ chối chặn IP của chính máy bạn đang dùng để mở trang DrayPulse.
 
 **Giới hạn cần biết:**
 
@@ -402,7 +406,9 @@ Nếu tài khoản bị lỗi (hết credit, key sai, quá tải) và bạn bậ
 | Tab VLAN trống | Chưa bật Telnet/SSH, hoặc firmware không có lệnh `vlan status` | Bật CLI; DrayOS 5 chưa được hỗ trợ |
 | Chặn báo "Bind IP to MAC đang TẮT nhưng bảng có … mục do bạn tạo" | Bảng có mục cũ của bạn, bật lên sẽ áp dụng chúng | Kiểm tra/xoá các mục đó ở LAN → Bind IP to MAC rồi chặn lại |
 | Chặn báo "router không lưu mục chặn" | Router từ chối lệnh `ip bindmac add` (firmware khác cú pháp); DrayPulse đã hoàn tác | Báo lại kèm model/firmware |
-| Cảnh báo "Đã TẠM DỪNG tự động chặn" | Trong 1 giờ DrayPulse định tự chặn nhiều IP hơn giới hạn (thường do chặn nhầm thiết bị dùng chung hoặc DHCP cấp lại hàng loạt) | Xem tab Client → Client bị chặn, bỏ chặn mục sai (hoặc **Bỏ chặn tất cả**), rồi bấm **Tiếp tục tự động chặn**. Tăng giới hạn ở Cài đặt nếu cần |
+| Cảnh báo "Thiết bị bị chặn … đã đổi IP … lần trong 1 giờ" | Router liên tục cấp IP mới cho thiết bị bị chặn (Bind IP to MAC là đặt trước IP trong DHCP) | DrayPulse tự đuổi theo lại sau 1 giờ. Tăng giới hạn ở Cài đặt → Chặn client an toàn nếu cần |
+| Sự kiện "Đối chiếu với router: … mục chặn đã mất khỏi router" | Router (đã thấy trên Vigor 3912S) tự xoá mục Bind IP to MAC | DrayPulse đã tự thêm lại/nhả; nếu lặp lại thường xuyên, kiểm tra ai/cái gì đang sửa cấu hình router (Web UI, VigorACS, Config Sync) |
+| WAN hoặc thiết bị hiện "Lỗi kiểm tra" | Lệnh ping qua router không chạy được nhiều lần liên tiếp (router bận phiên Telnet/SSH, lỗi kết nối) | Không phải mất kết nối. Xem lý do ở dòng trạng thái; từ 0.6.4 DrayPulse không còn đọc lệch kết quả lệnh sau khi đăng nhập SSH |
 | Chặn báo "nằm trong danh sách Không bao giờ chặn" | MAC/IP (hoặc MAC đang dùng IP đó) thuộc danh sách bảo vệ | Bỏ khỏi danh sách ở Cài đặt → Chặn client an toàn nếu thật sự cần chặn |
 | Bấm “Chặn” hiện “Đang xử lý…” rất lâu rồi báo lỗi hết thời gian | Phiên Telnet/SSH của router bận liên tục, thường vì nhiều thiết bị được ping **Từ router** | Nâng cấp lên 0.6.3 (lệnh chặn được ưu tiên) và chuyển **Ping thiết bị LAN = Từ máy DrayPulse** nếu máy DrayPulse ping được các thiết bị đó |
 | Chặn nhầm nhiều máy cùng lúc | Chặn sai thiết bị, hoặc dữ liệu từ bản cũ (theo tên máy) | Tab Client → **Bỏ chặn tất cả** |

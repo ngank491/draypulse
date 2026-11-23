@@ -39,7 +39,7 @@ type Settings struct {
 	// client blocking safety
 	BlockProtected  string `json:"blockProtected"`  // MACs/IPs that may never be blocked
 	BlockHostIgnore string `json:"blockHostIgnore"` // host names (patterns) never used to recognise a device
-	BlockAutoMax    int    `json:"blockAutoMax"`    // automatic blocks per router per hour before auto-blocking pauses
+	BlockAutoMax    int    `json:"blockAutoMax"`    // new IPs blocked automatically for one device per hour
 }
 
 // defaultHostIgnore lists the factory host names shared by many devices:
@@ -49,7 +49,7 @@ const defaultHostIgnore = "iphone, iphone-?, ipad, ipad-?, macbook, macbook-air,
 
 func defaultSettings() Settings {
 	return Settings{SummaryOn: true, SummaryAt: "08:00", RepeatMin: 30, Timezone: "Asia/Ho_Chi_Minh", RetentionDays: 30,
-		AIAnonymize: true, AIFallback: true, BlockHostIgnore: defaultHostIgnore, BlockAutoMax: 5}
+		AIAnonymize: true, AIFallback: true, BlockHostIgnore: defaultHostIgnore, BlockAutoMax: 10}
 }
 
 type SettingsStore struct {
@@ -368,7 +368,7 @@ func (s *SettingsStore) Update(in SettingsInput) error {
 		ignore = p
 	}
 	if in.BlockAutoMax != nil && (*in.BlockAutoMax < 1 || *in.BlockAutoMax > 100) {
-		return errors.New("giới hạn tự động chặn phải từ 1 đến 100 thiết bị/giờ")
+		return errors.New("giới hạn tự động chặn phải từ 1 đến 100 IP mỗi thiết bị trong 1 giờ")
 	}
 	in.AdminChat = strings.TrimSpace(in.AdminChat)
 	in.ZaloAdmin = strings.TrimSpace(in.ZaloAdmin)
@@ -496,7 +496,7 @@ type blockSafety struct {
 }
 
 func (s *SettingsStore) blockSafety() blockSafety {
-	b := blockSafety{macs: map[string]bool{}, ips: map[string]bool{}, autoMax: 5, ignore: splitList(defaultHostIgnore)}
+	b := blockSafety{macs: map[string]bool{}, ips: map[string]bool{}, autoMax: 10, ignore: splitList(defaultHostIgnore)}
 	if s == nil {
 		return b
 	}

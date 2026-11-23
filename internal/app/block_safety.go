@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"regexp"
 	"strings"
+	"time"
 )
 
 // ---------- Safety rails for client blocking ----------
@@ -94,22 +95,35 @@ func (h *Hub) suggestByHost(routerID int64, devs []Device, ob observed, blocked 
 	}
 }
 
-// autoRecent counts automatic blocks in the last hour (caller holds blockMu).
-func (rs *RState) autoRecent(now int64) int {
-	keep := rs.autoAdds[:0]
-	for _, t := range rs.autoAdds {
+// autoCount counts the IPs blocked automatically for a device in the last
+// hour (caller holds blockMu).
+func (rs *RState) autoCount(mac string, now int64) int {
+	if rs.autoAdds == nil {
+		rs.autoAdds, rs.limitNoted = map[string][]int64{}, map[string]int64{}
+	}
+	var keep []int64
+	for _, t := range rs.autoAdds[mac] {
 		if now-t < 3600_000 {
 			keep = append(keep, t)
 		}
 	}
-	rs.autoAdds = keep
+	if keep == nil {
+		delete(rs.autoAdds, mac)
+	} else {
+		rs.autoAdds[mac] = keep
+	}
 	return len(keep)
 }
 
-func (rs *RState) autoRecord(now int64, n int) {
-	for range n {
-		rs.autoAdds = append(rs.autoAdds, now)
+func (rs *RState) autoRecord(mac string, now int64) {
+	if rs.autoAdds == nil {
+		rs.autoAdds, rs.limitNoted = map[string][]int64{}, map[string]int64{}
 	}
+	rs.autoAdds[mac] = append(rs.autoAdds[mac], now)
+}
+
+func (rs *RState) resetAuto() {
+	rs.autoAdds, rs.limitNoted = map[string][]int64{}, map[string]int64{}
 }
 
 // AcceptSuggestion blocks the suggested MAC (an admin confirmed it).
@@ -121,6 +135,10 @@ func (h *Hub) AcceptSuggestion(ctx context.Context, routerID int64, mac, by stri
 	}
 	for _, x := range l {
 		if x.MAC == mac {
+			if devs, _ := h.st.ListDevices(routerID); slicesContains(deviceMACs(devs), mac) {
+				h.st.DeleteSuggestion(routerID, mac) // blocked meanwhile
+				return nil, errors.New("thiết bị này đã bị chặn")
+			}
 			// the IP of the suggestion may have moved on: block what the router sees now
 			return h.blockDevice(ctx, routerID, x.MAC, "", x.Name, x.Host, "", true, by,
 				fmt.Sprintf("cùng tên máy với %s, xác nhận bởi %s", x.RefMAC, by))
@@ -157,7 +175,7 @@ func (h *Hub) ResumeAuto(routerID int64, by string) error {
 	if err := h.saveBlockCfg(rs, func(b *BlockCfg) { b.AutoPaused, b.AutoPausedAt = false, 0 }); err != nil {
 		return err
 	}
-	rs.autoAdds = nil
+	rs.resetAuto()
 	rs.mu.RLock()
 	cfg := rs.cfg
 	rs.mu.RUnlock()
@@ -202,6 +220,11 @@ func (h *Hub) UnblockAll(ctx context.Context, routerID int64, by string) (int, e
 			del = append(del, e.IP)
 		}
 	}
+	for _, b := range blocks { // entries the router dropped on its own can leave ARP lines behind
+		if !slicesContains(del, b.IP) {
+			o.clearARP(b.IP)
+		}
+	}
 	if len(del) > 0 {
 		if err := h.bindTx(o, rs, nil, del); err != nil {
 			return 0, err
@@ -221,7 +244,10 @@ func (h *Hub) UnblockAll(ctx context.Context, routerID int64, by string) (int, e
 		return len(del), err
 	}
 	rs.hasBlocks.Store(false)
-	rs.autoAdds = nil
+	rs.resetAuto()
+	rs.mu.Lock()
+	rs.drift = nil
+	rs.mu.Unlock()
 	rs.mu.RLock()
 	cfg := rs.cfg
 	rs.mu.RUnlock()
@@ -229,6 +255,141 @@ func (h *Hub) UnblockAll(ctx context.Context, routerID int64, by string) (int, e
 	eff.add(nowMs(), "warning", "✅", fmt.Sprintf("Đã bỏ chặn TẤT CẢ: %d thiết bị, %d IP (%d mục DrayPulse trên router) – bởi %s", len(devs), len(blocks), len(del), by), true)
 	h.apply(cfg, eff)
 	return len(del), nil
+}
+
+func deviceMACs(devs []Device) []string {
+	out := make([]string, len(devs))
+	for i, d := range devs {
+		out[i] = d.MAC
+	}
+	return out
+}
+
+// ---------- comparison with the router ----------
+
+// BlockDrift is the last comparison of DrayPulse's blocks with the router.
+type BlockDrift struct {
+	At       int64    `json:"at"`
+	Missing  []string `json:"missing"`  // blocked here, gone from the router
+	Readded  []string `json:"readded"`  // … and added again
+	Released []string `json:"released"` // … and released: the device no longer uses the IP
+	Extra    []string `json:"extra"`    // DrayPulse entries on the router unknown here (removed)
+	Stale    []string `json:"stale"`    // ARP lines left pointing at the blocking MAC (cleared)
+	Error    string   `json:"error,omitempty"`
+}
+
+// reconcileEvery is how often the router's table is compared with the DB.
+var reconcileEvery = 5 * time.Minute
+
+// reconcileBlocks compares the router's Bind IP to MAC table and ARP with
+// DrayPulse's blocks (Vigor 3912S was seen dropping entries on its own):
+//   - a missing entry is added again while its device (or a manual IP block)
+//     still uses the IP; otherwise the block is released,
+//   - DrayPulse entries the DB does not know are removed,
+//   - ARP lines left pointing at the blocking MAC are cleared.
+//
+// arp is the router's fresh ARP table (all rows, blocking MAC included).
+func (h *Hub) reconcileBlocks(ctx context.Context, rs *RState, arp, lease []Row) {
+	if !rs.hasBlocks.Load() || !rs.blockMu.TryLock() {
+		return
+	}
+	defer rs.blockMu.Unlock()
+	rs.mu.RLock()
+	cfg := rs.cfg
+	rs.mu.RUnlock()
+	if !cfg.Opts.Block.Enabled {
+		return
+	}
+	blocks, err := h.st.ListBlocks(cfg.ID)
+	if err != nil {
+		return
+	}
+	now := nowMs()
+	ob := observe(arp, lease)
+	cctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	o, done, err := h.bindSession(cctx, rs)
+	if err != nil {
+		return
+	}
+	defer done()
+	st, err := o.show()
+	if err != nil {
+		return
+	}
+	dr := &BlockDrift{At: now, Missing: []string{}, Readded: []string{}, Released: []string{}, Extra: []string{}, Stale: []string{}}
+	known := map[string]bool{}
+	var readd []string
+	for _, b := range blocks {
+		known[b.IP] = true
+		if e := st.find(b.IP); e != nil && e.ours() {
+			continue
+		}
+		dr.Missing = append(dr.Missing, b.IP)
+		if b.MAC == "" || slicesContains(ob.ipMACs[b.IP], b.MAC) {
+			readd = append(readd, b.IP) // still in use by the blocked device (or a manual block)
+			continue
+		}
+		h.st.DeleteBlock(cfg.ID, b.IP) // the device moved on: follow it, not the old IP
+		o.clearARP(b.IP)
+		dr.Released = append(dr.Released, b.IP)
+	}
+	var extra []string
+	for _, e := range st.Entries {
+		if e.ours() && !known[e.IP] {
+			extra = append(extra, e.IP)
+		}
+	}
+	for _, a := range arp {
+		ip := a["address"]
+		if normMAC(a["mac-address"]) == blockMAC && ip != "" && !known[ip] && !slicesContains(extra, ip) {
+			o.clearARP(ip)
+			dr.Stale = append(dr.Stale, ip)
+		}
+	}
+	if len(extra) > 0 {
+		if err := h.bindTx(o, rs, nil, extra); err != nil {
+			dr.Error = err.Error()
+		} else {
+			dr.Extra = extra
+		}
+	}
+	if len(readd) > 0 {
+		if err := h.bindTx(o, rs, readd, nil); err != nil {
+			dr.Error = err.Error()
+		} else {
+			dr.Readded = readd
+		}
+	}
+	rs.mu.Lock()
+	rs.drift = dr
+	rs.mu.Unlock()
+	if len(dr.Missing)+len(dr.Extra)+len(dr.Stale) == 0 {
+		return
+	}
+	var eff effects
+	msg := fmt.Sprintf("Đối chiếu với router: %d mục chặn đã mất khỏi router (không do DrayPulse xoá)", len(dr.Missing))
+	if len(dr.Readded) > 0 {
+		msg += fmt.Sprintf("; đã thêm lại %d (%s)", len(dr.Readded), strings.Join(dr.Readded, ", "))
+	}
+	if len(dr.Released) > 0 {
+		msg += fmt.Sprintf("; nhả %d IP thiết bị không còn dùng (%s)", len(dr.Released), strings.Join(dr.Released, ", "))
+	}
+	if len(dr.Extra) > 0 {
+		msg += fmt.Sprintf("; xoá %d mục DrayPulse lạ (%s)", len(dr.Extra), strings.Join(dr.Extra, ", "))
+	}
+	if len(dr.Stale) > 0 {
+		msg += fmt.Sprintf("; xoá %d dòng ARP còn trỏ về MAC chặn (%s)", len(dr.Stale), strings.Join(dr.Stale, ", "))
+	}
+	if dr.Error != "" {
+		msg += "; lỗi: " + dr.Error
+	}
+	eff.add(now, "warning", "🔁", msg, len(dr.Missing) > 0 && now-rs.blockErrNotified >= 3600_000)
+	if len(dr.Missing) > 0 && now-rs.blockErrNotified >= 3600_000 {
+		rs.blockErrNotified = now
+	}
+	h.refreshHasBlocks(rs, cfg.ID)
+	h.apply(cfg, eff)
 }
 
 // ---------- DHCP leases reported by syslog ----------

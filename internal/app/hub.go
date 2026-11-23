@@ -27,6 +27,7 @@ type ProbeState struct {
 	Alerted   bool    `json:"alerted"`
 	LastAlert int64   `json:"lastAlert"`
 	Error     string  `json:"error,omitempty"`
+	Errs      int     `json:"errs,omitempty"` // consecutive checks that could not run
 }
 
 func newProbe() *ProbeState { return &ProbeState{Status: "unknown", RTT: -1} }
@@ -34,19 +35,22 @@ func newProbe() *ProbeState { return &ProbeState{Status: "unknown", RTT: -1} }
 func (p *ProbeState) step(ok, errored bool, now int64, rtt float64, threshold int) string {
 	p.LastCheck = now
 	if errored {
-		if p.Status == "unknown" {
-			p.Status = "error"
+		// a check that cannot run says nothing about the target: after a few
+		// in a row show "error" instead of keeping an old "down" (or "up")
+		p.Errs++
+		if p.Status == "unknown" || (p.Errs >= 3 && p.Status != "error") {
+			p.Status, p.Since = "error", now
 		}
 		return ""
 	}
-	p.Error = ""
+	p.Error, p.Errs = "", 0
 	if ok {
 		p.Fails, p.RTT = 0, rtt
 		if p.Status != "up" {
 			prev := p.Status
 			p.Status, p.Since = "up", now
-			if prev == "down" {
-				return "up"
+			if prev == "down" || (prev == "error" && p.Alerted) {
+				return "up" // recovery is reported if the outage was
 			}
 		}
 		return ""
@@ -119,9 +123,16 @@ type RState struct {
 	hasBlocks  atomic.Bool // devices are blocked: follow their IPs every 15 s
 	flows      []flowRec   // recent firewall connections from syslog (memory only)
 	lastFollow time.Time   // only touched by the poll loop
-	autoAdds   []int64     // times of automatic blocks in the last hour (guarded by blockMu)
 	followWake chan struct{}
-	dhcpHints  []dhcpHint // recent leases seen in syslog (guarded by mu)
+	// guarded by blockMu:
+	autoAdds         map[string][]int64 // per blocked MAC: times of automatic blocks in the last hour
+	limitNoted       map[string]int64   // per MAC: last "changes IP too often" event
+	blockErrMsg      string             // last router update error (event de-duplication)
+	blockErrAt       int64
+	blockErrNotified int64
+	lastReconcile    time.Time   // only touched by the poll loop
+	drift            *BlockDrift // last comparison with the router (guarded by mu)
+	dhcpHints        []dhcpHint  // recent leases seen in syslog (guarded by mu)
 }
 
 type persisted struct {
@@ -146,7 +157,7 @@ func newRState(r Router, mons []Monitor) *RState {
 	return &RState{id: r.ID, cfg: r, monitors: mons, Conn: *newProbe(), Sections: map[string][]Row{}, SectionAt: map[string]int64{},
 		Probes: map[int64]*ProbeState{}, WANs: map[string]*WanState{},
 		IfLinks: map[string]*ProbeState{}, WanIPs: map[string]string{}, PoolFull: map[string]bool{}, Clients: map[string]*Client{}, aliases: map[string]string{},
-		followWake: make(chan struct{}, 1)}
+		followWake: make(chan struct{}, 1), autoAdds: map[string][]int64{}, limitNoted: map[string]int64{}}
 }
 
 func (rs *RState) restore(b []byte) {
@@ -1239,9 +1250,10 @@ func (h *Hub) view(rs *RState, detail bool) RouterView {
 	if detail {
 		v.Clients = rs.clientList()
 		v.VLANs, v.LANs = rs.vlanViews()
-		if c.Opts.Block.Enabled {
-			v.Blocking = &BlockInfo{Devices: devices, IPs: blocks, Suggestions: suggestions,
-				AutoPaused: c.Opts.Block.AutoPaused, AutoPausedAt: c.Opts.Block.AutoPausedAt}
+		// with blocking switched off, leftovers are still shown so they can be removed
+		if c.Opts.Block.Enabled || len(devices)+len(blocks) > 0 {
+			v.Blocking = &BlockInfo{Devices: devices, IPs: blocks, Suggestions: suggestions, Enabled: c.Opts.Block.Enabled,
+				Drift: rs.drift, AutoPaused: c.Opts.Block.AutoPaused, AutoPausedAt: c.Opts.Block.AutoPausedAt}
 		}
 		v.Ifaces = append([]Iface{}, rs.Ifaces...)
 		v.Sections, v.SectionAt = map[string][]Row{}, map[string]int64{}

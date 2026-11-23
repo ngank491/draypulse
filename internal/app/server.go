@@ -805,6 +805,9 @@ func (s *Server) testRouter(w http.ResponseWriter, r *http.Request, u *User) {
 		return
 	}
 	defer src.Close()
+	if in.ID > 0 {
+		defer s.hub.sharedCLI(in.ID, src)() // unchanged login: use the running session
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 40*time.Second)
 	defer cancel()
 	out := map[string]any{"ok": true}
@@ -1349,6 +1352,10 @@ func (s *Server) blockClient(w http.ResponseWriter, r *http.Request, u *User) {
 	in.IP = strings.TrimSpace(in.IP)
 	if in.IP != "" && net.ParseIP(in.IP) == nil {
 		errJSON(w, 400, "IP không hợp lệ")
+		return
+	}
+	if in.IP != "" && in.IP == s.clientIP(r) {
+		errJSON(w, 400, "đây là IP của máy bạn đang dùng để mở DrayPulse – chặn sẽ mất kết nối")
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)

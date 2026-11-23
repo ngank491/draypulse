@@ -165,6 +165,7 @@ func (a *Auditor) run(rs *RState, rep *AuditReport) {
 		if c, ok := src.(interface{ Close() }); ok {
 			defer c.Close()
 		}
+		defer a.h.sharedCLI(cfg.ID, asDraytek(src))() // one CLI session per router
 		snap = collectAudit(ctx, src)
 		ok, firstErr := 0, ""
 		for _, sec := range snap.Sections {
