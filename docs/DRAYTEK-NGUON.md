@@ -43,12 +43,17 @@ Không có trên các walk đã xem (2920/2927/2962): `ifXTable` (bộ đếm 64
 
 | Lệnh | Ý nghĩa |
 |---|---|
-| `ip bindmac show` | đọc trạng thái (ON/OFF, STRICT) và bảng IP–MAC |
-| `ip bindmac on` / `off` | bật/tắt Bind IP to MAC ở chế độ thường (không strict) |
-| `ip bindmac add <IP> 02:dd:00:00:00:01 DrayPulse` | chặn IP: gắn với MAC không tồn tại |
-| `ip bindmac del <IP>` | bỏ chặn (chỉ xoá mục có MAC và ghi chú của DrayPulse) |
+| `ipf set -v` / `ipf set -d <bộ lọc>` / `ipf set -d 0` | đọc / bật / tắt Data Filter (chỉ tắt nếu DrayPulse đã bật) |
+| `ipf rule ?` | số bộ lọc và số luật mỗi bộ của firmware |
+| `ipf rule <s> <r> -v` | đọc luật (trạng thái, ghi chú, nguồn, Pass/Block) |
+| `ipf rule <s> <r> -e 1 -D 0 -s "g 1 32" -F "1 0" -m "0 0" -M "DrayPulse"` | tạo/bật luật chặn: LAN → WAN, nguồn nhóm 32, Block Immediately, MAC Bind non-strict |
+| `ipf rule <s> <r> -s "g 2 31"` / `"g 2 0"` | thêm/bỏ nhóm 31 làm nguồn thứ hai |
+| `ipf rule <s> <r> -e 0` / `-U 0` | tắt luật / chuyển luật lên một bậc |
+| `object ip obj <100–192> -v / -n DP-… / -i 1 / -a 4 <mac> / -a 1 <ip> / -a 0 0.0.0.0 0.0.0.0` | đối tượng IP của DrayPulse |
+| `object ip grp <31|32> -v / -n DrayPulse1|2 / -i 1 / -a "<12 số>"` | nhóm IP của DrayPulse |
+| `ip bindmac show` / `del <IP>` / `off`, `ip arp del <IP> LAN` | chỉ để dọn mục chặn của bản 0.4–0.6 khi Bỏ chặn tất cả |
 
-Không có `del all`, `strict_on`, `subnet`. Mẫu output `ip bindmac show` theo User Guide Vigor 2927/3912.
+Không có `sys commit`, `sys reboot`, lệnh xoá luật/nhóm/đối tượng khác. Cú pháp theo CLI Reference DrayOS 4.4 và đã thử trên Vigor 3912S 4.4.3.2 và Vigor2926 plus 4.4.3.
 
 ## Syslog
 

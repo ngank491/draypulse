@@ -20,6 +20,7 @@ type demoRouter struct {
 	snmp *simSNMP
 	cli  *simCLI
 	bind *simBindMAC
+	fw   *simFirewall
 
 	mu      sync.Mutex
 	started time.Time
@@ -72,6 +73,7 @@ func startDemoRouter(ctx context.Context, seed int64) (*demoRouter, error) {
 	}
 	var err error
 	d.bind = &simBindMAC{}
+	d.fw = newSimFirewall()
 	if d.snmp, err = startSimSNMP(ctx, "public", d.snmpData); err != nil {
 		return nil, err
 	}
@@ -168,6 +170,9 @@ func atoiDef(s string, def int) int {
 func wan2Down() bool { return time.Now().Minute()%15 < 2 }
 
 func (d *demoRouter) cliReply(cmd string) string {
+	if out, ok := d.fw.handle(cmd); ok {
+		return out
+	}
 	if out, ok := d.bind.handle(cmd); ok {
 		return out
 	}

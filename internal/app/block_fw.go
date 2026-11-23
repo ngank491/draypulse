@@ -1,0 +1,804 @@
+package app
+
+import (
+	"errors"
+	"fmt"
+	"net"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+)
+
+// ---------- Blocking with a data filter rule and MAC IP objects ----------
+//
+// DrayTek documents a firewall rule with an IP object of type MAC as the way
+// to block one device whatever its IP (Bind IP to MAC is a DHCP reservation:
+// a "blocked" device just gets another IP, and the router keeps one entry
+// per MAC and LAN). DrayPulse keeps on each router:
+//
+//   - one IP object per blocked device (type MAC) or IP-only block (type
+//     single), named "DP-<MAC>" / "DPI<IP>", taken from index 192 downwards,
+//   - IP groups 32 and 31 ("DrayPulse1", "DrayPulse2"), 12 objects each,
+//   - one rule commented "DrayPulse" in the data filter's start set:
+//     LAN → WAN, source = the groups, Block Immediately, MAC Bind non-strict.
+//
+// Every change converges the router to the wanted list and is read back. The
+// rule is enabled only after its groups hold the objects and disabled before
+// they are emptied (an empty group must never be a rule's source). Nothing
+// is committed to flash: the comparison every 5 minutes restores what a
+// reboot lost.
+
+const (
+	fwComment  = "DrayPulse"
+	fwObjTop   = 192
+	fwObjLow   = 100
+	fwPerGroup = 12
+)
+
+var fwGroups = []int{32, 31}
+
+// fwMax is how many devices/IPs DrayPulse can block per router.
+var fwMax = fwPerGroup * len(fwGroups)
+
+// fwLayout is where DrayPulse's pieces sit on one router (kv "fw:<id>").
+type fwLayout struct {
+	Set      int            `json:"set"`      // rule slot
+	Rule     int            `json:"rule"`     //
+	Objects  map[string]int `json:"objects"`  // key → IP object index
+	TurnedOn bool           `json:"turnedOn"` // DrayPulse switched the data filter on
+	Sets     int            `json:"sets"`     // limits of this firmware
+	Rules    int            `json:"rules"`
+}
+
+// fwKey identifies a block: "mac:AA:BB:…" or "ip:192.168.1.5".
+func fwKeyMAC(mac string) string { return "mac:" + mac }
+func fwKeyIP(ip string) string   { return "ip:" + ip }
+
+func fwObjName(key string) string {
+	if mac, ok := strings.CutPrefix(key, "mac:"); ok {
+		return "DP-" + strings.ReplaceAll(mac, ":", "")
+	}
+	ip := strings.TrimPrefix(key, "ip:")
+	var b strings.Builder
+	b.WriteString("DPI")
+	for _, p := range strings.Split(ip, ".") {
+		n, _ := strconv.Atoi(p)
+		fmt.Fprintf(&b, "%03d", n)
+	}
+	return b.String()
+}
+
+// fwWriteAllowed are the only firewall changes DrayPulse can make. Indices
+// and values are constrained; the code also checks each object, group and
+// rule is DrayPulse's (by name/comment) before changing it.
+var fwWriteAllowed = []*regexp.Regexp{
+	regexp.MustCompile(`^ipf set -v$`),
+	regexp.MustCompile(`^ipf set -d \d{1,2}$`),
+	regexp.MustCompile(`^ipf rule \?$`),
+	regexp.MustCompile(`^ipf rule \d{1,2} \d{1,2} -v$`),
+	regexp.MustCompile(`^ipf rule \d{1,2} \d{1,2} -e 1 -D 0 -s "g 1 32" -F "1 0" -m "0 0" -M "DrayPulse"$`),
+	regexp.MustCompile(`^ipf rule \d{1,2} \d{1,2} -s "g 2 (31|0)"$`),
+	regexp.MustCompile(`^ipf rule \d{1,2} \d{1,2} -e 0$`),
+	regexp.MustCompile(`^ipf rule \d{1,2} \d{1,2} -U 0$`),
+	regexp.MustCompile(`^object ip obj (1\d\d|\d{1,2}) -v$`),
+	regexp.MustCompile(`^object ip obj (1\d\d) -n (DP-[0-9A-F]{12}|DPI\d{12}|"")$`),
+	regexp.MustCompile(`^object ip obj (1\d\d) -i [01]$`),
+	regexp.MustCompile(`^object ip obj (1\d\d) -a 4 [0-9a-f]{2}(:[0-9a-f]{2}){5}$`),
+	regexp.MustCompile(`^object ip obj (1\d\d) -a 1 \d{1,3}(\.\d{1,3}){3}$`),
+	regexp.MustCompile(`^object ip obj (1\d\d) -a 0 0\.0\.0\.0 0\.0\.0\.0$`),
+	regexp.MustCompile(`^object ip grp (31|32) -v$`),
+	regexp.MustCompile(`^object ip grp (31|32) -n DrayPulse[12]$`),
+	regexp.MustCompile(`^object ip grp (31|32) -i [01]$`),
+	regexp.MustCompile(`^object ip grp (31|32) -a "\d{1,3}( \d{1,3}){11}"$`),
+}
+
+func fwCommandAllowed(cmd string) bool {
+	for _, re := range fwWriteAllowed {
+		if re.MatchString(cmd) {
+			if i := objIndex(cmd); i > 0 && strings.Contains(cmd, " -v") == false && (i < fwObjLow || i > fwObjTop) {
+				return false
+			}
+			return true
+		}
+	}
+	return false
+}
+
+var reObjIdx = regexp.MustCompile(`^object ip obj (\d+) `)
+
+func objIndex(cmd string) int {
+	if m := reObjIdx.FindStringSubmatch(cmd); m != nil {
+		n, _ := strconv.Atoi(m[1])
+		return n
+	}
+	return 0
+}
+
+// ---------- parsing the "-v" views ----------
+
+var (
+	reFwName   = regexp.MustCompile(`(?m)^\s*Name\s*:\[([^\]]*)\]`)
+	reFwType   = regexp.MustCompile(`(?m)^\s*Address type:\[([^\]]*)\]`)
+	reFwIP     = regexp.MustCompile(`(?m)^\s*Start ip address:\[([^\]]*)\]`)
+	reFwMAC    = regexp.MustCompile(`(?m)^\s*MAC Address:\[([^\]]*)\]`)
+	reFwMember = regexp.MustCompile(`(?m)^\s*\[(\d+):\]\[(\d+)\]`)
+	reFwStatus = regexp.MustCompile(`(?m)^Status\s*:\s*(\w+)`)
+	reFwCmt    = regexp.MustCompile(`(?m)^Comments\s*:\s*(.*?)\s*$`)
+	reFwSrc    = regexp.MustCompile(`(?m)^Source IP\s*:\s*(.*?)\s*$`)
+	reFwAct    = regexp.MustCompile(`(?m)^Pass or Block\s*:\s*(.*?)\s*$`)
+	reFwDF     = regexp.MustCompile(`Data Filter:\s*(Enable|Disable)(?:\s*\(Start Filter Set\s*=\s*(\d+)\))?`)
+	reFwLimits = regexp.MustCompile(`s: set, range 1-(\d+)\.[\s\S]*?r: rule, range 1-(\d+)\.`)
+)
+
+type fwObj struct {
+	Name, Type, IP, MAC string
+}
+
+func (o fwObj) empty() bool {
+	return o.Name == "" && (o.Type == "mask" || o.Type == "") && (o.IP == "" || o.IP == "0.0.0.0") && (o.MAC == "" || o.MAC == zeroMAC)
+}
+
+func parseFwObj(s string) (fwObj, bool) {
+	var o fwObj
+	m := reFwName.FindStringSubmatch(s)
+	if m == nil {
+		return o, false
+	}
+	o.Name = strings.TrimSpace(m[1])
+	if m := reFwType.FindStringSubmatch(s); m != nil {
+		o.Type = strings.ToLower(strings.TrimSpace(m[1]))
+	}
+	if m := reFwIP.FindStringSubmatch(s); m != nil {
+		o.IP = strings.TrimSpace(m[1])
+	}
+	if m := reFwMAC.FindStringSubmatch(s); m != nil {
+		o.MAC = normMAC(m[1])
+	}
+	return o, true
+}
+
+type fwGrp struct {
+	Name    string
+	Members [fwPerGroup]int
+}
+
+func parseFwGrp(s string) (fwGrp, bool) {
+	var g fwGrp
+	m := reFwName.FindStringSubmatch(s)
+	if m == nil {
+		return g, false
+	}
+	g.Name = strings.TrimSpace(m[1])
+	for _, x := range reFwMember.FindAllStringSubmatch(s, -1) {
+		k, _ := strconv.Atoi(x[1])
+		v, _ := strconv.Atoi(x[2])
+		if k >= 0 && k < fwPerGroup {
+			g.Members[k] = v
+		}
+	}
+	return g, true
+}
+
+type fwRule struct {
+	On      bool
+	Comment string
+	Source  string
+	Block   bool
+}
+
+func (r fwRule) ours() bool { return r.Comment == fwComment }
+
+// free: an untouched slot (disabled, no comment, any source, default pass).
+func (r fwRule) free() bool {
+	return !r.On && (r.Comment == "" || r.Comment == "<null>") && r.Source == "Any" && !r.Block
+}
+
+func parseFwRule(s string) (fwRule, bool) {
+	var r fwRule
+	m := reFwStatus.FindStringSubmatch(s)
+	if m == nil {
+		return r, false
+	}
+	r.On = strings.EqualFold(m[1], "Enable")
+	if m := reFwCmt.FindStringSubmatch(s); m != nil {
+		r.Comment = m[1]
+	}
+	if m := reFwSrc.FindStringSubmatch(s); m != nil {
+		r.Source = strings.TrimRight(m[1], ", ")
+	}
+	if m := reFwAct.FindStringSubmatch(s); m != nil {
+		r.Block = strings.HasPrefix(strings.ToLower(m[1]), "block")
+	}
+	return r, true
+}
+
+// ---------- router session helpers ----------
+
+func (o *bindOps) fw(cmd string) (string, error) {
+	if !fwCommandAllowed(cmd) {
+		return "", fmt.Errorf("lệnh CLI không được phép: %q", cmd)
+	}
+	out, err := o.cli.runHeld(o.ctx, []string{cmd})
+	if err != nil {
+		return "", err
+	}
+	text := out[cmd]
+	if strings.HasSuffix(cmd, " -v") || strings.HasSuffix(cmd, " ?") {
+		return text, nil
+	}
+	low := strings.ToLower(text)
+	for _, bad := range []string{"unknown command", "command not found", "invalid", "error", "fail", "usage"} {
+		if strings.Contains(low, bad) {
+			return text, fmt.Errorf("router từ chối lệnh %q: %s", cmd, firstLine(text))
+		}
+	}
+	return text, nil
+}
+
+func (o *bindOps) fwObj(i int) (fwObj, error) {
+	t, err := o.fw(fmt.Sprintf("object ip obj %d -v", i))
+	if err != nil {
+		return fwObj{}, err
+	}
+	ob, ok := parseFwObj(t)
+	if !ok {
+		return ob, fmt.Errorf("không hiểu kết quả “object ip obj %d -v”: %s", i, rawSnippet(t))
+	}
+	return ob, nil
+}
+
+func (o *bindOps) fwGrp(i int) (fwGrp, error) {
+	t, err := o.fw(fmt.Sprintf("object ip grp %d -v", i))
+	if err != nil {
+		return fwGrp{}, err
+	}
+	g, ok := parseFwGrp(t)
+	if !ok {
+		return g, fmt.Errorf("không hiểu kết quả “object ip grp %d -v”: %s", i, rawSnippet(t))
+	}
+	return g, nil
+}
+
+func (o *bindOps) fwRule(s, r int) (fwRule, error) {
+	t, err := o.fw(fmt.Sprintf("ipf rule %d %d -v", s, r))
+	if err != nil {
+		return fwRule{}, err
+	}
+	x, ok := parseFwRule(t)
+	if !ok {
+		return x, fmt.Errorf("không hiểu kết quả “ipf rule %d %d -v”: %s", s, r, rawSnippet(t))
+	}
+	return x, nil
+}
+
+// fwDataFilter reads whether the data filter is on and its start set.
+func (o *bindOps) fwDataFilter() (on bool, start int, err error) {
+	t, err := o.fw("ipf set -v")
+	if err != nil {
+		return false, 0, err
+	}
+	m := reFwDF.FindStringSubmatch(t)
+	if m == nil {
+		return false, 0, fmt.Errorf("không hiểu kết quả “ipf set -v”: %s", rawSnippet(t))
+	}
+	on = m[1] == "Enable"
+	start = 1
+	if m[2] != "" {
+		start, _ = strconv.Atoi(m[2])
+	}
+	return on, start, nil
+}
+
+// ---------- converging the router to the wanted blocks ----------
+
+// fwWant is one block DrayPulse wants on the router.
+type fwWant struct {
+	Key string // fwKeyMAC / fwKeyIP
+}
+
+// FwReport says what a convergence had to change (for drift events).
+type FwReport struct {
+	Recreated []string // objects that were missing or wrong
+	Removed   []string
+	MovedUp   int  // positions the rule was moved above "Pass Immediately" rules
+	FilterOn  bool // DrayPulse switched the data filter on
+	FilterOff bool
+	RuleSet   bool // the rule was (re)written: missing or switched off before
+	RulePlace string
+}
+
+var errFwFull = fmt.Errorf("đã chặn tối đa %d thiết bị/IP trên router này (DrayPulse dùng 2 nhóm IP × 12 đối tượng)", fwPerGroup*2)
+
+// errFwFilterOff: the data filter is off and the start set holds the admin's
+// enabled rules, which switching it on would activate.
+type errFwFilterOff struct{ rules []string }
+
+func (e errFwFilterOff) Error() string {
+	return "Firewall → Data Filter của router đang TẮT, và bộ luật có luật của bạn đang bật (" + strings.Join(e.rules, "; ") +
+		"). Bật Data Filter sẽ áp dụng cả các luật này, nên DrayPulse không tự bật. Hãy kiểm tra các luật đó rồi bật Data Filter trong Firewall → General Setup, sau đó chặn lại"
+}
+
+func (h *Hub) fwLoad(routerID int64) fwLayout {
+	var l fwLayout
+	h.st.GetJSON(fmt.Sprintf("fw:%d", routerID), &l)
+	if l.Objects == nil {
+		l.Objects = map[string]int{}
+	}
+	return l
+}
+
+func (h *Hub) fwSave(routerID int64, l fwLayout) error {
+	return h.st.SetJSON(fmt.Sprintf("fw:%d", routerID), l)
+}
+
+// fwApply makes the router block exactly want (and nothing else of
+// DrayPulse's), reading every piece back.
+func (h *Hub) fwApply(o *bindOps, routerID int64, want []string) (*FwReport, error) {
+	rep := &FwReport{}
+	if len(want) > fwMax {
+		return rep, errFwFull
+	}
+	lay := h.fwLoad(routerID)
+	defer func() { h.fwSave(routerID, lay) }() // the final layout, not this copy
+	if lay.Sets == 0 {
+		if t, err := o.fw("ipf rule ?"); err == nil {
+			if m := reFwLimits.FindStringSubmatch(t); m != nil {
+				lay.Sets, _ = strconv.Atoi(m[1])
+				lay.Rules, _ = strconv.Atoi(m[2])
+			}
+		}
+		if lay.Sets == 0 || lay.Rules == 0 {
+			lay.Sets, lay.Rules = 12, 7
+		}
+	}
+	dfOn, start, err := o.fwDataFilter()
+	if err != nil {
+		return rep, err
+	}
+	wanted := map[string]bool{}
+	for _, k := range want {
+		wanted[k] = true
+	}
+	// 1. the rule slot: ours if placed, else the first free one of the start set
+	set := start
+	if !dfOn && lay.Set > 0 {
+		set = lay.Set
+	}
+	rules := map[int]fwRule{}
+	slot := 0
+	for r := 1; r <= lay.Rules; r++ {
+		x, err := o.fwRule(set, r)
+		if err != nil {
+			return rep, err
+		}
+		rules[r] = x
+		if x.ours() && slot == 0 {
+			slot = r
+		}
+	}
+	if slot == 0 && len(want) > 0 {
+		for r := 1; r <= lay.Rules; r++ {
+			if rules[r].free() {
+				slot = r
+				break
+			}
+		}
+		if slot == 0 {
+			return rep, fmt.Errorf("bộ luật lọc số %d của router không còn chỗ trống cho luật chặn của DrayPulse", set)
+		}
+	}
+	if len(want) > 0 && !dfOn {
+		var others []string
+		for r := 1; r <= lay.Rules; r++ {
+			if x := rules[r]; x.On && !x.ours() {
+				others = append(others, fmt.Sprintf("luật %d-%d “%s”", set, r, strings.TrimPrefix(x.Comment, "<null>")))
+			}
+		}
+		if len(others) > 0 {
+			return rep, errFwFilterOff{others}
+		}
+	}
+	// the groups: one the admin uses is never touched; it stops a block only
+	// when DrayPulse needs it (group 31 from the 13th block on)
+	grps := map[int]fwGrp{}
+	foreign := map[int]bool{}
+	for gi, g := range fwGroups {
+		cur, err := o.fwGrp(g)
+		if err != nil {
+			return rep, err
+		}
+		if cur.Name != "" && cur.Name != fmt.Sprintf("DrayPulse%d", gi+1) {
+			if gi*fwPerGroup < len(want) {
+				return rep, fmt.Errorf("nhóm IP %d của router đang được dùng (“%s”): DrayPulse cần nhóm 32 và 31 để chặn", g, cur.Name)
+			}
+			foreign[g] = true
+		}
+		grps[g] = cur
+	}
+	// 2. switch the rule off before any group shrinks
+	if slot > 0 && rules[slot].On && len(want) == 0 {
+		if _, err := o.fw(fmt.Sprintf("ipf rule %d %d -e 0", set, slot)); err != nil {
+			return rep, err
+		}
+	}
+	// 3. objects for new blocks (not in any group yet); repaired in place
+	used := map[int]bool{}
+	var drop []string
+	for k, i := range lay.Objects {
+		used[i] = true // an unwanted one stays reserved until it left the groups
+		if !wanted[k] {
+			drop = append(drop, k)
+		}
+	}
+	sort.Strings(drop)
+	var keys []string
+	for k := range wanted {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		i, ok := lay.Objects[k]
+		if ok {
+			cur, err := o.fwObj(i)
+			if err != nil {
+				return rep, err
+			}
+			if fwObjIs(cur, k) {
+				continue
+			}
+			if cur.Name != "" && cur.Name != fwObjName(k) { // taken by the admin meanwhile: find another
+				delete(lay.Objects, k)
+				delete(used, i)
+				ok = false
+			}
+		}
+		if !ok {
+			free, err := h.fwFreeObj(o, used)
+			if err != nil {
+				return rep, err
+			}
+			i = free
+		}
+		used[i] = true
+		if err := h.fwSetObj(o, i, k); err != nil {
+			return rep, err
+		}
+		lay.Objects[k] = i
+		rep.Recreated = append(rep.Recreated, k)
+	}
+	// 4. groups. An emptied group must never stay a source of the enabled
+	// rule, and an object leaves its group before it is cleared.
+	var idx []int
+	for _, k := range keys {
+		idx = append(idx, lay.Objects[k])
+	}
+	sort.Ints(idx)
+	needG2 := len(idx) > fwPerGroup
+	if slot > 0 && rules[slot].ours() && rules[slot].On && !needG2 && strings.Contains(rules[slot].Source, "Group31") {
+		if _, err := o.fw(fmt.Sprintf(`ipf rule %d %d -s "g 2 0"`, set, slot)); err != nil {
+			return rep, err
+		}
+		x := rules[slot]
+		x.Source = "(g1)IP Group32"
+		rules[slot] = x
+	}
+	for gi, g := range fwGroups {
+		var mem [fwPerGroup]int
+		for k := 0; k < fwPerGroup && gi*fwPerGroup+k < len(idx); k++ {
+			mem[k] = idx[gi*fwPerGroup+k]
+		}
+		cur := grps[g]
+		name := fmt.Sprintf("DrayPulse%d", gi+1)
+		if foreign[g] || cur.Members == mem && (cur.Name == name || mem == [fwPerGroup]int{}) {
+			continue
+		}
+		if cur.Name != name {
+			if _, err := o.fw(fmt.Sprintf("object ip grp %d -n %s", g, name)); err != nil {
+				return rep, err
+			}
+			if _, err := o.fw(fmt.Sprintf("object ip grp %d -i 1", g)); err != nil {
+				return rep, err
+			}
+		}
+		if cur.Members != mem {
+			parts := make([]string, fwPerGroup)
+			for k, v := range mem {
+				parts[k] = strconv.Itoa(v)
+			}
+			if _, err := o.fw(fmt.Sprintf(`object ip grp %d -a "%s"`, g, strings.Join(parts, " "))); err != nil {
+				return rep, err
+			}
+		}
+	}
+	// 5. objects no longer wanted
+	for _, k := range drop {
+		if err := h.fwClearObj(o, lay.Objects[k]); err != nil {
+			return rep, err
+		}
+		delete(lay.Objects, k)
+		rep.Removed = append(rep.Removed, k)
+	}
+	if len(want) == 0 {
+		if lay.TurnedOn && dfOn {
+			others := false
+			for r := 1; r <= lay.Rules; r++ {
+				if x := rules[r]; x.On && !x.ours() {
+					others = true
+				}
+			}
+			if !others {
+				if _, err := o.fw("ipf set -d 0"); err != nil {
+					return rep, err
+				}
+				rep.FilterOff = true
+			}
+			lay.TurnedOn = false
+		}
+		return rep, h.fwVerify(o, lay, set, slot, nil)
+	}
+	// 6. the rule: groups first, then the rule (left alone when already right,
+	// so a comparison in sync writes nothing)
+	if cur := rules[slot]; !(cur.ours() && cur.On && cur.Block && strings.Contains(cur.Source, "Group32") && strings.Contains(cur.Source, "Group31") == needG2) {
+		if _, err := o.fw(fmt.Sprintf(`ipf rule %d %d -e 1 -D 0 -s "g 1 32" -F "1 0" -m "0 0" -M "DrayPulse"`, set, slot)); err != nil {
+			return rep, err
+		}
+		second := "0"
+		if needG2 {
+			second = "31"
+		}
+		if _, err := o.fw(fmt.Sprintf(`ipf rule %d %d -s "g 2 %s"`, set, slot, second)); err != nil {
+			return rep, err
+		}
+		if !cur.ours() || !cur.On {
+			rep.RuleSet = true
+		}
+	}
+	// 7. above every enabled "Pass Immediately" rule of the set
+	for slot > 1 {
+		above := rules[slot-1]
+		if !(above.On && !above.Block) {
+			// a block rule or a disabled one above: keep looking further up
+			passAbove := false
+			for r := 1; r < slot; r++ {
+				if x := rules[r]; x.On && !x.Block && !x.ours() {
+					passAbove = true
+				}
+			}
+			if !passAbove {
+				break
+			}
+		}
+		if _, err := o.fw(fmt.Sprintf("ipf rule %d %d -U 0", set, slot)); err != nil {
+			return rep, err
+		}
+		moved, err := o.fwRule(set, slot-1)
+		if err != nil {
+			return rep, err
+		}
+		if !moved.ours() {
+			return rep, fmt.Errorf("router không chuyển luật chặn lên trên được (đọc lại luật %d-%d)", set, slot-1)
+		}
+		rules[slot-1], rules[slot] = moved, rules[slot-1]
+		slot--
+		rep.MovedUp++
+	}
+	rep.RulePlace = fmt.Sprintf("%d-%d", set, slot)
+	lay.Set, lay.Rule = set, slot
+	if !dfOn {
+		if _, err := o.fw(fmt.Sprintf("ipf set -d %d", set)); err != nil {
+			return rep, err
+		}
+		lay.TurnedOn, rep.FilterOn = true, true
+	}
+	return rep, h.fwVerify(o, lay, set, slot, keys)
+}
+
+func fwObjIs(o fwObj, key string) bool {
+	if o.Name != fwObjName(key) {
+		return false
+	}
+	if mac, ok := strings.CutPrefix(key, "mac:"); ok {
+		return o.Type == "mac" && o.MAC == mac
+	}
+	return o.IP == strings.TrimPrefix(key, "ip:")
+}
+
+func (h *Hub) fwSetObj(o *bindOps, i int, key string) error {
+	cmds := []string{fmt.Sprintf("object ip obj %d -n %s", i, fwObjName(key)), fmt.Sprintf("object ip obj %d -i 1", i)}
+	if mac, ok := strings.CutPrefix(key, "mac:"); ok {
+		cmds = append(cmds, fmt.Sprintf("object ip obj %d -a 4 %s", i, strings.ToLower(mac)))
+	} else {
+		cmds = append(cmds, fmt.Sprintf("object ip obj %d -a 1 %s", i, strings.TrimPrefix(key, "ip:")))
+	}
+	for _, c := range cmds {
+		if _, err := o.fw(c); err != nil {
+			return err
+		}
+	}
+	got, err := o.fwObj(i)
+	if err != nil {
+		return err
+	}
+	if !fwObjIs(got, key) {
+		return fmt.Errorf("router không lưu đối tượng IP %d cho %s (đọc lại: tên “%s”, kiểu %s, MAC %s, IP %s)", i, strings.SplitN(key, ":", 2)[1], got.Name, got.Type, got.MAC, got.IP)
+	}
+	return nil
+}
+
+func (h *Hub) fwClearObj(o *bindOps, i int) error {
+	cur, err := o.fwObj(i)
+	if err != nil {
+		return err
+	}
+	if cur.Name != "" && !strings.HasPrefix(cur.Name, "DP-") && !strings.HasPrefix(cur.Name, "DPI") {
+		return nil // no longer DrayPulse's: leave it alone
+	}
+	for _, c := range []string{fmt.Sprintf("object ip obj %d -a 4 00:00:00:00:00:00", i), fmt.Sprintf("object ip obj %d -a 0 0.0.0.0 0.0.0.0", i),
+		fmt.Sprintf("object ip obj %d -i 0", i)} {
+		if _, err := o.fw(c); err != nil {
+			return err
+		}
+	}
+	// a firmware that refuses an empty name keeps "DP-…": still free for
+	// DrayPulse (fwFreeObj), harmless for everyone else
+	o.fw(fmt.Sprintf(`object ip obj %d -n ""`, i))
+	return nil
+}
+
+// fwFreeForUs: an empty object, or one of DrayPulse's emptied leftovers.
+func fwFreeForUs(o fwObj) bool {
+	if o.empty() {
+		return true
+	}
+	ours := strings.HasPrefix(o.Name, "DP-") || strings.HasPrefix(o.Name, "DPI")
+	return ours && fwObj{Type: o.Type, IP: o.IP, MAC: o.MAC}.empty()
+}
+
+// fwFreeObj finds an empty IP object from index 192 downwards.
+func (h *Hub) fwFreeObj(o *bindOps, used map[int]bool) (int, error) {
+	for i := fwObjTop; i >= fwObjLow; i-- {
+		if used[i] {
+			continue
+		}
+		cur, err := o.fwObj(i)
+		if err != nil {
+			return 0, err
+		}
+		if fwFreeForUs(cur) {
+			return i, nil
+		}
+	}
+	return 0, fmt.Errorf("router không còn đối tượng IP trống (DrayPulse tìm từ số %d xuống %d)", fwObjTop, fwObjLow)
+}
+
+// fwVerify reads the rule and groups back.
+func (h *Hub) fwVerify(o *bindOps, lay fwLayout, set, slot int, keys []string) error {
+	var idx []int
+	for _, k := range keys {
+		idx = append(idx, lay.Objects[k])
+	}
+	sort.Ints(idx)
+	for gi, g := range fwGroups {
+		cur, err := o.fwGrp(g)
+		if err != nil {
+			return err
+		}
+		if cur.Name != "" && cur.Name != fmt.Sprintf("DrayPulse%d", gi+1) && gi*fwPerGroup >= len(idx) {
+			continue // the admin's group, not needed by DrayPulse
+		}
+		for k := 0; k < fwPerGroup; k++ {
+			want := 0
+			if gi*fwPerGroup+k < len(idx) {
+				want = idx[gi*fwPerGroup+k]
+			}
+			if cur.Members[k] != want {
+				return fmt.Errorf("router không lưu đúng nhóm IP %d (vị trí %d: %d, cần %d)", g, k, cur.Members[k], want)
+			}
+		}
+	}
+	if slot == 0 {
+		return nil
+	}
+	r, err := o.fwRule(set, slot)
+	if err != nil {
+		return err
+	}
+	switch {
+	case !r.ours():
+		return fmt.Errorf("luật %d-%d không còn là luật của DrayPulse", set, slot)
+	case len(keys) > 0 && (!r.On || !r.Block || !strings.Contains(r.Source, "Group32")):
+		return fmt.Errorf("router không lưu đúng luật chặn %d-%d (đọc lại: %v, nguồn %s)", set, slot, r.On, r.Source)
+	case len(keys) == 0 && r.On:
+		return fmt.Errorf("router chưa tắt luật chặn %d-%d", set, slot)
+	}
+	return nil
+}
+
+// fwWantList: what DrayPulse blocks on a router (devices by MAC, IP-only
+// blocks), protected entries excluded.
+func (h *Hub) fwWantList(routerID int64, sf blockSafety) ([]string, error) {
+	devs, err := h.st.ListDevices(routerID)
+	if err != nil {
+		return nil, err
+	}
+	blocks, err := h.st.ListBlocks(routerID)
+	if err != nil {
+		return nil, err
+	}
+	var want []string
+	for _, d := range devs {
+		if !sf.macs[d.MAC] {
+			want = append(want, fwKeyMAC(d.MAC))
+		}
+	}
+	for _, b := range blocks {
+		if b.MAC == "" && !sf.ips[b.IP] && net.ParseIP(b.IP) != nil {
+			want = append(want, fwKeyIP(b.IP))
+		}
+	}
+	return want, nil
+}
+
+var errFwNoRouter = errors.New("router không có trong DrayPulse")
+
+// fwCheckResult is a read-only comparison with the router.
+type fwCheckResult struct {
+	FilterOn, RuleOn bool
+	Rule             string
+	Missing, Extra   []string
+	Others           int // the admin's enabled rules in the same set
+}
+
+func (h *Hub) fwCheck(o *bindOps, routerID int64, want []string) (fwCheckResult, error) {
+	var res fwCheckResult
+	lay := h.fwLoad(routerID)
+	dfOn, start, err := o.fwDataFilter()
+	if err != nil {
+		return res, err
+	}
+	res.FilterOn = dfOn
+	set := start
+	if !dfOn && lay.Set > 0 {
+		set = lay.Set
+	}
+	n := lay.Rules
+	if n == 0 {
+		n = 7
+	}
+	for r := 1; r <= n; r++ {
+		x, err := o.fwRule(set, r)
+		if err != nil {
+			return res, err
+		}
+		switch {
+		case x.ours():
+			res.RuleOn = x.On && x.Block && strings.Contains(x.Source, "Group32")
+			res.Rule = fmt.Sprintf("%d-%d", set, r)
+		case x.On:
+			res.Others++
+		}
+	}
+	wanted := map[string]bool{}
+	for _, k := range want {
+		wanted[k] = true
+		i, ok := lay.Objects[k]
+		if !ok {
+			res.Missing = append(res.Missing, k)
+			continue
+		}
+		cur, err := o.fwObj(i)
+		if err != nil {
+			return res, err
+		}
+		if !fwObjIs(cur, k) {
+			res.Missing = append(res.Missing, k)
+		}
+	}
+	for k := range lay.Objects {
+		if !wanted[k] {
+			res.Extra = append(res.Extra, k)
+		}
+	}
+	return res, nil
+}

@@ -153,40 +153,46 @@ DrayOS không có bộ đếm lưu lượng riêng cho từng VLAN qua SNMP; xem
 
 ### Chặn client
 
-Chặn một thiết bị khỏi mạng ngay từ DrayPulse, **không cần chuẩn bị gì trên router**:
+Chặn một thiết bị **ra Internet** ngay từ DrayPulse:
 
 1. **Router → Sửa** → tick **Cho phép DrayPulse chặn IP client** (cần Telnet/SSH) → Lưu.
 2. Tab **Client** (hoặc danh sách client của một VLAN) → nút **Chặn** ở dòng thiết bị. Hoặc **+ Chặn MAC/IP** để nhập MAC/IP bất kỳ.
 
-**Chặn theo thiết bị (MAC) – mặc định, khuyên dùng:**
+**Cách hoạt động (từ 0.7.0):** DrayPulse dùng **Firewall** của router, đúng cách DrayTek hướng dẫn để chặn một thiết bị bất kể IP:
 
-- DrayPulse chặn mọi IP mà MAC đó đang dùng, rồi **kiểm tra bảng DHCP và ARP của router mỗi 15 giây** (kể cả khi chu kỳ đọc router dài hơn): router cấp IP mới nào cho thiết bị thì IP đó bị chặn ngay (ghi sự kiện "nhận IP mới … – đã chặn").
-- **Thiết bị bị chặn thường được cấp IP khác.** Theo tài liệu DrayTek, Bind IP to MAC thực chất là *đặt trước IP trong DHCP*: IP bị gắn với MAC giả nên router cấp cho thiết bị một IP khác. DrayPulse chặn IP mới và **nhả IP cũ** (kèm xoá dòng ARP của IP đó trên router bằng `ip arp del <IP> LAN`), nên mỗi thiết bị chỉ giữ một mục chặn. Giữa hai lần đổi IP thiết bị có thể vào mạng vài giây.
-- Khi một IP từng bị chặn được thiết bị **khác** dùng lại – chỉ cần **một** nguồn (ARP, bảng DHCP hoặc syslog) thấy MAC khác chưa bị chặn trên IP đó – DrayPulse **nhả IP ngay** và không chặn lại IP đó chừng nào máy kia còn xuất hiện, để không chặn nhầm máy vô tội.
-- Nếu router gửi syslog về DrayPulse (Bước D3) và dòng log có thông tin cấp IP DHCP, DrayPulse kiểm tra lại ngay (sau ~3 giây) thay vì chờ 15 giây. Dòng log chỉ được dùng để **nhả** IP (khi nó nêu đúng một IP LAN và một MAC), không bao giờ để chặn thêm.
-- Chặn được cả thiết bị **chưa có mặt**: nhập MAC, khi nó xuất hiện sẽ bị chặn ngay.
+- mỗi thiết bị bị chặn là một **đối tượng IP kiểu MAC** (Objects Setting → IP Object, tên `DP-<MAC>`; chặn chỉ IP thì kiểu Single, tên `DPI<IP>`), lấy từ **số 192 trở xuống**, bỏ qua đối tượng bạn đã dùng;
+- các đối tượng đó nằm trong **nhóm IP 32 và 31** (`DrayPulse1`, `DrayPulse2`, 12 đối tượng mỗi nhóm) → **tối đa 24 thiết bị/IP mỗi router**;
+- một luật **Data Filter** ghi chú `DrayPulse` ở bộ lọc đang dùng (Start Filter Set), lấy luật **trống** đầu tiên: hướng LAN → WAN, nguồn là hai nhóm trên, **Block Immediately**. Nếu phía trên có luật **Pass Immediately** đang bật, DrayPulse chuyển luật của nó lên trên (lệnh `-U 0`), để luật cho qua của bạn không làm thiết bị bị chặn lọt ra Internet.
+
+Thiết bị bị chặn **vẫn nhận IP và vẫn dùng được mạng nội bộ** (máy in, chia sẻ file), chỉ không ra Internet. Router chặn theo MAC nên **không cần đuổi theo IP** như các bản 0.4–0.6 (cách Bind IP to MAC cũ chỉ là đặt trước IP trong DHCP: thiết bị bị chặn được cấp IP khác ngay, và router chỉ giữ một mục cho mỗi MAC – nguyên nhân các mục chặn "tự biến mất").
+
+**An toàn khi thay đổi router:**
+
+- Thứ tự luôn là: đối tượng → nhóm → bật luật; khi gỡ: tắt luật (nếu không còn ai) → gỡ khỏi nhóm → xoá đối tượng. Không bao giờ để luật đang bật trỏ vào một nhóm trống. Mỗi bước được đọc lại; router không lưu thì DrayPulse báo lỗi và không ghi nhận chặn.
+- DrayPulse **không sửa luật, nhóm hay đối tượng do bạn tạo** (nhận ra của mình qua tên/ghi chú). Nếu nhóm 32 đang được bạn dùng, DrayPulse từ chối chặn; nhóm 31 chỉ cần từ thiết bị thứ 13.
+- **Data Filter đang TẮT:** nếu bộ lọc không có luật nào của bạn đang bật, DrayPulse tự bật Data Filter (và tự tắt lại khi bỏ chặn hết). Nếu có luật của bạn đang bật, DrayPulse **từ chối** và nêu tên luật – vì bật Data Filter sẽ áp dụng cả các luật đó. Hãy kiểm tra chúng rồi tự bật ở **Firewall → General Setup**, sau đó chặn lại.
+- DrayPulse **không lưu vào bộ nhớ flash** của router. Nếu router khởi động lại trước khi cấu hình được lưu, **mỗi 5 phút DrayPulse đối chiếu** và tạo lại đối tượng/nhóm/luật còn thiếu, bật lại luật nếu ai đó tắt nó; kết quả hiện ở khung "Client bị chặn" và trong Sự kiện. Khi đã khớp, lần đối chiếu không ghi gì lên router.
+- Không chặn được: IP của router, gateway, máy chạy DrayPulse, IP ngoài mạng LAN, và mọi MAC/IP trong danh sách **Không bao giờ chặn**.
+- Lệnh dùng (danh sách cố định, chỉ số và giá trị bị giới hạn): `ipf set -v`, `ipf set -d <bộ lọc|0>`, `ipf rule ?`, `ipf rule <s> <r> -v / -e 0 / -U 0 / -s "g 2 31|0"` và lệnh tạo luật DrayPulse, `object ip obj <100–192> -v / -n / -i / -a`, `object ip grp <31|32> -v / -n / -i / -a`.
+
+**Chặn theo thiết bị (MAC) – mặc định, khuyên dùng.** Chặn được cả thiết bị **chưa có mặt**: nhập MAC là đủ.
+
 - Tuỳ chọn **"Báo cho tôi khi thiết bị đổi MAC nhưng vẫn mang tên máy"**: điện thoại bật "địa chỉ Wi-Fi riêng tư" thường vẫn gửi cùng tên máy (HOST ID) khi xin DHCP. Khi **đúng một** MAC mới (chưa bị chặn) mang tên đó xuất hiện, DrayPulse **không tự chặn** mà ghi **gợi ý chặn** và gửi cảnh báo Telegram/Zalo. Ở tab **Client → Client bị chặn → Gợi ý chặn**, bấm **Chặn** để xác nhận hoặc **Bỏ qua** (MAC đã bỏ qua sẽ không bị gợi ý lại). Nếu nhiều máy cùng mang tên đó một lúc thì không gợi ý gì.
 - **Tên máy phổ biến không bao giờ được dùng để nhận diện** (iPhone, iPad, android-\*, Galaxy-\*, Redmi-\*, OPPO-\*, vivo-\*, realme-\*… và tên dưới 3 ký tự). Chặn thiết bị có tên như vậy chỉ chặn theo MAC; sự kiện ghi rõ "không theo dõi tên máy … vì tên này phổ biến". Danh sách sửa ở **Cài đặt → Chặn client an toàn**.
 
-> **Bài học từ v0.5.0:** trước đây tuỳ chọn theo tên máy tự chặn mọi MAC mới cùng tên. Một lần chặn máy tên "Redmi-12"/"iPhone" đã lan ra hàng trăm điện thoại vô tội. Từ bản này, theo tên máy chỉ còn là gợi ý cần người duyệt.
+> **Bài học từ v0.5.0:** trước đây tuỳ chọn theo tên máy tự chặn mọi MAC mới cùng tên. Một lần chặn máy tên "Redmi-12"/"iPhone" đã lan ra hàng trăm điện thoại vô tội. Từ bản đó, theo tên máy chỉ còn là gợi ý cần người duyệt.
+
+**Chỉ chặn IP:** tick "Chỉ chặn IP này" – dùng cho thiết bị đặt IP tĩnh mà bạn không biết MAC. Lưu ý: thiết bị đổi IP là thoát chặn.
 
 **An toàn khi chặn (Cài đặt → Chặn client an toàn):**
 
-- **Không bao giờ chặn**: danh sách MAC và/hoặc IP (máy chủ, camera, máy quản trị, AP…). Chặn tay sẽ bị từ chối; DrayPulse không bao giờ tự chặn chúng, và nếu một mục đang bị chặn được thêm vào danh sách thì IP đó được **nhả** ở lần kiểm tra kế tiếp.
-- **Tối đa số IP mới tự chặn cho một thiết bị trong 1 giờ** (mặc định 10): mỗi lần thiết bị bị chặn nhận IP mới và bị chặn tiếp là một lượt của **riêng thiết bị đó**. Vượt giới hạn thì DrayPulse tạm không đuổi theo thiết bị đó (tự chạy lại sau 1 giờ), ghi một cảnh báo; các thiết bị khác vẫn được theo dõi, việc nhả IP vẫn tiếp tục. Chặn tay không bị giới hạn. (Từ 0.6.4 không còn tạm dừng cả router như các bản 0.6.0–0.6.3.)
+- **Không bao giờ chặn**: danh sách MAC và/hoặc IP (máy chủ, camera, máy quản trị, AP…). Chặn sẽ bị từ chối; nếu một mục đang bị chặn được thêm vào danh sách thì nó được gỡ khỏi luật chặn ở lần đối chiếu kế tiếp.
 - **Tên máy phổ biến**: các mẫu tên (dùng `*` và `?`, không phân biệt hoa thường) không dùng để gợi ý chặn thiết bị đổi MAC.
 
-**Bỏ chặn tất cả:** tab **Client → Client bị chặn → Bỏ chặn tất cả** (chỉ quản trị viên, có hộp thoại xác nhận). DrayPulse xoá **mọi mục DrayPulse** trong bảng Bind IP to MAC của router (kể cả mục sót lại không có trong danh sách), quên toàn bộ thiết bị/IP bị chặn và gợi ý chặn. Mục do bạn tạo được giữ nguyên; chức năng Bind IP to MAC chỉ được **tắt** nếu chính DrayPulse đã bật nó và bảng đã trống. Dùng khi chặn nhầm hàng loạt – không cần xoá tay từng mục trên router.
+**Bỏ chặn tất cả:** tab **Client → Client bị chặn → Bỏ chặn tất cả** (chỉ quản trị viên, có hộp thoại xác nhận). DrayPulse tắt luật `DrayPulse`, làm trống nhóm 32/31 và các đối tượng `DP-…`, xoá cả **mục chặn cũ của DrayPulse trong LAN → Bind IP to MAC** (bản 0.4–0.6), rồi quên toàn bộ thiết bị/IP bị chặn và gợi ý chặn. Luật/nhóm/đối tượng/mục do bạn tạo được giữ nguyên; Data Filter chỉ được **tắt** nếu chính DrayPulse đã bật nó và bộ lọc không còn luật nào khác đang bật.
 
-**Chỉ chặn IP:** tick "Chỉ chặn IP này" – dùng cho thiết bị đặt IP tĩnh mà bạn không biết MAC.
+**Nâng cấp từ 0.6.x:** sau khi cài 0.7.0, ở lần đối chiếu đầu tiên (≤ 5 phút) các thiết bị/IP đang bị chặn được đưa vào luật Firewall, rồi DrayPulse xoá các mục Bind IP to MAC cũ của chính nó (ghi chú `DrayPulse`) và ghi sự kiện "Đã chuyển sang chặn bằng Firewall". Mục do bạn tạo trong Bind IP to MAC được giữ nguyên.
 
-**Cách hoạt động:** DrayPulse dùng chức năng **LAN → Bind IP to MAC** của router. Mỗi IP bị chặn được gắn với một MAC không tồn tại (`02:dd:00:00:00:01`, ghi chú `DrayPulse`), nên router từ chối mọi gói tin từ IP đó: thiết bị không ra được Internet và không sang được mạng/VLAN khác. Các lệnh dùng: `ip bindmac show / on / off / add / del` – không lệnh nào khác.
-
-- Chế độ thường (không strict): các IP không có trong bảng vẫn dùng bình thường. Khi không còn ai bị chặn, nếu chính DrayPulse đã bật chức năng thì sẽ tắt lại.
-- DrayPulse **không sửa hay xoá mục do bạn tạo**. Nếu chức năng đang tắt mà bảng đã có mục của bạn, DrayPulse từ chối bật và báo rõ IP nào.
-- Không chặn được: IP của router, gateway, máy chạy DrayPulse, IP ngoài mạng LAN.
-- Mỗi thay đổi được đọc lại; nếu router không lưu, DrayPulse hoàn tác. Nút **Đối chiếu với router** so danh sách với bảng trên router.
-- **Tự đối chiếu mỗi 5 phút:** Vigor 3912S từng tự xoá mục chặn mà không ai xoá. DrayPulse đọc lại bảng chặn và ARP của router: mục bị mất được **thêm lại** nếu thiết bị vẫn dùng IP đó (hoặc là mục chặn IP tay), **nhả** nếu thiết bị đã rời IP đó; mục DrayPulse lạ và dòng ARP còn trỏ về MAC chặn được xoá. Kết quả hiện ở khung "Client bị chặn" và trong Sự kiện.
 - Tắt **Cho phép DrayPulse chặn IP client** không xoá các mục đang chặn trên router: khung "Client bị chặn" vẫn hiện để bạn **Bỏ chặn** hoặc **Bỏ chặn tất cả**.
 - DrayPulse từ chối chặn IP của chính máy bạn đang dùng để mở trang DrayPulse.
 
@@ -404,10 +410,11 @@ Nếu tài khoản bị lỗi (hết credit, key sai, quá tải) và bạn bậ
 | Tab Client / DHCP trống | Chưa bật Telnet/SSH | Bật CLI ở bước D2 rồi sửa router trong DrayPulse |
 | WAN Internet báo “Lỗi kiểm tra” | Router không chạy được `ip ping` qua WAN đó | Kiểm tra tên WAN (WAN1…), WAN đang bật |
 | Tab VLAN trống | Chưa bật Telnet/SSH, hoặc firmware không có lệnh `vlan status` | Bật CLI; DrayOS 5 chưa được hỗ trợ |
-| Chặn báo "Bind IP to MAC đang TẮT nhưng bảng có … mục do bạn tạo" | Bảng có mục cũ của bạn, bật lên sẽ áp dụng chúng | Kiểm tra/xoá các mục đó ở LAN → Bind IP to MAC rồi chặn lại |
-| Chặn báo "router không lưu mục chặn" | Router từ chối lệnh `ip bindmac add` (firmware khác cú pháp); DrayPulse đã hoàn tác | Báo lại kèm model/firmware |
-| Cảnh báo "Thiết bị bị chặn … đã đổi IP … lần trong 1 giờ" | Router liên tục cấp IP mới cho thiết bị bị chặn (Bind IP to MAC là đặt trước IP trong DHCP) | DrayPulse tự đuổi theo lại sau 1 giờ. Tăng giới hạn ở Cài đặt → Chặn client an toàn nếu cần |
-| Sự kiện "Đối chiếu với router: … mục chặn đã mất khỏi router" | Router (đã thấy trên Vigor 3912S) tự xoá mục Bind IP to MAC | DrayPulse đã tự thêm lại/nhả; nếu lặp lại thường xuyên, kiểm tra ai/cái gì đang sửa cấu hình router (Web UI, VigorACS, Config Sync) |
+| Chặn báo "Firewall → Data Filter của router đang TẮT…" | Data Filter tắt và bộ lọc có luật của bạn đang bật; bật lên sẽ áp dụng các luật đó | Kiểm tra các luật được nêu, bật Data Filter ở Firewall → General Setup rồi chặn lại |
+| Chặn báo "router không lưu đối tượng IP …" / "…nhóm IP …" | Firmware khác cú pháp lệnh `object ip` | Báo lại kèm model/firmware và output của “Thử lệnh xem trên router” |
+| Chặn báo "nhóm IP 32/31 của router đang được dùng" | Bạn đã dùng nhóm IP số 32 (hoặc 31 khi chặn từ 13 thiết bị) | Chuyển nhóm của bạn sang số khác, hoặc đổi tên thành trống nếu không dùng |
+| Chặn báo "bộ luật lọc số … không còn chỗ trống" | Mọi luật của bộ lọc đang dùng đều đã có nội dung | Xoá một luật không dùng (để trống hoàn toàn) trong Firewall → Filter Setup |
+| Sự kiện "Đối chiếu với router: đã tạo lại cấu hình chặn …" | Router khởi động lại trước khi lưu cấu hình (DrayPulse không lưu flash), hoặc ai đó sửa/xoá đối tượng, nhóm, luật của DrayPulse | DrayPulse đã tự sửa; nếu lặp lại thường xuyên, kiểm tra ai/cái gì đang sửa cấu hình router (Web UI, VigorACS, Config Sync) |
 | WAN hoặc thiết bị hiện "Lỗi kiểm tra" | Lệnh ping qua router không chạy được nhiều lần liên tiếp (router bận phiên Telnet/SSH, lỗi kết nối) | Không phải mất kết nối. Xem lý do ở dòng trạng thái; từ 0.6.4 DrayPulse không còn đọc lệch kết quả lệnh sau khi đăng nhập SSH |
 | Chặn báo "nằm trong danh sách Không bao giờ chặn" | MAC/IP (hoặc MAC đang dùng IP đó) thuộc danh sách bảo vệ | Bỏ khỏi danh sách ở Cài đặt → Chặn client an toàn nếu thật sự cần chặn |
 | Bấm “Chặn” hiện “Đang xử lý…” rất lâu rồi báo lỗi hết thời gian | Phiên Telnet/SSH của router bận liên tục, thường vì nhiều thiết bị được ping **Từ router** | Nâng cấp lên 0.6.3 (lệnh chặn được ưu tiên) và chuyển **Ping thiết bị LAN = Từ máy DrayPulse** nếu máy DrayPulse ping được các thiết bị đó |

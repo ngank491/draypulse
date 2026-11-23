@@ -1253,7 +1253,7 @@ func (h *Hub) view(rs *RState, detail bool) RouterView {
 		// with blocking switched off, leftovers are still shown so they can be removed
 		if c.Opts.Block.Enabled || len(devices)+len(blocks) > 0 {
 			v.Blocking = &BlockInfo{Devices: devices, IPs: blocks, Suggestions: suggestions, Enabled: c.Opts.Block.Enabled,
-				Drift: rs.drift, AutoPaused: c.Opts.Block.AutoPaused, AutoPausedAt: c.Opts.Block.AutoPausedAt}
+				Drift: rs.drift, Max: fwMax, AutoPaused: c.Opts.Block.AutoPaused, AutoPausedAt: c.Opts.Block.AutoPausedAt}
 		}
 		v.Ifaces = append([]Iface{}, rs.Ifaces...)
 		v.Sections, v.SectionAt = map[string][]Row{}, map[string]int64{}
