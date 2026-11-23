@@ -167,8 +167,9 @@ func asDraytek(s Source) *draytekSource {
 // for the whole transaction (see bindSession), so its commands are not queued
 // behind the poller's reads and pings one by one.
 type bindOps struct {
-	cli *cliClient
-	ctx context.Context
+	cli   *cliClient
+	ctx   context.Context
+	trace func(cmd, out string, err error) // diagnostics: every firewall command
 }
 
 func (o *bindOps) run(cmd string) (string, error) {

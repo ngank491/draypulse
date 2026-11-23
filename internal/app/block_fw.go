@@ -220,6 +220,9 @@ func (o *bindOps) fw(cmd string) (string, error) {
 		return "", fmt.Errorf("lệnh CLI không được phép: %q", cmd)
 	}
 	out, err := o.cli.runHeld(o.ctx, []string{cmd})
+	if o.trace != nil {
+		o.trace(cmd, out[cmd], err)
+	}
 	if err != nil {
 		return "", err
 	}
