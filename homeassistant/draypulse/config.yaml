@@ -1,5 +1,5 @@
 name: DrayPulse
-version: "0.6.3"
+version: "0.6.4"
 slug: draypulse
 description: Giám sát router DrayTek Vigor gọn nhẹ – SNMP/Telnet/SSH/Syslog, WAN, VPN, thiết bị, cảnh báo Telegram/Zalo, kiểm tra bảo mật bằng AI
 url: https://github.com/ngank491/draypulse
