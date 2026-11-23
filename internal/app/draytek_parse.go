@@ -238,9 +238,18 @@ func parseDHCP(s string) []Row {
 var (
 	rePingSum   = regexp.MustCompile(`Sent\s*=\s*(\d+),\s*Received\s*=\s*(\d+)`)
 	rePingReply = regexp.MustCompile(`(?i)reply from [^,]+,\s*time[=<]\s*(\d+(?:\.\d+)?)\s*ms`)
+	// Linux-style output of DrayOS 4.4.3 on Vigor2926 plus:
+	//   64 bytes from 8.8.8.8: seq=1 time=34.95ms
+	//   5 packets transmitted, 5 received, 0% packet loss, time 4950ms
+	rePingSumLx   = regexp.MustCompile(`(\d+)\s+packets transmitted,\s*(\d+)\s+(?:packets\s+)?received`)
+	rePingReplyLx = regexp.MustCompile(`(?i)(\d+)\s+bytes from [^:]+:.*?time[=<]\s*(\d+(?:\.\d+)?)\s*ms`)
 )
 
 // parseRouterPing reads "ip ping": replies with times plus a summary line.
+// Two firmware formats exist (Windows-like "Reply from …" and Linux-like
+// "64 bytes from …"). The Linux-like one also prints odd short echoes
+// ("32 bytes … seq=256 time=0.09ms"): only replies of the size of the first
+// one count for the round-trip time.
 func parseRouterPing(s string) (PingResult, bool) {
 	res := PingResult{RTT: -1}
 	var sum float64
@@ -250,7 +259,26 @@ func parseRouterPing(s string) (PingResult, bool) {
 		sum += v
 		n++
 	}
-	if m := rePingSum.FindStringSubmatch(s); m != nil {
+	size := ""
+	for _, m := range rePingReplyLx.FindAllStringSubmatch(s, -1) {
+		if size == "" {
+			size = m[1]
+		}
+		if m[1] != size {
+			continue
+		}
+		v, _ := strconv.ParseFloat(m[2], 64)
+		sum += v
+		n++
+	}
+	if m := rePingSumLx.FindStringSubmatch(s); m != nil {
+		res.Sent, _ = strconv.Atoi(m[1])
+		res.Received, _ = strconv.Atoi(m[2])
+		res.Received = min(res.Received, n) // odd echoes are not answers
+		if n == 0 {
+			res.Received = 0
+		}
+	} else if m := rePingSum.FindStringSubmatch(s); m != nil {
 		res.Sent, _ = strconv.Atoi(m[1])
 		res.Received, _ = strconv.Atoi(m[2])
 	} else if n > 0 {

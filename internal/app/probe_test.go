@@ -2,6 +2,23 @@ package app
 
 import "testing"
 
+// Vigor2926 plus (DrayOS 4.4.3_Vietfpt) prints Linux-style ping output; it
+// was read as "1 sent, 0 received", so WAN1 showed "Mất Internet" for days.
+func TestParseRouterPingLinuxStyle(t *testing.T) {
+	out := "\nPinging 8.8.8.8 with 64 bytes of Data through WAN1:\n\n" +
+		"64 bytes from 8.8.8.8: seq=1 time=34.95ms\n64 bytes from 8.8.8.8: seq=2 time=34.77ms\n64 bytes from 8.8.8.8: seq=3 time=34.64ms\n" +
+		"32 bytes from 8.8.8.8: seq=256 time=0.09ms\n32 bytes from 8.8.8.8: seq=256 time=0.08ms\n\n" +
+		"5 packets transmitted, 5 received, 0% packet loss, time 4950ms\nrtt min/avg/max/mdev = 0.88/20.910/34.950/17.0 ms"
+	p, ok := parseRouterPing(out)
+	if !ok || p.Sent != 5 || p.Received != 3 || p.RTT < 34 || p.RTT > 35.5 {
+		t.Fatalf("%+v %v", p, ok)
+	}
+	lost := "\nPinging 8.8.8.8 with 64 bytes of Data through WAN1:\n\nRequest timed out.\nRequest timed out.\n\n5 packets transmitted, 0 received, 100% packet loss, time 5000ms"
+	if p, ok := parseRouterPing(lost); !ok || p.Sent != 5 || p.Received != 0 || p.RTT != -1 {
+		t.Fatalf("lost: %+v %v", p, ok)
+	}
+}
+
 // A WAN ping through the router that keeps failing to run (CLI busy, empty
 // answer) must not leave the line "down" for days: after three such checks
 // the state is "error", and a later success reports the recovery if the
