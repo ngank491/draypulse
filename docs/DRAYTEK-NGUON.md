@@ -48,6 +48,7 @@ Không có trên các walk đã xem (2920/2927/2962): `ifXTable` (bộ đếm 64
 | `ipf rule <s> <r> -v` | đọc luật (trạng thái, ghi chú, nguồn, Pass/Block) |
 | `ipf rule <s> <r> -e 1 -D 0 -s "g 1 32" -F "1 0" -m "0 0" -M "DrayPulse"` | tạo/bật luật chặn: LAN → WAN, nguồn nhóm 32, Block Immediately, MAC Bind non-strict |
 | `ipf rule <s> <r> -s "g 2 31"` / `"g 2 0"` | thêm/bỏ nhóm 31 làm nguồn thứ hai |
+| `ipf rule <s> <r> -e 1 -D 0 -s "g 1 30" -F "1 0" -m "0 0" -M "DrayPulse2"` / `-s "g 2 29"` | luật chặn thứ hai (từ thiết bị thứ 25): nguồn nhóm 30 (+29). `-s` chỉ có 2 ô nhóm IP (`g 1`, `g 2`, “hava 2 field”), nên một luật tối đa 24 đối tượng |
 | `ipf rule <s> <r> -e 0` / `-U 0` | tắt luật / chuyển luật lên một bậc |
 | `object ip obj <100–192> -v / -n DP-… / -i 1 / -a 4 <mac> / -a 1 <ip> / -a 0 0.0.0.0 0.0.0.0` | đối tượng IP của DrayPulse |
 | `object ip grp <31|32> -v / -n DrayPulse1|2 / -i 1 / -a "<12 số>"` | nhóm IP của DrayPulse |

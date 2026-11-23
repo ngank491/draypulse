@@ -260,46 +260,106 @@ func TestFwDataFilterOff(t *testing.T) {
 	})
 }
 
-func TestFwLimit24(t *testing.T) {
+func TestFwLimit48(t *testing.T) {
 	h, r, _, fw, _ := fwHarness(t)
-	ctx := testCtx(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute) // ~100 changes, each reading every object back
+	defer cancel()
+	fw.SetRule(1, 1, true, "allow-boss", false) // a "Pass Immediately" rule both must go above
 	ip := func(i int) string { return fmt.Sprintf("192.168.1.%d", 100+i) }
-	for i := range 24 {
-		if _, err := h.BlockClient(ctx, r.ID, ip(i), "", "", "", "admin"); err != nil {
-			t.Fatalf("%d: %v", i, err)
+	block := func(from, to int) {
+		t.Helper()
+		for i := from; i < to; i++ {
+			if _, err := h.BlockClient(ctx, r.ID, ip(i), "", "", "", "admin"); err != nil {
+				t.Fatalf("%d: %v", i, err)
+			}
 		}
 	}
-	if g := fw.Grp(31); g[11] == 0 || fw.Grp(32)[11] == 0 {
-		t.Fatalf("both groups full: %v %v", fw.Grp(32), fw.Grp(31))
-	}
-	if x := fw.Rule(1, 1); x.g1 != 32 || x.g2 != 31 {
-		t.Fatalf("rule must use both groups: %+v", x)
-	}
-	_, err := h.BlockClient(ctx, r.ID, ip(24), "", "", "", "admin")
-	if err == nil || !strings.Contains(err.Error(), "tối đa 24") {
-		t.Fatalf("25th: %v", err)
-	}
-	// back to 12: group 31 leaves the rule before it is emptied
-	for i := range 12 {
-		if err := h.UnblockClient(ctx, r.ID, ip(i), "admin"); err != nil {
-			t.Fatal(err)
+	unblock := func(from, to int) {
+		t.Helper()
+		for i := from; i < to; i++ {
+			if err := h.UnblockClient(ctx, r.ID, ip(i), "admin"); err != nil {
+				t.Fatalf("%d: %v", i, err)
+			}
 		}
 	}
-	if x := fw.Rule(1, 1); !x.on || x.g2 != 0 || fw.Grp(31) != [12]int{} {
-		t.Fatalf("rule %+v group 31 %v", x, fw.Grp(31))
+	// index of the first write equal to cmd after position from
+	at := func(w []string, from int, cmd string) int {
+		for i := from; i < len(w); i++ {
+			if w[i] == cmd {
+				return i
+			}
+		}
+		return -1
 	}
+	block(0, 24)
+	if x := fw.Rule(1, 1); x.comment != "DrayPulse" || x.g1 != 32 || x.g2 != 31 || !x.on {
+		t.Fatalf("rule 1 must use groups 32+31: %+v", x)
+	}
+	if fw.Grp(30) != [12]int{} || fw.Rule(1, 3).comment != "" {
+		t.Fatal("the second rule is not needed for 24")
+	}
+	block(24, 25)
+	if x := fw.Rule(1, 2); x.comment != "DrayPulse2" || x.g1 != 30 || x.g2 != 0 || !x.on || !x.block {
+		t.Fatalf("25th: second rule %+v", x)
+	}
+	if fw.Rule(1, 3).comment != "allow-boss" || fw.Rule(1, 1).comment != "DrayPulse" {
+		t.Fatalf("both DrayPulse rules above the pass rule: %+v %+v %+v", fw.Rule(1, 1), fw.Rule(1, 2), fw.Rule(1, 3))
+	}
+	block(25, 48)
+	for _, g := range []int{32, 31, 30, 29} {
+		if fw.Grp(g)[11] == 0 {
+			t.Fatalf("group %d must be full: %v", g, fw.Grp(g))
+		}
+	}
+	if x := fw.Rule(1, 2); x.g1 != 30 || x.g2 != 29 {
+		t.Fatalf("rule 2 must use groups 30+29: %+v", x)
+	}
+	n := len(fw.Writes())
+	_, err := h.BlockClient(ctx, r.ID, ip(48), "", "", "", "admin")
+	if err == nil || !strings.Contains(err.Error(), "tối đa 48") || len(fw.Writes()) != n {
+		t.Fatalf("49th: %v", err)
+	}
+	// back to 36: group 29 leaves rule 2 before it is emptied
+	n = len(fw.Writes())
+	unblock(0, 12)
 	w := fw.Writes()
-	src, grp := -1, -1
-	for i, c := range w {
-		if c == `ipf rule 1 1 -s "g 2 0"` && src < 0 {
-			src = i
-		}
-		if c == `object ip grp 31 -a "0 0 0 0 0 0 0 0 0 0 0 0"` {
-			grp = i
-		}
+	if src, grp := at(w, n, `ipf rule 1 2 -s "g 2 0"`), at(w, n, `object ip grp 29 -a "0 0 0 0 0 0 0 0 0 0 0 0"`); src < 0 || grp < src {
+		t.Fatalf("group 29 must leave the rule first (%d, %d)", src, grp)
 	}
-	if src < 0 || grp < src {
-		t.Fatalf("group 31 must leave the rule first (%d, %d)", src, grp)
+	// back to 24: rule 2 is switched off before group 30 is emptied
+	n = len(fw.Writes())
+	unblock(12, 24)
+	w = fw.Writes()
+	if off, grp := at(w, n, "ipf rule 1 2 -e 0"), at(w, n, `object ip grp 30 -a "0 0 0 0 0 0 0 0 0 0 0 0"`); off < 0 || grp < off {
+		t.Fatalf("rule 2 must be off before group 30 is emptied (%d, %d)", off, grp)
+	}
+	if x := fw.Rule(1, 2); x.on || x.comment != "DrayPulse2" || !fw.Rule(1, 1).on {
+		t.Fatalf("rule 2 off, rule 1 on: %+v %+v", fw.Rule(1, 1), x)
+	}
+	// the 25th again: the disabled rule 2 still names group 29 (empty); it is
+	// dropped before the rule is enabled
+	fw.handle(`ipf rule 1 2 -s "g 2 29"`)
+	n = len(fw.Writes())
+	block(0, 1)
+	w = fw.Writes()
+	if g2, on := at(w, n, `ipf rule 1 2 -s "g 2 0"`), at(w, n, `ipf rule 1 2 -e 1 -D 0 -s "g 1 30" -F "1 0" -m "0 0" -M "DrayPulse2"`); g2 < 0 || on < g2 {
+		t.Fatalf("an emptied group must leave the rule before it is enabled (%d, %d)", g2, on)
+	}
+	if x := fw.Rule(1, 2); !x.on || x.g1 != 30 || x.g2 != 0 {
+		t.Fatalf("rule 2 %+v", x)
+	}
+	// in sync: nothing written
+	n = len(fw.Writes())
+	h.reconcileBlocks(ctx, h.get(r.ID))
+	if len(fw.Writes()) != n {
+		t.Fatalf("in sync must write nothing: %v", fw.Writes()[n:])
+	}
+	// unblock-all switches both rules off
+	if _, err := h.UnblockAll(ctx, r.ID, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	if fw.Rule(1, 1).on || fw.Rule(1, 2).on || fw.Grp(32) != [12]int{} || fw.Grp(30) != [12]int{} || !fw.Rule(1, 3).on {
+		t.Fatalf("after unblock-all: %+v %+v %+v", fw.Rule(1, 1), fw.Rule(1, 2), fw.Rule(1, 3))
 	}
 }
 
@@ -423,6 +483,8 @@ func TestFwRouterIgnoresObject(t *testing.T) {
 func TestFwAllowlist(t *testing.T) {
 	for _, ok := range []string{"ipf set -v", "ipf set -d 0", "ipf set -d 1", "ipf rule ?", "ipf rule 1 2 -v", "ipf rule 1 2 -U 0", "ipf rule 1 2 -e 0",
 		`ipf rule 1 2 -e 1 -D 0 -s "g 1 32" -F "1 0" -m "0 0" -M "DrayPulse"`, `ipf rule 1 2 -s "g 2 31"`, `ipf rule 1 2 -s "g 2 0"`,
+		`ipf rule 1 3 -e 1 -D 0 -s "g 1 30" -F "1 0" -m "0 0" -M "DrayPulse2"`, `ipf rule 1 3 -s "g 2 29"`,
+		"object ip grp 30 -v", "object ip grp 29 -n DrayPulse4", `object ip grp 29 -a "150 0 0 0 0 0 0 0 0 0 0 0"`,
 		"object ip obj 7 -v", "object ip obj 192 -n DP-A4C69A000023", "object ip obj 150 -n DPI192168001021", `object ip obj 192 -n ""`,
 		"object ip obj 192 -i 1", "object ip obj 192 -a 4 a4:c6:9a:00:00:23", "object ip obj 192 -a 1 192.168.1.21", "object ip obj 192 -a 0 0.0.0.0 0.0.0.0",
 		"object ip grp 32 -v", "object ip grp 31 -n DrayPulse2", `object ip grp 32 -a "192 191 0 0 0 0 0 0 0 0 0 0"`} {
@@ -431,7 +493,9 @@ func TestFwAllowlist(t *testing.T) {
 		}
 	}
 	for _, bad := range []string{"object ip obj 50 -n DP-A4C69A000023", "object ip obj 199 -a 4 a4:c6:9a:00:00:23", "object ip obj 192 -n Printer",
-		"object ip obj 192 -a 0 192.168.1.0 255.255.255.0", "object ip grp 30 -v", `object ip grp 30 -a "1 0 0 0 0 0 0 0 0 0 0 0"`, "object ip grp 32 -n Office",
+		"object ip obj 192 -a 0 192.168.1.0 255.255.255.0", "object ip grp 28 -v", `object ip grp 28 -a "1 0 0 0 0 0 0 0 0 0 0 0"`, "object ip grp 32 -n Office",
+		"object ip grp 30 -n DrayPulse5", `ipf rule 1 2 -e 1 -D 0 -s "g 1 30" -F "1 0" -m "0 0" -M "DrayPulse"`, `ipf rule 1 2 -e 1 -D 0 -s "g 1 32" -F "1 0" -m "0 0" -M "DrayPulse2"`,
+		`ipf rule 1 2 -s "g 2 30"`, `ipf rule 1 2 -s "g 1 29"`,
 		`ipf rule 1 2 -e 1 -D 0 -s "g 1 32" -F "0 0" -m "0 0" -M "DrayPulse"`, `ipf rule 1 2 -e 1`, `ipf rule 1 2 -M "x"`, "ipf rule 1 2 -U 1",
 		"ipf set -d 1; sys reboot", "sys commit", "sys reboot", "ipf flowtrack"} {
 		if fwCommandAllowed(bad) {
@@ -674,7 +738,7 @@ func TestUnblockWhenBlockingDisabled(t *testing.T) {
 	rs.mu.Lock()
 	rs.cfg.Opts.Block.Enabled = false
 	rs.mu.Unlock()
-	if v := h.view(rs, true); v.Blocking == nil || v.Blocking.Enabled || len(v.Blocking.IPs) != 1 || len(v.Blocking.Devices) != 1 || v.Blocking.Max != 24 {
+	if v := h.view(rs, true); v.Blocking == nil || v.Blocking.Enabled || len(v.Blocking.IPs) != 1 || len(v.Blocking.Devices) != 1 || v.Blocking.Max != 48 {
 		t.Fatalf("leftovers must stay visible: %+v", v.Blocking)
 	}
 	if _, err := h.BlockClient(ctx, r.ID, "192.168.1.112", "", "", "", "admin"); err == nil {

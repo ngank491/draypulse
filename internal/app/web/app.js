@@ -768,7 +768,7 @@ function blockForm(routerId, c) {
   [mac, ipOnly].forEach(x => x.addEventListener('input', sync)); ipOnly.addEventListener('change', sync);
   modal('Chặn ' + (c.name || c.ip || c.mac || 'thiết bị'), h('div', { class: 'stack' },
     h('div', { class: 'form' }, field('MAC thiết bị', mac), field('IP hiện tại', ip)),
-    h('p', { class: 'hint' }, h('b', null, 'Chặn theo thiết bị (MAC): '), 'DrayPulse đưa MAC này vào luật chặn của Firewall router (Data Filter, luật ghi chú “DrayPulse”): thiết bị không ra Internet được dù router cấp IP nào, và DrayPulse không cần đuổi theo IP. Thiết bị vẫn nhận IP và vẫn dùng được mạng nội bộ. Tối đa 24 thiết bị/IP mỗi router.'),
+    h('p', { class: 'hint' }, h('b', null, 'Chặn theo thiết bị (MAC): '), 'DrayPulse đưa MAC này vào luật chặn của Firewall router (Data Filter, luật ghi chú “DrayPulse”): thiết bị không ra Internet được dù router cấp IP nào, và DrayPulse không cần đuổi theo IP. Thiết bị vẫn nhận IP và vẫn dùng được mạng nội bộ. Tối đa 48 thiết bị/IP mỗi router.'),
     hostRow,
     check('Chỉ chặn IP này (không theo dõi thiết bị)', ipOnly),
     field('Ghi chú', note),
@@ -799,7 +799,7 @@ function unblockAllForm(routerId, bl) {
   const nDev = (bl.devices || []).length, nIP = (bl.ips || []).length;
   const ok = h('input', { type: 'checkbox' });
   modal('Bỏ chặn tất cả', h('div', { class: 'stack' },
-    h('p', null, `DrayPulse sẽ tắt luật chặn “DrayPulse” trong Firewall của router, làm trống nhóm IP DrayPulse1/2 và các đối tượng IP “DP-…”, rồi quên ${nDev} thiết bị, ${nIP} IP đang bị chặn cùng các gợi ý chặn. Mục chặn cũ của DrayPulse trong LAN → Bind IP to MAC (bản 0.4–0.6) cũng được xoá.`),
+    h('p', null, `DrayPulse sẽ tắt các luật chặn “DrayPulse”, “DrayPulse2” trong Firewall của router, làm trống nhóm IP DrayPulse1–4 và các đối tượng IP “DP-…”, rồi quên ${nDev} thiết bị, ${nIP} IP đang bị chặn cùng các gợi ý chặn. Mục chặn cũ của DrayPulse trong LAN → Bind IP to MAC (bản 0.4–0.6) cũng được xoá.`),
     h('p', { class: 'hint' }, 'Luật, nhóm và đối tượng do bạn tạo được giữ nguyên. Data Filter chỉ được TẮT nếu chính DrayPulse đã bật nó và bộ lọc không còn luật nào khác đang bật.'),
     check('Tôi hiểu: mọi thiết bị đang bị DrayPulse chặn trên router này sẽ vào mạng lại được', ok)),
     [{ t: 'Huỷ', fn: x => x() }, { t: 'Bỏ chặn tất cả', cls: 'danger', submit: true, fn: async close => {
@@ -890,7 +890,7 @@ function tabClients(id) {
               h('td', null, me.role === 'admin' ? h('div', { class: 'row' },
                 h('button', { class: 'sm danger', onclick: e => suggestionAction(id, x, true, e.target) }, 'Chặn'),
                 h('button', { class: 'sm', onclick: e => suggestionAction(id, x, false, e.target) }, 'Bỏ qua')) : null))))))) : null,
-        h('p', { class: 'hint' }, `Đang chặn ${list.length}/${bl.max || 24}. Chặn bằng Firewall của router: một luật Data Filter ghi chú “DrayPulse” (LAN → WAN, Block Immediately) với nguồn là nhóm IP DrayPulse1/2 (nhóm 32, 31), mỗi thiết bị là một đối tượng IP kiểu MAC (“DP-…”, lấy từ số 192 trở xuống). Thiết bị bị chặn vẫn nhận IP và dùng được mạng nội bộ, chỉ không ra Internet. DrayPulse không lưu vào bộ nhớ router: mỗi 5 phút nó đối chiếu và tạo lại cấu hình chặn nếu router khởi động lại. Không bao giờ tự chặn theo tên máy.`));
+        h('p', { class: 'hint' }, `Đang chặn ${list.length}/${bl.max || 48}. Chặn bằng Firewall của router: luật Data Filter ghi chú “DrayPulse” (LAN → WAN, Block Immediately) với nguồn là nhóm IP DrayPulse1/2 (nhóm 32, 31); từ thiết bị thứ 25 thêm luật “DrayPulse2” với nhóm DrayPulse3/4 (30, 29), vì mỗi luật chỉ nhận 2 nhóm; mỗi thiết bị là một đối tượng IP kiểu MAC (“DP-…”, lấy từ số 192 trở xuống). Thiết bị bị chặn vẫn nhận IP và dùng được mạng nội bộ, chỉ không ra Internet. DrayPulse không lưu vào bộ nhớ router: mỗi 5 phút nó đối chiếu và tạo lại cấu hình chặn nếu router khởi động lại. Không bao giờ tự chặn theo tên máy.`));
     }
   };
   return {
@@ -1591,7 +1591,7 @@ function routerForm(r, view, sys) {
   // --- client blocking (writes a firewall rule, IP groups and objects: off by default)
   const bkOn = h('input', { type: 'checkbox', checked: !!(o.block && o.block.enabled) });
   const blockBox = h('div', { class: 'form full' }, h('div', { class: 'full' }, check('Cho phép DrayPulse chặn IP client (cần Telnet/SSH)', bkOn)),
-    h('p', { class: 'hint full' }, 'Khi bạn bấm “Chặn” ở tab Client, DrayPulse dùng Firewall của router: đối tượng IP kiểu MAC (“DP-…”, số 192 trở xuống), nhóm IP 32 và 31 (DrayPulse1/2) và một luật trống trong bộ lọc đang dùng của Data Filter (ghi chú “DrayPulse”, chuyển lên trên các luật “Pass Immediately”). DrayPulse không sửa luật, nhóm hay đối tượng do bạn tạo. Nếu Data Filter đang TẮT mà bộ lọc có luật của bạn đang bật, DrayPulse từ chối tự bật Data Filter (bật nó sẽ áp dụng cả các luật đó): hãy kiểm tra rồi bật trong Firewall → General Setup.'));
+    h('p', { class: 'hint full' }, 'Khi bạn bấm “Chặn” ở tab Client, DrayPulse dùng Firewall của router: đối tượng IP kiểu MAC (“DP-…”, số 192 trở xuống), nhóm IP 32, 31 (DrayPulse1/2) và một luật trống trong bộ lọc đang dùng của Data Filter (ghi chú “DrayPulse”; từ thiết bị thứ 25 thêm nhóm 30, 29 và luật thứ hai “DrayPulse2”; chuyển lên trên các luật “Pass Immediately”). DrayPulse không sửa luật, nhóm hay đối tượng do bạn tạo. Nếu Data Filter đang TẮT mà bộ lọc có luật của bạn đang bật, DrayPulse từ chối tự bật Data Filter (bật nó sẽ áp dụng cả các luật đó): hãy kiểm tra rồi bật trong Firewall → General Setup.'));
   const syncSnmp = () => {
     v2Box.classList.toggle('hidden', !['1', '2c'].includes(snmpVer.value));
     v3Box.classList.toggle('hidden', snmpVer.value !== '3');

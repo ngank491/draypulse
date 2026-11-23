@@ -291,6 +291,9 @@ func (f *simFirewall) handle(cmd string) (string, bool) {
 				p := strings.Fields(v)
 				if len(p) == 3 && p[0] == "g" {
 					n, _ := strconv.Atoi(p[2])
+					if n == 0 && p[1] == "2" && x.g1 == 0 { // as Vigor2926 plus 4.4.3 answers
+						return "Invalid value, must have least one object/group.", true
+					}
 					if p[1] == "1" {
 						x.g1 = n
 					} else {

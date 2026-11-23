@@ -19,9 +19,11 @@ import (
 //
 //   - one IP object per blocked device (type MAC) or IP-only block (type
 //     single), named "DP-<MAC>" / "DPI<IP>", taken from index 192 downwards,
-//   - IP groups 32 and 31 ("DrayPulse1", "DrayPulse2"), 12 objects each,
-//   - one rule commented "DrayPulse" in the data filter's start set:
-//     LAN → WAN, source = the groups, Block Immediately, MAC Bind non-strict.
+//   - IP groups 32, 31, 30, 29 ("DrayPulse1" … "DrayPulse4"), 12 objects each,
+//   - rules in the data filter's start set, LAN → WAN, Block Immediately, MAC
+//     Bind non-strict: "DrayPulse" with source groups 32 (+31), and from the
+//     25th block "DrayPulse2" with groups 30 (+29). DrayOS takes at most two
+//     IP groups as a rule's source, hence 24 per rule.
 //
 // Every change converges the router to the wanted list and is read back. The
 // rule is enabled only after its groups hold the objects and disabled before
@@ -36,15 +38,31 @@ const (
 	fwPerGroup = 12
 )
 
-var fwGroups = []int{32, 31}
+// fwUnit is one DrayPulse rule and its two source groups.
+type fwUnit struct {
+	Comment string
+	G1, G2  int
+}
+
+var fwUnits = []fwUnit{{fwComment, 32, 31}, {fwComment + "2", 30, 29}}
+
+var fwGroups = []int{32, 31, 30, 29}
+
+const fwPerRule = 2 * fwPerGroup
 
 // fwMax is how many devices/IPs DrayPulse can block per router.
 var fwMax = fwPerGroup * len(fwGroups)
+
+// fwUnitsFor: how many rules n blocks need.
+func fwUnitsFor(n int) int { return (n + fwPerRule - 1) / fwPerRule }
+
+func grpTag(g int) string { return fmt.Sprintf("Group%d", g) }
 
 // fwLayout is where DrayPulse's pieces sit on one router (kv "fw:<id>").
 type fwLayout struct {
 	Set      int            `json:"set"`      // rule slot
 	Rule     int            `json:"rule"`     //
+	Rule2    int            `json:"rule2"`    // the second rule (25th block on)
 	Objects  map[string]int `json:"objects"`  // key → IP object index
 	TurnedOn bool           `json:"turnedOn"` // DrayPulse switched the data filter on
 	Sets     int            `json:"sets"`     // limits of this firmware
@@ -78,7 +96,8 @@ var fwWriteAllowed = []*regexp.Regexp{
 	regexp.MustCompile(`^ipf rule \?$`),
 	regexp.MustCompile(`^ipf rule \d{1,2} \d{1,2} -v$`),
 	regexp.MustCompile(`^ipf rule \d{1,2} \d{1,2} -e 1 -D 0 -s "g 1 32" -F "1 0" -m "0 0" -M "DrayPulse"$`),
-	regexp.MustCompile(`^ipf rule \d{1,2} \d{1,2} -s "g 2 (31|0)"$`),
+	regexp.MustCompile(`^ipf rule \d{1,2} \d{1,2} -e 1 -D 0 -s "g 1 30" -F "1 0" -m "0 0" -M "DrayPulse2"$`),
+	regexp.MustCompile(`^ipf rule \d{1,2} \d{1,2} -s "g 2 (31|29|0)"$`),
 	regexp.MustCompile(`^ipf rule \d{1,2} \d{1,2} -e 0$`),
 	regexp.MustCompile(`^ipf rule \d{1,2} \d{1,2} -U 0$`),
 	regexp.MustCompile(`^object ip obj (1\d\d|\d{1,2}) -v$`),
@@ -87,10 +106,10 @@ var fwWriteAllowed = []*regexp.Regexp{
 	regexp.MustCompile(`^object ip obj (1\d\d) -a 4 [0-9a-f]{2}(:[0-9a-f]{2}){5}$`),
 	regexp.MustCompile(`^object ip obj (1\d\d) -a 1 \d{1,3}(\.\d{1,3}){3}$`),
 	regexp.MustCompile(`^object ip obj (1\d\d) -a 0 0\.0\.0\.0 0\.0\.0\.0$`),
-	regexp.MustCompile(`^object ip grp (31|32) -v$`),
-	regexp.MustCompile(`^object ip grp (31|32) -n DrayPulse[12]$`),
-	regexp.MustCompile(`^object ip grp (31|32) -i [01]$`),
-	regexp.MustCompile(`^object ip grp (31|32) -a "\d{1,3}( \d{1,3}){11}"$`),
+	regexp.MustCompile(`^object ip grp (29|30|31|32) -v$`),
+	regexp.MustCompile(`^object ip grp (29|30|31|32) -n DrayPulse[1-4]$`),
+	regexp.MustCompile(`^object ip grp (29|30|31|32) -i [01]$`),
+	regexp.MustCompile(`^object ip grp (29|30|31|32) -a "\d{1,3}( \d{1,3}){11}"$`),
 }
 
 func fwCommandAllowed(cmd string) bool {
@@ -187,7 +206,24 @@ type fwRule struct {
 	Block   bool
 }
 
-func (r fwRule) ours() bool { return r.Comment == fwComment }
+func (r fwRule) ours() bool { return r.unit() >= 0 }
+
+// unit: which DrayPulse rule this is (-1: not DrayPulse's).
+func (r fwRule) unit() int {
+	for u, x := range fwUnits {
+		if r.Comment == x.Comment {
+			return u
+		}
+	}
+	return -1
+}
+
+// right: the enabled block rule of unit u, with its second group exactly
+// when two says so.
+func (r fwRule) right(u int, two bool) bool {
+	x := fwUnits[u]
+	return r.unit() == u && r.On && r.Block && strings.Contains(r.Source, grpTag(x.G1)) && strings.Contains(r.Source, grpTag(x.G2)) == two
+}
 
 // free: an untouched slot (disabled, no comment, any source, default pass).
 func (r fwRule) free() bool {
@@ -311,7 +347,7 @@ type FwReport struct {
 	RulePlace string
 }
 
-var errFwFull = fmt.Errorf("đã chặn tối đa %d thiết bị/IP trên router này (DrayPulse dùng 2 nhóm IP × 12 đối tượng)", fwPerGroup*2)
+var errFwFull = fmt.Errorf("đã chặn tối đa %d thiết bị/IP trên router này (DrayPulse dùng 2 luật, %d nhóm IP × %d đối tượng)", fwMax, len(fwGroups), fwPerGroup)
 
 // errFwFilterOff: the data filter is off and the start set holds the admin's
 // enabled rules, which switching it on would activate.
@@ -363,32 +399,44 @@ func (h *Hub) fwApply(o *bindOps, routerID int64, want []string) (*FwReport, err
 	for _, k := range want {
 		wanted[k] = true
 	}
-	// 1. the rule slot: ours if placed, else the first free one of the start set
+	// 1. the rule slots: ours if placed, else the first free ones of the set
 	set := start
 	if !dfOn && lay.Set > 0 {
 		set = lay.Set
 	}
+	need := fwUnitsFor(len(want))
 	rules := map[int]fwRule{}
-	slot := 0
+	slots := make([]int, len(fwUnits))
 	for r := 1; r <= lay.Rules; r++ {
 		x, err := o.fwRule(set, r)
 		if err != nil {
 			return rep, err
 		}
 		rules[r] = x
-		if x.ours() && slot == 0 {
-			slot = r
+		if u := x.unit(); u >= 0 && slots[u] == 0 {
+			slots[u] = r
 		}
 	}
-	if slot == 0 && len(want) > 0 {
+	taken := func(r int) bool {
+		for _, s := range slots {
+			if s == r {
+				return true
+			}
+		}
+		return false
+	}
+	for u := 0; u < need; u++ {
+		if slots[u] > 0 {
+			continue
+		}
 		for r := 1; r <= lay.Rules; r++ {
-			if rules[r].free() {
-				slot = r
+			if rules[r].free() && !taken(r) {
+				slots[u] = r
 				break
 			}
 		}
-		if slot == 0 {
-			return rep, fmt.Errorf("bộ luật lọc số %d của router không còn chỗ trống cho luật chặn của DrayPulse", set)
+		if slots[u] == 0 {
+			return rep, fmt.Errorf("bộ luật lọc số %d của router không còn chỗ trống cho luật chặn “%s” của DrayPulse", set, fwUnits[u].Comment)
 		}
 	}
 	if len(want) > 0 && !dfOn {
@@ -403,7 +451,8 @@ func (h *Hub) fwApply(o *bindOps, routerID int64, want []string) (*FwReport, err
 		}
 	}
 	// the groups: one the admin uses is never touched; it stops a block only
-	// when DrayPulse needs it (group 31 from the 13th block on)
+	// when DrayPulse needs it (group 31 from the 13th block on, 30 from the
+	// 25th, 29 from the 37th)
 	grps := map[int]fwGrp{}
 	foreign := map[int]bool{}
 	for gi, g := range fwGroups {
@@ -413,16 +462,21 @@ func (h *Hub) fwApply(o *bindOps, routerID int64, want []string) (*FwReport, err
 		}
 		if cur.Name != "" && cur.Name != fmt.Sprintf("DrayPulse%d", gi+1) {
 			if gi*fwPerGroup < len(want) {
-				return rep, fmt.Errorf("nhóm IP %d của router đang được dùng (“%s”): DrayPulse cần nhóm 32 và 31 để chặn", g, cur.Name)
+				return rep, fmt.Errorf("nhóm IP %d của router đang được dùng (“%s”): DrayPulse cần nhóm %d để chặn quá %d thiết bị/IP", g, cur.Name, g, gi*fwPerGroup)
 			}
 			foreign[g] = true
 		}
 		grps[g] = cur
 	}
-	// 2. switch the rule off before any group shrinks
-	if slot > 0 && rules[slot].On && len(want) == 0 {
-		if _, err := o.fw(fmt.Sprintf("ipf rule %d %d -e 0", set, slot)); err != nil {
-			return rep, err
+	// 2. switch off a rule no longer needed before its groups shrink
+	for u, slot := range slots {
+		if slot > 0 && u >= need && rules[slot].unit() == u && rules[slot].On {
+			if _, err := o.fw(fmt.Sprintf("ipf rule %d %d -e 0", set, slot)); err != nil {
+				return rep, err
+			}
+			x := rules[slot]
+			x.On = false
+			rules[slot] = x
 		}
 	}
 	// 3. objects for new blocks (not in any group yet); repaired in place
@@ -470,21 +524,24 @@ func (h *Hub) fwApply(o *bindOps, routerID int64, want []string) (*FwReport, err
 		lay.Objects[k] = i
 		rep.Recreated = append(rep.Recreated, k)
 	}
-	// 4. groups. An emptied group must never stay a source of the enabled
+	// 4. groups. An emptied group must never stay a source of an enabled
 	// rule, and an object leaves its group before it is cleared.
 	var idx []int
 	for _, k := range keys {
 		idx = append(idx, lay.Objects[k])
 	}
 	sort.Ints(idx)
-	needG2 := len(idx) > fwPerGroup
-	if slot > 0 && rules[slot].ours() && rules[slot].On && !needG2 && strings.Contains(rules[slot].Source, "Group31") {
-		if _, err := o.fw(fmt.Sprintf(`ipf rule %d %d -s "g 2 0"`, set, slot)); err != nil {
-			return rep, err
-		}
+	two := func(u int) bool { return len(idx) > u*fwPerRule+fwPerGroup }
+	for u := 0; u < need; u++ {
+		slot := slots[u]
 		x := rules[slot]
-		x.Source = "(g1)IP Group32"
-		rules[slot] = x
+		if x.unit() == u && x.On && !two(u) && strings.Contains(x.Source, grpTag(fwUnits[u].G2)) {
+			if _, err := o.fw(fmt.Sprintf(`ipf rule %d %d -s "g 2 0"`, set, slot)); err != nil {
+				return rep, err
+			}
+			x.Source = "(g1)IP " + grpTag(fwUnits[u].G1)
+			rules[slot] = x
+		}
 	}
 	for gi, g := range fwGroups {
 		var mem [fwPerGroup]int
@@ -522,6 +579,7 @@ func (h *Hub) fwApply(o *bindOps, routerID int64, want []string) (*FwReport, err
 		delete(lay.Objects, k)
 		rep.Removed = append(rep.Removed, k)
 	}
+	lay.Set, lay.Rule, lay.Rule2 = set, slots[0], slots[1]
 	if len(want) == 0 {
 		if lay.TurnedOn && dfOn {
 			others := false
@@ -538,63 +596,95 @@ func (h *Hub) fwApply(o *bindOps, routerID int64, want []string) (*FwReport, err
 			}
 			lay.TurnedOn = false
 		}
-		return rep, h.fwVerify(o, lay, set, slot, nil)
+		return rep, h.fwVerify(o, lay, set, slots, nil)
 	}
-	// 6. the rule: groups first, then the rule (left alone when already right,
-	// so a comparison in sync writes nothing)
-	if cur := rules[slot]; !(cur.ours() && cur.On && cur.Block && strings.Contains(cur.Source, "Group32") && strings.Contains(cur.Source, "Group31") == needG2) {
-		if _, err := o.fw(fmt.Sprintf(`ipf rule %d %d -e 1 -D 0 -s "g 1 32" -F "1 0" -m "0 0" -M "DrayPulse"`, set, slot)); err != nil {
+	// 6. the rules: groups first, then the rules (left alone when already
+	// right, so a comparison in sync writes nothing)
+	for u := 0; u < need; u++ {
+		slot, x := slots[u], fwUnits[u]
+		cur := rules[slot]
+		if cur.right(u, two(u)) {
+			continue
+		}
+		second, src := "0", "(g1)IP "+grpTag(x.G1)
+		if two(u) {
+			second, src = strconv.Itoa(x.G2), src+", (g2)IP "+grpTag(x.G2)
+		}
+		g2 := fmt.Sprintf(`ipf rule %d %d -s "g 2 %s"`, set, slot, second)
+		// DrayPulse's disabled rule may still name an emptied group: fix it
+		// before enabling. (A free rule has no group: the router refuses "g 2 0"
+		// on a rule without any object or group.)
+		if cur.unit() == u && !cur.On {
+			if _, err := o.fw(g2); err != nil {
+				return rep, err
+			}
+		}
+		if _, err := o.fw(fmt.Sprintf(`ipf rule %d %d -e 1 -D 0 -s "g 1 %d" -F "1 0" -m "0 0" -M "%s"`, set, slot, x.G1, x.Comment)); err != nil {
 			return rep, err
 		}
-		second := "0"
-		if needG2 {
-			second = "31"
-		}
-		if _, err := o.fw(fmt.Sprintf(`ipf rule %d %d -s "g 2 %s"`, set, slot, second)); err != nil {
+		if _, err := o.fw(g2); err != nil {
 			return rep, err
 		}
-		if !cur.ours() || !cur.On {
+		if cur.unit() != u || !cur.On {
 			rep.RuleSet = true
 		}
+		rules[slot] = fwRule{On: true, Comment: x.Comment, Source: src, Block: true}
 	}
-	// 7. above every enabled "Pass Immediately" rule of the set
-	for slot > 1 {
-		above := rules[slot-1]
-		if !(above.On && !above.Block) {
-			// a block rule or a disabled one above: keep looking further up
-			passAbove := false
-			for r := 1; r < slot; r++ {
-				if x := rules[r]; x.On && !x.Block && !x.ours() {
-					passAbove = true
+	// 7. above every enabled "Pass Immediately" rule of the set, the upper
+	// rule first (the lower one then stops right below it at the latest)
+	order := make([]int, need)
+	for u := range order {
+		order[u] = u
+	}
+	sort.Slice(order, func(a, b int) bool { return slots[order[a]] < slots[order[b]] })
+	for _, u := range order {
+		slot := slots[u]
+		for slot > 1 {
+			above := rules[slot-1]
+			if !(above.On && !above.Block) {
+				// a block rule or a disabled one above: keep looking further up
+				passAbove := false
+				for r := 1; r < slot; r++ {
+					if x := rules[r]; x.On && !x.Block && !x.ours() {
+						passAbove = true
+					}
+				}
+				if !passAbove {
+					break
 				}
 			}
-			if !passAbove {
-				break
+			if _, err := o.fw(fmt.Sprintf("ipf rule %d %d -U 0", set, slot)); err != nil {
+				return rep, err
 			}
+			moved, err := o.fwRule(set, slot-1)
+			if err != nil {
+				return rep, err
+			}
+			if moved.unit() != u {
+				return rep, fmt.Errorf("router không chuyển luật chặn lên trên được (đọc lại luật %d-%d)", set, slot-1)
+			}
+			if v := above.unit(); v >= 0 { // DrayPulse's other (disabled) rule moves down
+				slots[v] = slot
+			}
+			rules[slot-1], rules[slot] = moved, above
+			slot--
+			rep.MovedUp++
 		}
-		if _, err := o.fw(fmt.Sprintf("ipf rule %d %d -U 0", set, slot)); err != nil {
-			return rep, err
-		}
-		moved, err := o.fwRule(set, slot-1)
-		if err != nil {
-			return rep, err
-		}
-		if !moved.ours() {
-			return rep, fmt.Errorf("router không chuyển luật chặn lên trên được (đọc lại luật %d-%d)", set, slot-1)
-		}
-		rules[slot-1], rules[slot] = moved, rules[slot-1]
-		slot--
-		rep.MovedUp++
+		slots[u] = slot
 	}
-	rep.RulePlace = fmt.Sprintf("%d-%d", set, slot)
-	lay.Set, lay.Rule = set, slot
+	var place []string
+	for u := 0; u < need; u++ {
+		place = append(place, fmt.Sprintf("%d-%d", set, slots[u]))
+	}
+	rep.RulePlace = strings.Join(place, ", ")
+	lay.Set, lay.Rule, lay.Rule2 = set, slots[0], slots[1]
 	if !dfOn {
 		if _, err := o.fw(fmt.Sprintf("ipf set -d %d", set)); err != nil {
 			return rep, err
 		}
 		lay.TurnedOn, rep.FilterOn = true, true
 	}
-	return rep, h.fwVerify(o, lay, set, slot, keys)
+	return rep, h.fwVerify(o, lay, set, slots, keys)
 }
 
 func fwObjIs(o fwObj, key string) bool {
@@ -675,8 +765,8 @@ func (h *Hub) fwFreeObj(o *bindOps, used map[int]bool) (int, error) {
 	return 0, fmt.Errorf("router không còn đối tượng IP trống (DrayPulse tìm từ số %d xuống %d)", fwObjTop, fwObjLow)
 }
 
-// fwVerify reads the rule and groups back.
-func (h *Hub) fwVerify(o *bindOps, lay fwLayout, set, slot int, keys []string) error {
+// fwVerify reads the groups and rules back.
+func (h *Hub) fwVerify(o *bindOps, lay fwLayout, set int, slots []int, keys []string) error {
 	var idx []int
 	for _, k := range keys {
 		idx = append(idx, lay.Objects[k])
@@ -700,20 +790,23 @@ func (h *Hub) fwVerify(o *bindOps, lay fwLayout, set, slot int, keys []string) e
 			}
 		}
 	}
-	if slot == 0 {
-		return nil
-	}
-	r, err := o.fwRule(set, slot)
-	if err != nil {
-		return err
-	}
-	switch {
-	case !r.ours():
-		return fmt.Errorf("luật %d-%d không còn là luật của DrayPulse", set, slot)
-	case len(keys) > 0 && (!r.On || !r.Block || !strings.Contains(r.Source, "Group32")):
-		return fmt.Errorf("router không lưu đúng luật chặn %d-%d (đọc lại: %v, nguồn %s)", set, slot, r.On, r.Source)
-	case len(keys) == 0 && r.On:
-		return fmt.Errorf("router chưa tắt luật chặn %d-%d", set, slot)
+	need := fwUnitsFor(len(keys))
+	for u, slot := range slots {
+		if slot == 0 {
+			continue
+		}
+		r, err := o.fwRule(set, slot)
+		if err != nil {
+			return err
+		}
+		switch {
+		case r.unit() != u:
+			return fmt.Errorf("luật %d-%d không còn là luật “%s” của DrayPulse", set, slot, fwUnits[u].Comment)
+		case u < need && !r.right(u, len(idx) > u*fwPerRule+fwPerGroup):
+			return fmt.Errorf("router không lưu đúng luật chặn %d-%d (đọc lại: %v, nguồn %s)", set, slot, r.On, r.Source)
+		case u >= need && r.On:
+			return fmt.Errorf("router chưa tắt luật chặn %d-%d", set, slot)
+		}
 	}
 	return nil
 }
@@ -769,19 +862,26 @@ func (h *Hub) fwCheck(o *bindOps, routerID int64, want []string) (fwCheckResult,
 	if n == 0 {
 		n = 7
 	}
+	need, found, ok := fwUnitsFor(len(want)), 0, true
+	var places []string
 	for r := 1; r <= n; r++ {
 		x, err := o.fwRule(set, r)
 		if err != nil {
 			return res, err
 		}
-		switch {
-		case x.ours():
-			res.RuleOn = x.On && x.Block && strings.Contains(x.Source, "Group32")
-			res.Rule = fmt.Sprintf("%d-%d", set, r)
+		switch u := x.unit(); {
+		case u >= 0:
+			if u < need {
+				found++
+				ok = ok && x.right(u, len(want) > u*fwPerRule+fwPerGroup)
+				places = append(places, fmt.Sprintf("%d-%d", set, r))
+			}
 		case x.On:
 			res.Others++
 		}
 	}
+	res.RuleOn = need > 0 && found == need && ok
+	res.Rule = strings.Join(places, ", ")
 	wanted := map[string]bool{}
 	for _, k := range want {
 		wanted[k] = true
